@@ -118,6 +118,10 @@ func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
 		return err
 	}
 	fmt.Printf("%s：%s\n", sceneName(scene), onOff(enabled))
+	if scene == SceneGlobal && enabled {
+		fmt.Println("提示：当前已打开的 shell 不会自动继承新的代理环境变量。")
+		fmt.Println("如需当前 shell 立即生效，请执行：source /etc/profile.d/xray-global-proxy.sh")
+	}
 	return nil
 }
 
