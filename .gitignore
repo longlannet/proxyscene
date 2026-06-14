@@ -1,0 +1,48 @@
+# Build artifacts
+/dist/
+/bin/
+/build/
+/xray-proxy
+*.exe
+*.test
+*.out
+*.prof
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+.DS_Store
+Thumbs.db
+
+# Go workspace/cache files that should not be committed
+/vendor/
+*.coverprofile
+coverage.out
+
+# Local editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime state, generated config, node/subscription data, and Xray assets
+/opt/
+/var/
+/xray
+/config.json
+/state.json
+/.state.lock
+/dev-proxy-backup.json
+/xray.log
+/geoip.dat
+/geosite.dat
+*.dat
+
+# Installer temporary build output
+/.xray-proxy-build.*
+
+# Local environment files
+.env
+.env.*
+!.env.example
