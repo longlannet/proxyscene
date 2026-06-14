@@ -286,12 +286,6 @@ func telegramProxyEnvPairs(cfg Config) []string {
 		"TELEGRAM_HTTP_PROXY=" + httpProxy,
 		"TELEGRAM_HTTPS_PROXY=" + httpProxy,
 		"TELEGRAM_SOCKS_PROXY=" + socksProxy,
-		"HTTP_PROXY=" + httpProxy,
-		"HTTPS_PROXY=" + httpProxy,
-		"ALL_PROXY=" + socksProxy,
-		"http_proxy=" + httpProxy,
-		"https_proxy=" + httpProxy,
-		"all_proxy=" + socksProxy,
 	}
 }
 
