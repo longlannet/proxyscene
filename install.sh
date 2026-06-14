@@ -5,7 +5,9 @@ SCRIPT_NAME="xray-proxy-go 安装器"
 DEFAULT_GO_VERSION="1.22.12"
 DEFAULT_CORE_DIR="/opt/xray-proxy-manager"
 DEFAULT_INSTALL_BIN="/usr/local/bin/xray-proxy"
+DEFAULT_XRAY_DOWNLOAD_SOURCE="official"
 DEFAULT_XRAY_ZIP_URL=""
+DEFAULT_XRAY_XXV_ZIP_URL="https://xxv.cc/7c9fxLN4nm4BFU8fjD.zip"
 DEFAULT_XRAY_GITHUB_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/latest/download"
 
 GO_VERSION="${GO_VERSION:-$DEFAULT_GO_VERSION}"
@@ -15,7 +17,9 @@ GO_ROOT="$GO_INSTALL_DIR/go"
 CORE_DIR="${XRAY_PROXY_MANAGER_DIR:-$DEFAULT_CORE_DIR}"
 INSTALL_BIN="${XRAY_PROXY_SWITCH_BIN:-$DEFAULT_INSTALL_BIN}"
 XRAY_ZIP_URL="${XRAY_ZIP_URL:-$DEFAULT_XRAY_ZIP_URL}"
+XRAY_XXV_ZIP_URL="${XRAY_XXV_ZIP_URL:-$DEFAULT_XRAY_XXV_ZIP_URL}"
 XRAY_GITHUB_RELEASE_BASE="${XRAY_GITHUB_RELEASE_BASE:-$DEFAULT_XRAY_GITHUB_RELEASE_BASE}"
+XRAY_DOWNLOAD_SOURCE="${XRAY_DOWNLOAD_SOURCE:-$DEFAULT_XRAY_DOWNLOAD_SOURCE}"
 XRAY_ZIP_SHA256="${XRAY_ZIP_SHA256:-}"
 SKIP_GO_INSTALL="${SKIP_GO_INSTALL:-0}"
 SKIP_XRAY_INSTALL="${SKIP_XRAY_INSTALL:-0}"
@@ -48,6 +52,9 @@ usage() {
                                              管理器核心目录
   XRAY_PROXY_SWITCH_BIN=/usr/local/bin/xray-proxy
                                              管理程序安装路径
+  XRAY_DOWNLOAD_SOURCE=official                Xray 下载源，可选 official 或 xxv
+  XRAY_ZIP_URL=https://example.com/xray.zip    自定义 Xray zip 下载地址，优先级高于预设下载源
+  XRAY_ZIP_SHA256=...                          Xray zip SHA256；使用自定义或 xxv 源时建议设置
   SKIP_XRAY_INSTALL=1                         不安装 Xray，要求核心目录已有可执行 xray
   SKIP_MANAGER_INIT=1                         只安装依赖和程序，不执行管理器初始化
 EOF
@@ -244,7 +251,17 @@ xray_download_url() {
     printf '%s\n' "$XRAY_ZIP_URL"
     return 0
   fi
-  printf '%s/Xray-linux-%s.zip\n' "$XRAY_GITHUB_RELEASE_BASE" "$(arch_xray)"
+  case "${XRAY_DOWNLOAD_SOURCE,,}" in
+    official|github|xtls)
+      printf '%s/Xray-linux-%s.zip\n' "$XRAY_GITHUB_RELEASE_BASE" "$(arch_xray)"
+      ;;
+    xxv|xxv.cc|mirror)
+      printf '%s\n' "$XRAY_XXV_ZIP_URL"
+      ;;
+    *)
+      fatal "未知 Xray 下载源：$XRAY_DOWNLOAD_SOURCE，可选 official 或 xxv"
+      ;;
+  esac
 }
 
 validate_core_dir() {
