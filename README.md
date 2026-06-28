@@ -1,5 +1,10 @@
 # xray-proxy-go
 
+[![CI](https://github.com/longlannet/xray-proxy-go/actions/workflows/ci.yml/badge.svg)](https://github.com/longlannet/xray-proxy-go/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/longlannet/xray-proxy-go)](https://github.com/longlannet/xray-proxy-go/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/github/go-mod/go-version/longlannet/xray-proxy-go)](go.mod)
+
 `xray-proxy-go` 是一个面向 Linux 服务器的 Xray 代理管理器。项目由一个安装脚本和一个 Go 编写的单二进制管理程序组成：
 
 - `install.sh`：负责安装期工作——安装 Xray、安装 `xray-proxy` 管理程序、初始化 systemd。支持离线整合包安装（推荐，解压即装、不联网、不需要 Go）、联机下载预编译二进制（失败回退源码编译）、源码编译三种方式。
