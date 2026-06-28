@@ -64,7 +64,7 @@ usage() {
     minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>
 
 管理程序获取方式（默认优先下载预编译二进制，目标机无需 Go；失败时回退源码编译）：
-  XRAY_PROXY_VERSION=latest                    要下载的预编译版本，如 v0.3.0
+  XRAY_PROXY_VERSION=latest                    要下载的预编译版本，如 v0.3.1
   XRAY_PROXY_REPO=longlannet/xray-proxy-go     预编译二进制所在的 GitHub 仓库 owner/name
   XRAY_PROXY_BASE_URL=https://mirror/dl         自定义预编译下载基址（必须 https），优先级最高
   XRAY_PROXY_MINISIGN_PUBKEY=RWxxxx             用 minisign 校验签名（联机校验 checksums.txt，离线校验整合包）
@@ -97,7 +97,7 @@ while [[ $# -gt 0 ]]; do
     --offline)
       FORCE_OFFLINE_LOCAL=1
       ;;
-    --*)
+    -*)
       fatal "未知选项：$1"
       ;;
     *)
@@ -509,6 +509,8 @@ install_manager_prebuilt() {
   elif [[ "$MANAGER_MINISIGN_REQUIRED" == "1" ]]; then
     rm -rf "$tmp"
     fatal "设置了 XRAY_PROXY_MINISIGN_PUBKEY 但未找到 minisign"
+  else
+    log "警告：未安装 minisign，跳过签名校验，仅校验 SHA256。镜像等不可信源可能同源篡改 SHA256 与二进制；如需密码学保证，请安装 minisign 或设置 XRAY_PROXY_MINISIGN_PUBKEY 强制验签。"
   fi
 
   # checksums.txt 每行形如 "<64hex>  <asset>"（二进制模式为 "<hex> *<asset>"）。

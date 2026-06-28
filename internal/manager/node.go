@@ -240,6 +240,12 @@ func parseSS(raw string) (*parsedNode, error) {
 	if strings.Contains(body, "@") {
 		parts := strings.SplitN(body, "@", 2)
 		userinfo, hostport = parts[0], parts[1]
+		// SIP002 允许 host:port 后带一个可选的 `/`（如 ss://...@host:port/?plugin=... 或
+		// ss://...@host:port/#name）。前面已去掉 ? 和 #，这里再去掉路径分隔符，否则
+		// net.SplitHostPort 会因端口含 `/` 失败、整条链接被当作无效丢弃。
+		if i := strings.IndexByte(hostport, '/'); i >= 0 {
+			hostport = hostport[:i]
+		}
 		if !strings.Contains(userinfo, ":") {
 			if b, err := decodeBase64URL(userinfo); err == nil {
 				userinfo = string(b)
@@ -569,12 +575,13 @@ func (a *App) removeNode(st *Store, id string) error {
 		st.SceneEnabled[SceneGlobal] = false
 		st.SceneEnabled[SceneDev] = false
 		st.SceneEnabled[SceneTelegram] = false
-		// 尽力而为：即使场景清理部分失败，也要停掉核心服务并保存已关闭的状态。
+		// 尽力而为：即使场景清理或停服务失败，也要继续往下把"已关闭"状态写入磁盘，
+		// 否则下次开机恢复会试图在零节点下重新开启场景而报错。
 		if err := a.applySavedScenes(st); err != nil {
 			fmt.Println("警告：删除最后一个节点后清理场景部分失败：", err)
 		}
 		if err := a.stopXrayService(); err != nil {
-			return err
+			fmt.Println("警告：停止 Xray 主服务失败：", err)
 		}
 	}
 	if err := a.saveStore(st); err != nil {

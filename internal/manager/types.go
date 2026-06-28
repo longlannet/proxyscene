@@ -9,7 +9,7 @@ import (
 // Version 和 Commit 可在构建时通过 -ldflags "-X xray-proxy-go/internal/manager.Version=..."
 // 注入（release 工作流会用 git tag 和 commit 覆盖）；源码直接构建时使用下面的默认值。
 var (
-	Version = "0.3.0"
+	Version = "0.3.1"
 	Commit  = ""
 )
 

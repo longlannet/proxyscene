@@ -145,6 +145,29 @@ func TestIsPublicIP(t *testing.T) {
 	}
 }
 
+func TestParseSSSIP002WithPath(t *testing.T) {
+	// SIP002：host:port 后带可选 `/`，再接 ?plugin / #name。这些过去会被误判为端口无效。
+	cases := []string{
+		"ss://aes-256-gcm:secret@example.com:8388/#name",
+		"ss://aes-256-gcm:secret@example.com:8388/?plugin=v2ray-plugin",
+		"ss://aes-256-gcm:secret@example.com:8388/?plugin=v2ray-plugin#name",
+		// base64 userinfo（SIP002 标准形式）+ 路径
+		"ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388/?plugin=obfs#name",
+	}
+	for _, raw := range cases {
+		pn, err := parseNode(raw)
+		if err != nil {
+			t.Fatalf("parseNode(%q) 应成功，却失败：%v", raw, err)
+		}
+		if pn.EndpointHost != "example.com" || pn.EndpointPort != 8388 {
+			t.Fatalf("%q 解析出 %s:%d，期望 example.com:8388", raw, pn.EndpointHost, pn.EndpointPort)
+		}
+		if got := outboundPassword(t, pn); got != "secret" {
+			t.Fatalf("%q 密码=%q，期望 secret", raw, got)
+		}
+	}
+}
+
 func TestParseTrojanColonPasswordRoundTrip(t *testing.T) {
 	pn, err := parseNode("trojan://a:b@h:443")
 	if err != nil {

@@ -65,6 +65,7 @@ jobs:
             install -m 755 "$stage/xray-proxy" "$stage/$pkg/xray-proxy"
             install -m 755 install.sh "$stage/$pkg/install.sh"
             install -m 644 NOTICE "$stage/$pkg/NOTICE"
+            install -m 644 LICENSE "$stage/$pkg/LICENSE"
             fetch_xray "$xrayarch" "$stage"
             install -m 755 "$stage/x/xray" "$stage/$pkg/xray"
             install -m 644 "$stage/x/geoip.dat" "$stage/$pkg/geoip.dat"
@@ -87,6 +88,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update
           sudo apt-get install -y minisign
           cleanup() {
             rm -f minisign.key
@@ -100,6 +102,18 @@ jobs:
           for b in dist/xray-proxy_bundle_linux_*.tar.gz; do
             minisign -S -W -m "$b" -s minisign.key -x "$b.minisig"
           done
+      - name: Require signatures on canonical repo
+        # 防止"签名 Secret 缺失时静默发布未签名产物"：官方仓库必须有签名才放行；
+        # fork（github.repository 不同）缺少 Secret 属正常，跳过此检查。
+        if: ${{ github.repository == 'longlannet/xray-proxy-go' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/checksums.txt.minisig || { echo "缺少 checksums.txt.minisig（签名 Secret 是否丢失？）"; exit 1; }
+          for f in dist/xray-proxy_bundle_linux_*.tar.gz; do
+            test -f "$f.minisig" || { echo "缺少签名：$f.minisig"; exit 1; }
+          done
+          echo "所有产物签名齐全"
       - name: Publish GitHub release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:

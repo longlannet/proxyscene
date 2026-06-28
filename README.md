@@ -120,7 +120,7 @@ curl -fsSL https://raw.githubusercontent.com/longlannet/xray-proxy-go/main/insta
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/longlannet/xray-proxy-go/main/install.sh \
-  | sudo XRAY_PROXY_VERSION=v0.3.0 \
+  | sudo XRAY_PROXY_VERSION=v0.3.1 \
          XRAY_PROXY_MINISIGN_PUBKEY=RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb \
          bash
 ```
@@ -494,10 +494,10 @@ sudo TG_PROXY_SERVICES='openclaw hermes user:root:hermes-gateway' xray-proxy tg 
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `XRAY_PROXY_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.3.0`。 |
+| `XRAY_PROXY_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.3.1`。 |
 | `XRAY_PROXY_REPO` | `longlannet/xray-proxy-go` | 预编译二进制所在的 GitHub 仓库 `owner/name`。 |
 | `XRAY_PROXY_BASE_URL` | 空 | 自定义预编译下载基址（必须 `https`），优先级高于 `XRAY_PROXY_VERSION`/仓库默认地址。 |
-| `XRAY_PROXY_MINISIGN_PUBKEY` | 空 | 提供时用 minisign 额外校验 `checksums.txt` 的签名（`checksums.txt.minisig`）。 |
+| `XRAY_PROXY_MINISIGN_PUBKEY` | 内置发布公钥 | 默认用内置公钥验签（装有 minisign 时 best-effort，缺则跳过并告警、仅校验 SHA256）。显式设置本变量会把验签变为**强制**：缺 minisign 或验签失败即中止。 |
 | `XRAY_PROXY_BUILD_FROM_SOURCE` | `0` | 设为 `1` 时跳过预编译下载，强制本地源码编译（需要 Go）。 |
 | `--offline`（命令行选项） | — | 强制走离线本地安装，要求在解压后的整合包目录内运行（同目录有 `xray-proxy`/`xray`）；通常无需显式指定，脚本会自动检测。 |
 | `GO_VERSION` | `1.22.12` | 源码编译时准备的 Go 版本（仅回退编译时用到）。 |
