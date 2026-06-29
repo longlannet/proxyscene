@@ -644,15 +644,15 @@ func (a *App) importSubscription(st *Store, sub string) error {
 	switch subURL.Scheme {
 	case "https":
 	case "http":
-		if !envBool("XRAY_PROXY_ALLOW_HTTP_SUBSCRIPTION", false) {
-			return fmt.Errorf("订阅链接必须使用 https；如确需导入明文 HTTP 订阅，请设置 XRAY_PROXY_ALLOW_HTTP_SUBSCRIPTION=1")
+		if !envBool("PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION", false) {
+			return fmt.Errorf("订阅链接必须使用 https；如确需导入明文 HTTP 订阅，请设置 PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1")
 		}
 		fmt.Println("警告：正在导入明文 HTTP 订阅，内容可能被中间人篡改")
 	default:
 		return fmt.Errorf("订阅链接必须是 https 地址")
 	}
-	allowHTTP := envBool("XRAY_PROXY_ALLOW_HTTP_SUBSCRIPTION", false)
-	allowPrivate := envBool("XRAY_PROXY_ALLOW_PRIVATE_SUBSCRIPTION", false)
+	allowHTTP := envBool("PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION", false)
+	allowPrivate := envBool("PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION", false)
 	client := subscriptionHTTPClient(allowHTTP, allowPrivate)
 	resp, err := client.Get(sub)
 	if err != nil {
@@ -723,7 +723,7 @@ func extractNodeURLs(s string) []string {
 //  1. CheckRedirect 在每一跳重新校验协议，禁止 https 被重定向降级到非允许协议；
 //  2. Dialer.Control 在 DNS 解析后、连接前校验目标 IP，默认拒绝环回/私网/链路本地/
 //     CGNAT 等非公网地址（含云元数据 169.254.169.254），可防 DNS rebinding。
-//     如确需抓取部署在内网的订阅，设置 XRAY_PROXY_ALLOW_PRIVATE_SUBSCRIPTION=1。
+//     如确需抓取部署在内网的订阅，设置 PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1。
 func subscriptionHTTPClient(allowHTTP, allowPrivate bool) *http.Client {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	if !allowPrivate {
@@ -737,7 +737,7 @@ func subscriptionHTTPClient(allowHTTP, allowPrivate bool) *http.Client {
 				return fmt.Errorf("无法解析订阅目标地址：%s", address)
 			}
 			if !isPublicIP(ip) {
-				return fmt.Errorf("订阅目标指向非公网地址，已拒绝（如确需可设 XRAY_PROXY_ALLOW_PRIVATE_SUBSCRIPTION=1）：%s", host)
+				return fmt.Errorf("订阅目标指向非公网地址，已拒绝（如确需可设 PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1）：%s", host)
 			}
 			return nil
 		}

@@ -6,10 +6,10 @@ import (
 	"time"
 )
 
-// Version 和 Commit 可在构建时通过 -ldflags "-X xray-proxy-go/internal/manager.Version=..."
+// Version 和 Commit 可在构建时通过 -ldflags "-X proxyscene/internal/manager.Version=..."
 // 注入（release 工作流会用 git tag 和 commit 覆盖）；源码直接构建时使用下面的默认值。
 var (
-	Version = "0.3.1"
+	Version = "0.4.0"
 	Commit  = ""
 )
 
@@ -52,28 +52,28 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		CoreDir:          envString("XRAY_PROXY_MANAGER_DIR", "/opt/xray-proxy-manager"),
-		ProxyHost:        envString("XRAY_PROXY_HOST", "127.0.0.1"),
-		DevHTTPPort:      envInt("XRAY_DEV_HTTP_PORT", 7891),
-		TGHTTPPort:       envIntAny([]string{"TG_HTTP_PROXY_PORT", "XRAY_TG_HTTP_PORT"}, 7892),
-		TGSocksPort:      envIntAny([]string{"TG_SOCKS_PROXY_PORT", "XRAY_TG_SOCKS_PORT"}, 7893),
-		GlobalHTTPPort:   envIntAny([]string{"GLOBAL_HTTP_PROXY_PORT", "XRAY_GLOBAL_HTTP_PORT"}, 7890),
-		GlobalSocksPort:  envIntAny([]string{"GLOBAL_SOCKS_PROXY_PORT", "XRAY_GLOBAL_SOCKS_PORT"}, 7894),
-		InstallBin:       envString("XRAY_PROXY_SWITCH_BIN", "/usr/local/bin/xray-proxy"),
-		SystemdService:   envString("XRAY_SYSTEMD_SERVICE_NAME", "xray-proxy-manager.service"),
-		RestoreService:   envString("XRAY_PROXY_BOOT_RESTORE_SERVICE_NAME", "xray-proxy-state.service"),
-		XrayServiceUser:  envString("XRAY_PROXY_SERVICE_USER", "xray-proxy"),
-		TGTargetServices: splitFields(envString("TG_PROXY_SERVICES", "openclaw hermes hermes-gateway user:root:hermes-gateway")),
-		DevTargetUser:    envString("DEV_PROXY_TARGET_USER", ""),
-		TestURL:          envString("XRAY_PROXY_TEST_URL", "https://www.google.com/generate_204"),
+		CoreDir:          envString("PROXYSCENE_MANAGER_DIR", "/opt/proxyscene"),
+		ProxyHost:        envString("PROXYSCENE_HOST", "127.0.0.1"),
+		DevHTTPPort:      envInt("PROXYSCENE_DEV_HTTP_PORT", 7891),
+		TGHTTPPort:       envInt("PROXYSCENE_TG_HTTP_PORT", 7892),
+		TGSocksPort:      envInt("PROXYSCENE_TG_SOCKS_PORT", 7893),
+		GlobalHTTPPort:   envInt("PROXYSCENE_GLOBAL_HTTP_PORT", 7890),
+		GlobalSocksPort:  envInt("PROXYSCENE_GLOBAL_SOCKS_PORT", 7894),
+		InstallBin:       envString("PROXYSCENE_SWITCH_BIN", "/usr/local/bin/proxyscene"),
+		SystemdService:   envString("PROXYSCENE_SYSTEMD_SERVICE_NAME", "proxyscene.service"),
+		RestoreService:   envString("PROXYSCENE_BOOT_RESTORE_SERVICE_NAME", "proxyscene-restore.service"),
+		XrayServiceUser:  envString("PROXYSCENE_SERVICE_USER", "proxyscene"),
+		TGTargetServices: splitFields(envString("PROXYSCENE_TG_SERVICES", "openclaw hermes hermes-gateway user:root:hermes-gateway")),
+		DevTargetUser:    envString("PROXYSCENE_DEV_TARGET_USER", ""),
+		TestURL:          envString("PROXYSCENE_TEST_URL", "https://www.google.com/generate_204"),
 	}
 }
 
 func (c Config) Validate() error {
-	if err := safeCoreDir(c.CoreDir, "XRAY_PROXY_MANAGER_DIR"); err != nil {
+	if err := safeCoreDir(c.CoreDir, "PROXYSCENE_MANAGER_DIR"); err != nil {
 		return err
 	}
-	if err := safePath(c.InstallBin, "XRAY_PROXY_SWITCH_BIN", true); err != nil {
+	if err := safePath(c.InstallBin, "PROXYSCENE_SWITCH_BIN", true); err != nil {
 		return err
 	}
 	if err := safeSystemdServiceName(c.SystemdService); err != nil {
@@ -86,17 +86,17 @@ func (c Config) Validate() error {
 		return err
 	}
 	if c.XrayServiceUser == "" {
-		return fmt.Errorf("XRAY_PROXY_SERVICE_USER 不能为空")
+		return fmt.Errorf("PROXYSCENE_SERVICE_USER 不能为空")
 	}
 	if err := validateUserName(c.XrayServiceUser); err != nil {
 		return err
 	}
 	ports := map[string]int{
-		"XRAY_DEV_HTTP_PORT":     c.DevHTTPPort,
-		"XRAY_TG_HTTP_PORT":      c.TGHTTPPort,
-		"XRAY_TG_SOCKS_PORT":     c.TGSocksPort,
-		"XRAY_GLOBAL_HTTP_PORT":  c.GlobalHTTPPort,
-		"XRAY_GLOBAL_SOCKS_PORT": c.GlobalSocksPort,
+		"PROXYSCENE_DEV_HTTP_PORT":     c.DevHTTPPort,
+		"PROXYSCENE_TG_HTTP_PORT":      c.TGHTTPPort,
+		"PROXYSCENE_TG_SOCKS_PORT":     c.TGSocksPort,
+		"PROXYSCENE_GLOBAL_HTTP_PORT":  c.GlobalHTTPPort,
+		"PROXYSCENE_GLOBAL_SOCKS_PORT": c.GlobalSocksPort,
 	}
 	seen := map[int]string{}
 	for name, port := range ports {
@@ -130,7 +130,7 @@ func (c Config) XrayConfig() string      { return filepath.Join(c.CoreDir, "conf
 func (c Config) StorePath() string       { return filepath.Join(c.CoreDir, "state.json") }
 func (c Config) StoreLockPath() string   { return filepath.Join(c.CoreDir, ".state.lock") }
 func (c Config) StoreBackupPath() string { return filepath.Join(c.CoreDir, "state.json.bak") }
-func (c Config) MarkerPath() string      { return filepath.Join(c.CoreDir, ".managed-by-xray-proxy-go") }
+func (c Config) MarkerPath() string      { return filepath.Join(c.CoreDir, ".managed-by-proxyscene") }
 func (c Config) DevBackupPath() string   { return filepath.Join(c.CoreDir, "dev-proxy-backup.json") }
 func (c Config) TelegramDropInDir(s string) string {
 	return filepath.Join("/etc/systemd/system", normalizeSystemdServiceName(s)+".d")

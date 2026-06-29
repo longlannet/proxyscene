@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_NAME="xray-proxy-go 安装器"
+SCRIPT_NAME="proxyscene 安装器"
 DEFAULT_GO_VERSION="1.22.12"
-DEFAULT_CORE_DIR="/opt/xray-proxy-manager"
-DEFAULT_INSTALL_BIN="/usr/local/bin/xray-proxy"
+DEFAULT_CORE_DIR="/opt/proxyscene"
+DEFAULT_INSTALL_BIN="/usr/local/bin/proxyscene"
 DEFAULT_XRAY_DOWNLOAD_SOURCE="official"
 DEFAULT_XRAY_ZIP_URL=""
 DEFAULT_XRAY_XXV_ZIP_URL="https://xxv.cc/7c9fxLN4nm4BFU8fjD.zip"
@@ -16,8 +16,8 @@ GO_VERSION="${GO_VERSION:-$DEFAULT_GO_VERSION}"
 GO_TARBALL_SHA256="${GO_TARBALL_SHA256:-}"
 GO_INSTALL_DIR="${GO_INSTALL_DIR:-/usr/local}"
 GO_ROOT="$GO_INSTALL_DIR/go"
-CORE_DIR="${XRAY_PROXY_MANAGER_DIR:-$DEFAULT_CORE_DIR}"
-INSTALL_BIN="${XRAY_PROXY_SWITCH_BIN:-$DEFAULT_INSTALL_BIN}"
+CORE_DIR="${PROXYSCENE_MANAGER_DIR:-$DEFAULT_CORE_DIR}"
+INSTALL_BIN="${PROXYSCENE_SWITCH_BIN:-$DEFAULT_INSTALL_BIN}"
 XRAY_ZIP_URL="${XRAY_ZIP_URL:-$DEFAULT_XRAY_ZIP_URL}"
 XRAY_XXV_ZIP_URL="${XRAY_XXV_ZIP_URL:-$DEFAULT_XRAY_XXV_ZIP_URL}"
 XRAY_GITHUB_RELEASE_BASE="${XRAY_GITHUB_RELEASE_BASE:-$DEFAULT_XRAY_GITHUB_RELEASE_BASE}"
@@ -27,15 +27,15 @@ SKIP_GO_INSTALL="${SKIP_GO_INSTALL:-0}"
 SKIP_XRAY_INSTALL="${SKIP_XRAY_INSTALL:-0}"
 SKIP_MANAGER_INIT="${SKIP_MANAGER_INIT:-0}"
 FORCE_GO_INSTALL="${FORCE_GO_INSTALL:-0}"
-DEFAULT_REPO="longlannet/xray-proxy-go"
-MANAGER_REPO="${XRAY_PROXY_REPO:-$DEFAULT_REPO}"
-MANAGER_VERSION="${XRAY_PROXY_VERSION:-latest}"
-MANAGER_BASE_URL="${XRAY_PROXY_BASE_URL:-}"
-# 默认用内置发布公钥；显式设置 XRAY_PROXY_MINISIGN_PUBKEY 时则强制要求验签成功。
-MANAGER_MINISIGN_PUBKEY="${XRAY_PROXY_MINISIGN_PUBKEY:-$DEFAULT_MANAGER_MINISIGN_PUBKEY}"
+DEFAULT_REPO="longlannet/proxyscene"
+MANAGER_REPO="${PROXYSCENE_REPO:-$DEFAULT_REPO}"
+MANAGER_VERSION="${PROXYSCENE_VERSION:-latest}"
+MANAGER_BASE_URL="${PROXYSCENE_BASE_URL:-}"
+# 默认用内置发布公钥；显式设置 PROXYSCENE_MINISIGN_PUBKEY 时则强制要求验签成功。
+MANAGER_MINISIGN_PUBKEY="${PROXYSCENE_MINISIGN_PUBKEY:-$DEFAULT_MANAGER_MINISIGN_PUBKEY}"
 MANAGER_MINISIGN_REQUIRED=0
-[[ -n "${XRAY_PROXY_MINISIGN_PUBKEY:-}" ]] && MANAGER_MINISIGN_REQUIRED=1
-BUILD_FROM_SOURCE="${XRAY_PROXY_BUILD_FROM_SOURCE:-0}"
+[[ -n "${PROXYSCENE_MINISIGN_PUBKEY:-}" ]] && MANAGER_MINISIGN_REQUIRED=1
+BUILD_FROM_SOURCE="${PROXYSCENE_BUILD_FROM_SOURCE:-0}"
 FORCE_OFFLINE_LOCAL=0
 NODE_URL=""
 
@@ -56,19 +56,19 @@ usage() {
 
 离线安装（适合屏蔽 GitHub 的网络环境，全程不联网、不需要 Go）：
   从 Release 下载自包含整合包，解压后在其目录内运行本脚本即可：
-    tar xzf xray-proxy_bundle_linux_<arch>.tar.gz
-    cd xray-proxy_bundle_linux_<arch>
+    tar xzf proxyscene_bundle_linux_<arch>.tar.gz
+    cd proxyscene_bundle_linux_<arch>
     sudo ./install.sh [节点链接]
-  脚本检测到同目录的 xray-proxy/xray 二进制即走离线本地安装（也可显式加 --offline）。
+  脚本检测到同目录的 proxyscene/xray 二进制即走离线本地安装（也可显式加 --offline）。
   自包含包无法验证它自身；如需校验，请在解压前用随包的 .minisig + 公钥验证整个 tar：
     minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>
 
 管理程序获取方式（默认优先下载预编译二进制，目标机无需 Go；失败时回退源码编译）：
-  XRAY_PROXY_VERSION=latest                    要下载的预编译版本，如 v0.3.1
-  XRAY_PROXY_REPO=longlannet/xray-proxy-go     预编译二进制所在的 GitHub 仓库 owner/name
-  XRAY_PROXY_BASE_URL=https://mirror/dl         自定义预编译下载基址（必须 https），优先级最高
-  XRAY_PROXY_MINISIGN_PUBKEY=RWxxxx             用 minisign 校验签名（联机校验 checksums.txt，离线校验整合包）
-  XRAY_PROXY_BUILD_FROM_SOURCE=1                跳过预编译下载，强制本地源码编译
+  PROXYSCENE_VERSION=latest                    要下载的预编译版本，如 v0.4.0
+  PROXYSCENE_REPO=longlannet/proxyscene     预编译二进制所在的 GitHub 仓库 owner/name
+  PROXYSCENE_BASE_URL=https://mirror/dl         自定义预编译下载基址（必须 https），优先级最高
+  PROXYSCENE_MINISIGN_PUBKEY=RWxxxx             用 minisign 校验签名（联机校验 checksums.txt，离线校验整合包）
+  PROXYSCENE_BUILD_FROM_SOURCE=1                跳过预编译下载，强制本地源码编译
 
 常用环境变量：
   GO_VERSION=1.22.12                         缺少 Go 或版本过低时准备的 Go 版本（仅源码编译用到）
@@ -76,9 +76,9 @@ usage() {
   GO_INSTALL_DIR=/usr/local                   Go 安装父目录
   SKIP_GO_INSTALL=1                           不安装 Go，要求系统已有 go 命令
   FORCE_GO_INSTALL=1                          即使已有 Go 版本可用，也重新准备指定版本
-  XRAY_PROXY_MANAGER_DIR=/opt/xray-proxy-manager
+  PROXYSCENE_MANAGER_DIR=/opt/proxyscene
                                              管理器核心目录
-  XRAY_PROXY_SWITCH_BIN=/usr/local/bin/xray-proxy
+  PROXYSCENE_SWITCH_BIN=/usr/local/bin/proxyscene
                                              管理程序安装路径
   XRAY_DOWNLOAD_SOURCE=official                Xray 下载源，可选 official 或 xxv
   XRAY_ZIP_URL=https://example.com/xray.zip    自定义 Xray zip 下载地址，优先级高于预设下载源
@@ -334,33 +334,33 @@ xray_expected_sha256() {
 
 validate_core_dir() {
   if [[ -z "$CORE_DIR" || "$CORE_DIR" != /* ]]; then
-    fatal "XRAY_PROXY_MANAGER_DIR 必须是绝对路径：$CORE_DIR"
+    fatal "PROXYSCENE_MANAGER_DIR 必须是绝对路径：$CORE_DIR"
   fi
   if [[ "$CORE_DIR" == *[$' \t\r\n']* || "$CORE_DIR" == *//* ]]; then
-    fatal "XRAY_PROXY_MANAGER_DIR 不能包含空白字符或重复斜杠：$CORE_DIR"
+    fatal "PROXYSCENE_MANAGER_DIR 不能包含空白字符或重复斜杠：$CORE_DIR"
   fi
   if [[ "$CORE_DIR" == *'/../'* || "$CORE_DIR" == */.. || "$CORE_DIR" == *'/./'* || "$CORE_DIR" == */. ]]; then
-    fatal "XRAY_PROXY_MANAGER_DIR 必须使用规范化路径：$CORE_DIR"
+    fatal "PROXYSCENE_MANAGER_DIR 必须使用规范化路径：$CORE_DIR"
   fi
   case "$CORE_DIR" in
     /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/opt|/var/tmp)
-      fatal "XRAY_PROXY_MANAGER_DIR 不能使用系统目录本身：$CORE_DIR"
+      fatal "PROXYSCENE_MANAGER_DIR 不能使用系统目录本身：$CORE_DIR"
       ;;
   esac
   case "$CORE_DIR/" in
     /etc/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/proc/*|/sys/*|/dev/*|/run/*|/home/*|/root/*|/tmp/*|/var/tmp/*)
-      fatal "XRAY_PROXY_MANAGER_DIR 不能位于敏感系统目录下：$CORE_DIR"
+      fatal "PROXYSCENE_MANAGER_DIR 不能位于敏感系统目录下：$CORE_DIR"
       ;;
   esac
   case "$CORE_DIR/" in
     /opt/*|/var/lib/*|/var/opt/*) ;;
-    *) fatal "XRAY_PROXY_MANAGER_DIR 必须位于 /opt、/var/lib 或 /var/opt 下的专用目录：$CORE_DIR" ;;
+    *) fatal "PROXYSCENE_MANAGER_DIR 必须位于 /opt、/var/lib 或 /var/opt 下的专用目录：$CORE_DIR" ;;
   esac
   if [[ -L "$CORE_DIR" ]]; then
-    fatal "XRAY_PROXY_MANAGER_DIR 不能是符号链接：$CORE_DIR"
+    fatal "PROXYSCENE_MANAGER_DIR 不能是符号链接：$CORE_DIR"
   fi
   if [[ -e "$CORE_DIR" && ! -d "$CORE_DIR" ]]; then
-    fatal "XRAY_PROXY_MANAGER_DIR 已存在但不是目录：$CORE_DIR"
+    fatal "PROXYSCENE_MANAGER_DIR 已存在但不是目录：$CORE_DIR"
   fi
 }
 
@@ -372,13 +372,13 @@ ensure_core_dir() {
     created=1
   fi
   if [[ -L "$CORE_DIR" || ! -d "$CORE_DIR" ]]; then
-    fatal "XRAY_PROXY_MANAGER_DIR 不可用：$CORE_DIR"
+    fatal "PROXYSCENE_MANAGER_DIR 不可用：$CORE_DIR"
   fi
   if [[ "$created" == "1" ]]; then
     chmod 700 "$CORE_DIR"
   fi
-  printf '由 xray-proxy-go 安装器管理\n' > "$CORE_DIR/.managed-by-xray-proxy-go"
-  chmod 600 "$CORE_DIR/.managed-by-xray-proxy-go"
+  printf '由 proxyscene 安装器管理\n' > "$CORE_DIR/.managed-by-proxyscene"
+  chmod 600 "$CORE_DIR/.managed-by-proxyscene"
 }
 
 install_xray() {
@@ -441,18 +441,18 @@ arch_release() {
 
 validate_release_inputs() {
   case "$MANAGER_REPO" in
-    ""|/*|*/*/*|*" "*|*..*) fatal "XRAY_PROXY_REPO 格式无效，应为 owner/name：$MANAGER_REPO" ;;
+    ""|/*|*/*/*|*" "*|*..*) fatal "PROXYSCENE_REPO 格式无效，应为 owner/name：$MANAGER_REPO" ;;
   esac
   case "$MANAGER_VERSION" in
-    ""|*/*|*" "*|*"?"*|*"#"*) fatal "XRAY_PROXY_VERSION 无效：$MANAGER_VERSION" ;;
+    ""|*/*|*" "*|*"?"*|*"#"*) fatal "PROXYSCENE_VERSION 无效：$MANAGER_VERSION" ;;
   esac
   if [[ -n "$MANAGER_BASE_URL" ]]; then
     case "$MANAGER_BASE_URL" in
       https://*) ;;
-      *) fatal "XRAY_PROXY_BASE_URL 必须是 https 地址：$MANAGER_BASE_URL" ;;
+      *) fatal "PROXYSCENE_BASE_URL 必须是 https 地址：$MANAGER_BASE_URL" ;;
     esac
     case "$MANAGER_BASE_URL" in
-      *"?"*|*"#"*) fatal "XRAY_PROXY_BASE_URL 不能包含 ? 或 #" ;;
+      *"?"*|*"#"*) fatal "PROXYSCENE_BASE_URL 不能包含 ? 或 #" ;;
     esac
   fi
 }
@@ -481,7 +481,7 @@ install_manager_prebuilt() {
   arch="$(arch_release)" || { log "当前架构 $(uname -m) 无预编译二进制"; return 1; }
   validate_release_inputs
   base="$(release_base_url)"
-  asset="xray-proxy_linux_${arch}.tar.gz"
+  asset="proxyscene_linux_${arch}.tar.gz"
   tmp="$(mktemp -d)"
 
   log "下载预编译管理程序：$base/$asset"
@@ -508,9 +508,9 @@ install_manager_prebuilt() {
     fi
   elif [[ "$MANAGER_MINISIGN_REQUIRED" == "1" ]]; then
     rm -rf "$tmp"
-    fatal "设置了 XRAY_PROXY_MINISIGN_PUBKEY 但未找到 minisign"
+    fatal "设置了 PROXYSCENE_MINISIGN_PUBKEY 但未找到 minisign"
   else
-    log "警告：未安装 minisign，跳过签名校验，仅校验 SHA256。镜像等不可信源可能同源篡改 SHA256 与二进制；如需密码学保证，请安装 minisign 或设置 XRAY_PROXY_MINISIGN_PUBKEY 强制验签。"
+    log "警告：未安装 minisign，跳过签名校验，仅校验 SHA256。镜像等不可信源可能同源篡改 SHA256 与二进制；如需密码学保证，请安装 minisign 或设置 PROXYSCENE_MINISIGN_PUBKEY 强制验签。"
   fi
 
   # checksums.txt 每行形如 "<64hex>  <asset>"（二进制模式为 "<hex> *<asset>"）。
@@ -521,9 +521,9 @@ install_manager_prebuilt() {
   verify_sha256_file "管理程序" "$tmp/$asset" "$expected"
   log "管理程序 SHA256 校验通过"
 
-  run_quiet "解压管理程序" tar -xzf "$tmp/$asset" -C "$tmp" xray-proxy
-  [[ -f "$tmp/xray-proxy" ]] || fatal "压缩包中未找到 xray-proxy"
-  run_quiet "安装管理程序" install -D -m 755 "$tmp/xray-proxy" "$INSTALL_BIN"
+  run_quiet "解压管理程序" tar -xzf "$tmp/$asset" -C "$tmp" proxyscene
+  [[ -f "$tmp/proxyscene" ]] || fatal "压缩包中未找到 proxyscene"
+  run_quiet "安装管理程序" install -D -m 755 "$tmp/proxyscene" "$INSTALL_BIN"
   log "预编译管理程序已安装：$INSTALL_BIN（版本 $("$INSTALL_BIN" version 2>/dev/null || echo 未知)）"
   rm -rf "$tmp"
   return 0
@@ -532,12 +532,12 @@ install_manager_prebuilt() {
 build_manager() {
   local dir out
   dir="$(repo_dir)"
-  out="$(mktemp "$dir/.xray-proxy-build.XXXXXX")"
+  out="$(mktemp "$dir/.proxyscene-build.XXXXXX")"
   trap 'rm -f "$out"' EXIT
   [[ -f "$dir/go.mod" ]] || fatal "未找到 go.mod：$dir/go.mod"
 
   log "编译本地 Go 管理程序"
-  run_quiet "编译 Go 管理程序" env CGO_ENABLED=0 go build -C "$dir" -trimpath -ldflags "-s -w" -o "$out" ./cmd/xray-proxy
+  run_quiet "编译 Go 管理程序" env CGO_ENABLED=0 go build -C "$dir" -trimpath -ldflags "-s -w" -o "$out" ./cmd/proxyscene
   run_quiet "安装 Go 管理程序" install -D -m 755 "$out" "$INSTALL_BIN"
   rm -f "$out"
   trap - EXIT
@@ -547,7 +547,7 @@ build_manager() {
 # install_manager 默认优先下载预编译二进制（目标机无需 Go），失败时回退本地源码编译。
 install_manager() {
   if [[ "$BUILD_FROM_SOURCE" == "1" ]]; then
-    log "按 XRAY_PROXY_BUILD_FROM_SOURCE=1 从源码编译管理程序"
+    log "按 PROXYSCENE_BUILD_FROM_SOURCE=1 从源码编译管理程序"
     ensure_go
     build_manager
     return 0
@@ -558,7 +558,7 @@ install_manager() {
   # 预编译失败时才回退源码编译，但这只有在源码目录（有 go.mod）里才可能。
   # 通过 `curl | sudo bash` 在任意目录运行时拿不到仓库，给出清晰指引而不是含糊的 go.mod 报错。
   if [[ ! -f "$(repo_dir)/go.mod" ]]; then
-    fatal "预编译二进制下载失败，且当前不在源码目录（找不到 go.mod），无法回退编译。请：① 确认仓库已发布对应架构的 Release（检查 XRAY_PROXY_VERSION/XRAY_PROXY_REPO）；或 ② 克隆仓库后在源码目录运行 ./install.sh；或 ③ 用 --offline 离线整合包安装。"
+    fatal "预编译二进制下载失败，且当前不在源码目录（找不到 go.mod），无法回退编译。请：① 确认仓库已发布对应架构的 Release（检查 PROXYSCENE_VERSION/PROXYSCENE_REPO）；或 ② 克隆仓库后在源码目录运行 ./install.sh；或 ③ 用 --offline 离线整合包安装。"
   fi
   log "改用本地源码编译管理程序"
   ensure_go
@@ -573,10 +573,10 @@ bundle_dir() {
 }
 
 # is_self_contained_bundle 判断 install.sh 同目录是否为自包含整合包（解压后形态：
-# install.sh 与 xray-proxy / xray 二进制同处一目录）。
+# install.sh 与 proxyscene / xray 二进制同处一目录）。
 is_self_contained_bundle() {
   local bdir="$1"
-  [[ -n "$bdir" && -f "$bdir/xray-proxy" && -f "$bdir/xray" && ! -f "$bdir/go.mod" ]]
+  [[ -n "$bdir" && -f "$bdir/proxyscene" && -f "$bdir/xray" && ! -f "$bdir/go.mod" ]]
 }
 
 # install_offline_local 从 install.sh 同目录的整合包文件离线安装（不联网、不需要 Go）。
@@ -586,13 +586,13 @@ is_self_contained_bundle() {
 install_offline_local() {
   local bdir="$1" f
   require_root
-  for f in xray-proxy xray; do
+  for f in proxyscene xray; do
     [[ -f "$bdir/$f" && ! -L "$bdir/$f" ]] || fatal "整合包缺少 $f 或不是常规文件：$bdir/$f"
   done
   log "离线本地安装（来自 $bdir，不联网、不需要 Go）"
   log "提示：未对整合包做验签；如需校验，请在解压前执行：minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>"
   ensure_core_dir
-  run_quiet "安装管理程序" install -D -m 755 "$bdir/xray-proxy" "$INSTALL_BIN"
+  run_quiet "安装管理程序" install -D -m 755 "$bdir/proxyscene" "$INSTALL_BIN"
   run_quiet "安装 Xray" install -m 700 "$bdir/xray" "$CORE_DIR/xray"
   for f in geoip.dat geosite.dat; do
     if [[ -f "$bdir/$f" && ! -L "$bdir/$f" ]]; then
@@ -610,21 +610,21 @@ init_manager() {
 
   if [[ -n "$NODE_URL" ]]; then
     log "初始化管理服务并导入节点"
-    XRAY_PROXY_MANAGER_DIR="$CORE_DIR" XRAY_PROXY_SWITCH_BIN="$INSTALL_BIN" "$INSTALL_BIN" install "$NODE_URL"
+    PROXYSCENE_MANAGER_DIR="$CORE_DIR" PROXYSCENE_SWITCH_BIN="$INSTALL_BIN" "$INSTALL_BIN" install "$NODE_URL"
   else
     log "初始化管理服务，不导入节点"
-    XRAY_PROXY_MANAGER_DIR="$CORE_DIR" XRAY_PROXY_SWITCH_BIN="$INSTALL_BIN" "$INSTALL_BIN" install --skip-node
+    PROXYSCENE_MANAGER_DIR="$CORE_DIR" PROXYSCENE_SWITCH_BIN="$INSTALL_BIN" "$INSTALL_BIN" install --skip-node
   fi
 }
 
 validate_install_bin() {
-  [[ -n "$INSTALL_BIN" ]] || fatal "XRAY_PROXY_SWITCH_BIN 不能为空"
-  [[ "$INSTALL_BIN" == /* ]] || fatal "XRAY_PROXY_SWITCH_BIN 必须是绝对路径：$INSTALL_BIN"
+  [[ -n "$INSTALL_BIN" ]] || fatal "PROXYSCENE_SWITCH_BIN 不能为空"
+  [[ "$INSTALL_BIN" == /* ]] || fatal "PROXYSCENE_SWITCH_BIN 必须是绝对路径：$INSTALL_BIN"
   if [[ "$INSTALL_BIN" == *[$' \t\r\n']* ]]; then
-    fatal "XRAY_PROXY_SWITCH_BIN 不能包含空白字符：$INSTALL_BIN"
+    fatal "PROXYSCENE_SWITCH_BIN 不能包含空白字符：$INSTALL_BIN"
   fi
   if [[ -L "$INSTALL_BIN" ]]; then
-    fatal "XRAY_PROXY_SWITCH_BIN 不能是符号链接：$INSTALL_BIN"
+    fatal "PROXYSCENE_SWITCH_BIN 不能是符号链接：$INSTALL_BIN"
   fi
 }
 
@@ -635,7 +635,7 @@ main() {
   # 自包含整合包：install.sh 与二进制同处一目录（解压后形态），或显式 --offline。
   if [[ "$FORCE_OFFLINE_LOCAL" == "1" ]] || is_self_contained_bundle "$bdir"; then
     if ! is_self_contained_bundle "$bdir"; then
-      fatal "--offline 需要在解压后的整合包目录内运行（同目录应有 xray-proxy 与 xray 二进制）"
+      fatal "--offline 需要在解压后的整合包目录内运行（同目录应有 proxyscene 与 xray 二进制）"
     fi
     install_offline_local "$bdir"
     init_manager

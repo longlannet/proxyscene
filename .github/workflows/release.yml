@@ -36,7 +36,7 @@ jobs:
           sudo apt-get install -y unzip
           mkdir -p dist
           VERSION="${GITHUB_REF_NAME#v}"
-          LDFLAGS="-s -w -X xray-proxy-go/internal/manager.Version=${VERSION} -X xray-proxy-go/internal/manager.Commit=${GITHUB_SHA}"
+          LDFLAGS="-s -w -X proxyscene/internal/manager.Version=${VERSION} -X proxyscene/internal/manager.Commit=${GITHUB_SHA}"
 
           # 下载并用官方 .dgst 校验 Xray，输出解压目录。
           fetch_xray() {
@@ -55,14 +55,14 @@ jobs:
             local goarch="$1" goarm="$2" name="$3" xrayarch="$4" stage pkg
             stage="$(mktemp -d)"
             CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" \
-              go build -trimpath -ldflags="$LDFLAGS" -o "$stage/xray-proxy" ./cmd/xray-proxy
+              go build -trimpath -ldflags="$LDFLAGS" -o "$stage/proxyscene" ./cmd/proxyscene
             # 仅含管理程序的二进制包。
-            tar -C "$stage" -czf "dist/xray-proxy_linux_${name}.tar.gz" xray-proxy
+            tar -C "$stage" -czf "dist/proxyscene_linux_${name}.tar.gz" proxyscene
             # 自包含离线整合包：顶层目录内含 install.sh + 管理程序 + Xray + geo + NOTICE。
             # 解压后 `cd <目录> && sudo ./install.sh` 即可离线安装。
-            pkg="xray-proxy_bundle_linux_${name}"
+            pkg="proxyscene_bundle_linux_${name}"
             mkdir -p "$stage/$pkg"
-            install -m 755 "$stage/xray-proxy" "$stage/$pkg/xray-proxy"
+            install -m 755 "$stage/proxyscene" "$stage/$pkg/proxyscene"
             install -m 755 install.sh "$stage/$pkg/install.sh"
             install -m 644 NOTICE "$stage/$pkg/NOTICE"
             install -m 644 LICENSE "$stage/$pkg/LICENSE"
@@ -82,7 +82,7 @@ jobs:
           build_one arm64 "" arm64 arm64-v8a
           build_one 386   "" 386   32
           build_one arm   7  armv7 arm32-v7a
-          (cd dist && sha256sum xray-proxy_*.tar.gz > checksums.txt)
+          (cd dist && sha256sum proxyscene_*.tar.gz > checksums.txt)
       - name: Sign artifacts
         if: ${{ env.XRAY_PROXY_MINISIGN_SECRET_KEY != '' }}
         shell: bash
@@ -99,18 +99,18 @@ jobs:
           # 签名 checksums.txt（联机安装校验用）。
           minisign -S -W -m dist/checksums.txt -s minisign.key -x dist/checksums.txt.minisig
           # 逐个签名离线整合包（离线安装用内置公钥直接验 .minisig）。
-          for b in dist/xray-proxy_bundle_linux_*.tar.gz; do
+          for b in dist/proxyscene_bundle_linux_*.tar.gz; do
             minisign -S -W -m "$b" -s minisign.key -x "$b.minisig"
           done
       - name: Require signatures on canonical repo
         # 防止"签名 Secret 缺失时静默发布未签名产物"：官方仓库必须有签名才放行；
         # fork（github.repository 不同）缺少 Secret 属正常，跳过此检查。
-        if: ${{ github.repository == 'longlannet/xray-proxy-go' }}
+        if: ${{ github.repository == 'longlannet/proxyscene' }}
         shell: bash
         run: |
           set -euo pipefail
           test -f dist/checksums.txt.minisig || { echo "缺少 checksums.txt.minisig（签名 Secret 是否丢失？）"; exit 1; }
-          for f in dist/xray-proxy_bundle_linux_*.tar.gz; do
+          for f in dist/proxyscene_bundle_linux_*.tar.gz; do
             test -f "$f.minisig" || { echo "缺少签名：$f.minisig"; exit 1; }
           done
           echo "所有产物签名齐全"

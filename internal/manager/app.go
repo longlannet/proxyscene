@@ -41,7 +41,7 @@ func (a *App) Run(args []string) error {
 		a.help()
 		return nil
 	case "version", "--version", "-v":
-		fmt.Printf("xray-proxy %s\n", VersionString())
+		fmt.Printf("proxyscene %s\n", VersionString())
 		return nil
 	default:
 		return fmt.Errorf("未知命令：%s", args[0])
@@ -50,24 +50,24 @@ func (a *App) Run(args []string) error {
 
 func (a *App) help() {
 	fmt.Println("用法：")
-	fmt.Println("  xray-proxy install '节点链接'       初始化/更新管理服务，可同时导入节点")
-	fmt.Println("  xray-proxy install --skip-node      初始化/更新管理服务，不交互录入节点")
-	fmt.Println("  xray-proxy                         打开交互菜单")
-	fmt.Println("  xray-proxy global|dev|tg           切换场景开关")
-	fmt.Println("  xray-proxy global on|off           显式开启/关闭全局代理")
-	fmt.Println("  xray-proxy node                    打开节点管理菜单")
-	fmt.Println("  xray-proxy node list               查看节点")
-	fmt.Println("  xray-proxy node add '节点链接' '备注'")
-	fmt.Println("  xray-proxy node import '订阅链接'")
-	fmt.Println("  xray-proxy node rename '节点ID' '新备注'")
-	fmt.Println("  xray-proxy node remove '节点ID'      删除节点（别名：delete）")
-	fmt.Println("  xray-proxy node test               对所有节点做 TCP 连通性测速")
-	fmt.Println("  xray-proxy node auto [范围]         测速后自动选择最快节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
-	fmt.Println("  xray-proxy node use '节点ID' [范围] 使用指定节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
-	fmt.Println("  xray-proxy test                    通过全局代理测试连通性")
-	fmt.Println("  xray-proxy status                  查看状态")
-	fmt.Println("  xray-proxy version                 查看版本")
-	fmt.Println("  xray-proxy uninstall               卸载 systemd 服务（保留数据目录）")
+	fmt.Println("  proxyscene install '节点链接'       初始化/更新管理服务，可同时导入节点")
+	fmt.Println("  proxyscene install --skip-node      初始化/更新管理服务，不交互录入节点")
+	fmt.Println("  proxyscene                         打开交互菜单")
+	fmt.Println("  proxyscene global|dev|tg           切换场景开关")
+	fmt.Println("  proxyscene global on|off           显式开启/关闭全局代理")
+	fmt.Println("  proxyscene node                    打开节点管理菜单")
+	fmt.Println("  proxyscene node list               查看节点")
+	fmt.Println("  proxyscene node add '节点链接' '备注'")
+	fmt.Println("  proxyscene node import '订阅链接'")
+	fmt.Println("  proxyscene node rename '节点ID' '新备注'")
+	fmt.Println("  proxyscene node remove '节点ID'      删除节点（别名：delete）")
+	fmt.Println("  proxyscene node test               对所有节点做 TCP 连通性测速")
+	fmt.Println("  proxyscene node auto [范围]         测速后自动选择最快节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
+	fmt.Println("  proxyscene node use '节点ID' [范围] 使用指定节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
+	fmt.Println("  proxyscene test                    通过全局代理测试连通性")
+	fmt.Println("  proxyscene status                  查看状态")
+	fmt.Println("  proxyscene version                 查看版本")
+	fmt.Println("  proxyscene uninstall               卸载 systemd 服务（保留数据目录）")
 }
 
 func (a *App) menu() error {

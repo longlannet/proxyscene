@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"xray-proxy-go/internal/manager"
+	"proxyscene/internal/manager"
 )
 
 func main() {

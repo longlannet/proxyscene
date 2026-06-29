@@ -1,3 +1,3 @@
-module xray-proxy-go
+module proxyscene
 
 go 1.22

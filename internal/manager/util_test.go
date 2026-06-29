@@ -59,7 +59,7 @@ func TestDefaultConfigValidates(t *testing.T) {
 }
 
 func TestValidateProxyHostLoopbackOnly(t *testing.T) {
-	t.Setenv("XRAY_PROXY_ALLOW_PUBLIC_BIND", "0")
+	t.Setenv("PROXYSCENE_ALLOW_PUBLIC_BIND", "0")
 	if err := validateProxyHost("127.0.0.1"); err != nil {
 		t.Fatalf("环回地址应通过：%v", err)
 	}
@@ -69,7 +69,7 @@ func TestValidateProxyHostLoopbackOnly(t *testing.T) {
 	if err := validateProxyHost("8.8.8.8"); err == nil {
 		t.Fatalf("公网地址默认应被拒绝")
 	}
-	t.Setenv("XRAY_PROXY_ALLOW_PUBLIC_BIND", "1")
+	t.Setenv("PROXYSCENE_ALLOW_PUBLIC_BIND", "1")
 	if err := validateProxyHost("0.0.0.0"); err != nil {
 		t.Fatalf("显式 opt-in 后应允许：%v", err)
 	}

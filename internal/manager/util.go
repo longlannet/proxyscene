@@ -43,17 +43,6 @@ func envInt(key string, fallback int) int {
 	return n
 }
 
-func envIntAny(keys []string, fallback int) int {
-	for _, key := range keys {
-		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				return n
-			}
-		}
-	}
-	return fallback
-}
-
 func splitFields(s string) []string {
 	return strings.Fields(strings.ReplaceAll(s, ",", " "))
 }
@@ -739,9 +728,9 @@ func validateProxyHost(host string) error {
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		// 本地 HTTP/SOCKS 入站没有认证；绑定到非环回地址会把它暴露成开放代理。
-		// 默认只允许环回，确需对外监听时须显式设置 XRAY_PROXY_ALLOW_PUBLIC_BIND=1。
-		if !ip.IsLoopback() && !envBool("XRAY_PROXY_ALLOW_PUBLIC_BIND", false) {
-			return fmt.Errorf("代理监听地址 %s 非环回地址：无认证入站对外监听会形成开放代理；如确需，请设置 XRAY_PROXY_ALLOW_PUBLIC_BIND=1", host)
+		// 默认只允许环回，确需对外监听时须显式设置 PROXYSCENE_ALLOW_PUBLIC_BIND=1。
+		if !ip.IsLoopback() && !envBool("PROXYSCENE_ALLOW_PUBLIC_BIND", false) {
+			return fmt.Errorf("代理监听地址 %s 非环回地址：无认证入站对外监听会形成开放代理；如确需，请设置 PROXYSCENE_ALLOW_PUBLIC_BIND=1", host)
 		}
 		return nil
 	}

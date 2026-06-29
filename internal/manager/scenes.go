@@ -126,7 +126,7 @@ func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
 	fmt.Printf("%s：%s\n", sceneName(scene), onOff(enabled))
 	if scene == SceneGlobal && enabled {
 		fmt.Println("提示：当前已打开的 shell 不会自动继承新的代理环境变量。")
-		fmt.Println("如需当前 shell 立即生效，请执行：source /etc/profile.d/xray-global-proxy.sh")
+		fmt.Println("如需当前 shell 立即生效，请执行：source /etc/profile.d/proxyscene-global-proxy.sh")
 	}
 	return nil
 }
@@ -189,8 +189,8 @@ func (a *App) applyScene(scene Scene) error {
 func (a *App) restoreScene(scene Scene) error {
 	switch scene {
 	case SceneGlobal:
-		_ = os.Remove("/etc/profile.d/xray-global-proxy.sh")
-		_ = os.Remove("/etc/apt/apt.conf.d/99xray-global-proxy")
+		_ = os.Remove("/etc/profile.d/proxyscene-global-proxy.sh")
+		_ = os.Remove("/etc/apt/apt.conf.d/99proxyscene-global-proxy")
 	case SceneDev:
 		return a.restoreDev()
 	case SceneTelegram:
@@ -204,12 +204,12 @@ func (a *App) applyGlobal() error {
 	// 限定为 IP 或 [A-Za-z0-9.-]）和已校验端口拼成，不含 shell 元字符，因此 %q 的
 	// Go 双引号语义在此等价于安全引用；如果未来放宽 ProxyHost 字符集，需改用严格的
 	// shell 引用。
-	content := fmt.Sprintf("# 由 xray-proxy-go 管理\nexport http_proxy=%q\nexport https_proxy=%q\nexport all_proxy=%q\nexport HTTP_PROXY=%q\nexport HTTPS_PROXY=%q\nexport ALL_PROXY=%q\n", a.cfg.HTTPAddr(SceneGlobal), a.cfg.HTTPAddr(SceneGlobal), a.cfg.GlobalSocksAddr(), a.cfg.HTTPAddr(SceneGlobal), a.cfg.HTTPAddr(SceneGlobal), a.cfg.GlobalSocksAddr())
-	if err := writeFileAtomic("/etc/profile.d/xray-global-proxy.sh", []byte(content), 0o644); err != nil {
+	content := fmt.Sprintf("# 由 proxyscene 管理\nexport http_proxy=%q\nexport https_proxy=%q\nexport all_proxy=%q\nexport HTTP_PROXY=%q\nexport HTTPS_PROXY=%q\nexport ALL_PROXY=%q\n", a.cfg.HTTPAddr(SceneGlobal), a.cfg.HTTPAddr(SceneGlobal), a.cfg.GlobalSocksAddr(), a.cfg.HTTPAddr(SceneGlobal), a.cfg.HTTPAddr(SceneGlobal), a.cfg.GlobalSocksAddr())
+	if err := writeFileAtomic("/etc/profile.d/proxyscene-global-proxy.sh", []byte(content), 0o644); err != nil {
 		return err
 	}
-	apt := fmt.Sprintf("// 由 xray-proxy-go 管理\nAcquire::http::Proxy %q;\nAcquire::https::Proxy %q;\n", a.cfg.HTTPAddr(SceneGlobal), a.cfg.HTTPAddr(SceneGlobal))
-	if err := writeFileAtomic("/etc/apt/apt.conf.d/99xray-global-proxy", []byte(apt), 0o644); err != nil {
+	apt := fmt.Sprintf("// 由 proxyscene 管理\nAcquire::http::Proxy %q;\nAcquire::https::Proxy %q;\n", a.cfg.HTTPAddr(SceneGlobal), a.cfg.HTTPAddr(SceneGlobal))
+	if err := writeFileAtomic("/etc/apt/apt.conf.d/99proxyscene-global-proxy", []byte(apt), 0o644); err != nil {
 		return err
 	}
 	return nil
@@ -301,7 +301,7 @@ func (a *App) applyTelegram() error {
 }
 
 func telegramProxyEnvContent(cfg Config) string {
-	return fmt.Sprintf("# 由 xray-proxy-go 管理\n%s", telegramProxyEnvironmentLines(cfg))
+	return fmt.Sprintf("# 由 proxyscene 管理\n%s", telegramProxyEnvironmentLines(cfg))
 }
 
 func telegramProxyEnvPairs(cfg Config) []string {

@@ -15,7 +15,7 @@ func (a *App) ensureCoreDirs() error {
 		return err
 	}
 	// 与其余写入保持一致：用原子、O_NOFOLLOW 的写法，避免跟随符号链接。
-	return writeFileAtomic(a.cfg.MarkerPath(), []byte("由 xray-proxy-go 管理\n"), 0o600)
+	return writeFileAtomic(a.cfg.MarkerPath(), []byte("由 proxyscene 管理\n"), 0o600)
 }
 
 func (a *App) ensureXrayInstalled() error {
@@ -158,7 +158,7 @@ func (a *App) testProxy() error {
 		return err
 	}
 	if !st.SceneEnabled[SceneGlobal] {
-		return fmt.Errorf("全局代理未开启，请先运行：xray-proxy global on")
+		return fmt.Errorf("全局代理未开启，请先运行：proxyscene global on")
 	}
 	if st.selectedNodeID(SceneGlobal) == "" {
 		return fmt.Errorf("全局代理没有可用节点，请先添加或选择节点")
@@ -177,7 +177,7 @@ func (a *App) testProxy() error {
 	if err != nil {
 		return fmt.Errorf("创建代理测试请求失败：%s", a.cfg.TestURL)
 	}
-	req.Header.Set("User-Agent", "xray-proxy-go/"+Version)
+	req.Header.Set("User-Agent", "proxyscene/"+Version)
 	start := time.Now()
 	resp, err := client.Do(req)
 	elapsed := time.Since(start).Milliseconds()
