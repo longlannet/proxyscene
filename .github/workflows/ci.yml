@@ -30,11 +30,49 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Shell syntax
-        run: bash -n install.sh
+        run: |
+          bash -n install.sh
+          bash -n scripts/build-bundle.sh
       - name: ShellCheck
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y shellcheck
           fi
-          shellcheck install.sh
+          shellcheck install.sh scripts/build-bundle.sh
+
+  build-dry-run:
+    name: Release build (dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install unzip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
+      - name: Build amd64 bundle (dry run)
+        # 仅构建 amd64，端到端验证发布脚本（含 Xray 下载与 .dgst 校验、打包、checksums）。
+        env:
+          VERSION: 0.0.0-dryrun
+        run: scripts/build-bundle.sh amd64
+      - name: Verify artifacts
+        run: |
+          set -euo pipefail
+          test -f dist/proxyscene_linux_amd64.tar.gz
+          test -f dist/proxyscene_bundle_linux_amd64.tar.gz
+          test -f dist/checksums.txt
+          # 校验离线整合包的目录布局齐全。
+          contents="$(tar tzf dist/proxyscene_bundle_linux_amd64.tar.gz)"
+          for f in proxyscene install.sh xray geoip.dat geosite.dat NOTICE LICENSE; do
+            echo "$contents" | grep -qx "proxyscene_bundle_linux_amd64/$f" \
+              || { echo "整合包缺少：$f"; exit 1; }
+          done
+          # checksums.txt 应能在 dist 内通过校验。
+          ( cd dist && sha256sum -c checksums.txt )
+          echo "dry-run 产物校验通过"
