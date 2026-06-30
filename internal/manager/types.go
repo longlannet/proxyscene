@@ -9,7 +9,7 @@ import (
 // Version 和 Commit 可在构建时通过 -ldflags "-X proxyscene/internal/manager.Version=..."
 // 注入（release 工作流会用 git tag 和 commit 覆盖）；源码直接构建时使用下面的默认值。
 var (
-	Version = "0.5.0"
+	Version = "0.6.0"
 	Commit  = ""
 )
 
@@ -52,18 +52,21 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		CoreDir:          envString("PROXYSCENE_MANAGER_DIR", "/opt/proxyscene"),
-		ProxyHost:        envString("PROXYSCENE_HOST", "127.0.0.1"),
-		DevHTTPPort:      envInt("PROXYSCENE_DEV_HTTP_PORT", 7891),
-		TGHTTPPort:       envInt("PROXYSCENE_TG_HTTP_PORT", 7892),
-		TGSocksPort:      envInt("PROXYSCENE_TG_SOCKS_PORT", 7893),
-		GlobalHTTPPort:   envInt("PROXYSCENE_GLOBAL_HTTP_PORT", 7890),
-		GlobalSocksPort:  envInt("PROXYSCENE_GLOBAL_SOCKS_PORT", 7894),
-		InstallBin:       envString("PROXYSCENE_SWITCH_BIN", "/usr/local/bin/proxyscene"),
-		SystemdService:   envString("PROXYSCENE_SYSTEMD_SERVICE_NAME", "proxyscene.service"),
-		RestoreService:   envString("PROXYSCENE_BOOT_RESTORE_SERVICE_NAME", "proxyscene-restore.service"),
-		XrayServiceUser:  envString("PROXYSCENE_SERVICE_USER", "proxyscene"),
-		TGTargetServices: splitFields(envString("PROXYSCENE_TG_SERVICES", "openclaw hermes hermes-gateway user:root:hermes-gateway")),
+		CoreDir:         envString("PROXYSCENE_MANAGER_DIR", "/opt/proxyscene"),
+		ProxyHost:       envString("PROXYSCENE_HOST", "127.0.0.1"),
+		DevHTTPPort:     envInt("PROXYSCENE_DEV_HTTP_PORT", 7891),
+		TGHTTPPort:      envInt("PROXYSCENE_TG_HTTP_PORT", 7892),
+		TGSocksPort:     envInt("PROXYSCENE_TG_SOCKS_PORT", 7893),
+		GlobalHTTPPort:  envInt("PROXYSCENE_GLOBAL_HTTP_PORT", 7890),
+		GlobalSocksPort: envInt("PROXYSCENE_GLOBAL_SOCKS_PORT", 7894),
+		InstallBin:      envString("PROXYSCENE_SWITCH_BIN", "/usr/local/bin/proxyscene"),
+		SystemdService:  envString("PROXYSCENE_SYSTEMD_SERVICE_NAME", "proxyscene.service"),
+		RestoreService:  envString("PROXYSCENE_BOOT_RESTORE_SERVICE_NAME", "proxyscene-restore.service"),
+		XrayServiceUser: envString("PROXYSCENE_SERVICE_USER", "proxyscene"),
+		// 默认只锚定规范的系统级 hermes 网关；openclaw 网关、hermes 的 profile 实例、用户级单元
+		// 都由精确自动发现覆盖（见 telegram_discovery.go）。此前写死的 openclaw/hermes/
+		// user:root:hermes-gateway 会对不存在的单元生成 phantom drop-in 并触发 exit-5 重启告警。
+		TGTargetServices: splitFields(envString("PROXYSCENE_TG_SERVICES", "hermes-gateway")),
 		DevTargetUser:    envString("PROXYSCENE_DEV_TARGET_USER", ""),
 		TestURL:          envString("PROXYSCENE_TEST_URL", "https://www.google.com/generate_204"),
 	}

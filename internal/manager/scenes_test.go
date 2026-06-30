@@ -9,11 +9,9 @@ func TestTelegramProxyEnvPairsOnlyTelegramScoped(t *testing.T) {
 	cfg := DefaultConfig()
 	pairs := telegramProxyEnvPairs(cfg)
 
+	// 只注入 TELEGRAM_PROXY（Hermes 实际消费的唯一 telegram 专用变量）。
 	want := map[string]string{
-		"TELEGRAM_PROXY":       "http://127.0.0.1:7892",
-		"TELEGRAM_HTTP_PROXY":  "http://127.0.0.1:7892",
-		"TELEGRAM_HTTPS_PROXY": "http://127.0.0.1:7892",
-		"TELEGRAM_SOCKS_PROXY": "socks5h://127.0.0.1:7893",
+		"TELEGRAM_PROXY": "http://127.0.0.1:7892",
 	}
 	if len(pairs) != len(want) {
 		t.Fatalf("telegramProxyEnvPairs() returned %d pairs, want %d: %v", len(pairs), len(want), pairs)
@@ -54,9 +52,6 @@ func TestTelegramProxySystemdEnvironmentLinesDoNotInjectBroadProxy(t *testing.T)
 	}
 	for _, required := range []string{
 		`Environment="TELEGRAM_PROXY=http://127.0.0.1:7892"`,
-		`Environment="TELEGRAM_HTTP_PROXY=http://127.0.0.1:7892"`,
-		`Environment="TELEGRAM_HTTPS_PROXY=http://127.0.0.1:7892"`,
-		`Environment="TELEGRAM_SOCKS_PROXY=socks5h://127.0.0.1:7893"`,
 	} {
 		if !strings.Contains(lines, required) {
 			t.Fatalf("systemd env lines missing %s in:\n%s", required, lines)

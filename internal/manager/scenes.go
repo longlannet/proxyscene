@@ -270,8 +270,29 @@ func (a *App) applyTelegram() error {
 		return err
 	}
 	dropIn := "[Service]\nEnvironmentFile=/etc/openclaw-hermes-tg-proxy.env\n"
+	proxyURL := a.cfg.HTTPAddr(SceneTelegram)
+	manageOpenClaw := envBool("PROXYSCENE_MANAGE_OPENCLAW_CONFIG", true)
 	userManagers := map[string]bool{}
+	openClawRestart := []systemdTargetName{} // openclaw 目标中配置确有改动、需重启以重载的
 	for _, target := range targets {
+		// OpenClaw 不读 TELEGRAM_*，env 注入对它无效；改其 channels.telegram.proxy 配置实现仅代理 Telegram。
+		if a.isOpenClawTarget(target) {
+			if !manageOpenClaw {
+				continue
+			}
+			if target.UserMode {
+				changed, err := a.applyOpenClawTelegramProxy(target.User, proxyURL)
+				if err != nil {
+					return err
+				}
+				if changed {
+					openClawRestart = append(openClawRestart, target)
+				}
+			} else if systemUnitExists(target.Service) {
+				fmt.Printf("警告：系统级 openclaw 单元 %s 无法确定配置归属用户，已跳过，请手动设置 channels.telegram.proxy=%s\n", target.Service, proxyURL)
+			}
+			continue
+		}
 		if target.UserMode {
 			path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service)
 			if err != nil {
@@ -294,28 +315,42 @@ func (a *App) applyTelegram() error {
 	for userName := range userManagers {
 		runUserSystemctlWarn(userName, "重新加载用户级 systemd 配置", "daemon-reload")
 	}
+	a.restartTelegramTargets(targets, openClawRestart)
+	return nil
+}
+
+// restartTelegramTargets 重启注入了 env drop-in 的目标（hermes 等），openclaw 目标则只重启
+// 配置确有改动的（在 changedOpenClaw 中），避免在配置未变时无谓地把整个 openclaw 网关弹一次。
+func (a *App) restartTelegramTargets(targets, changedOpenClaw []systemdTargetName) {
 	for _, target := range targets {
+		if a.isOpenClawTarget(target) {
+			continue // openclaw 按需单独重启（见下）
+		}
 		if target.UserMode {
 			runUserSystemctlWarn(target.User, "重启用户级服务 "+target.Service, "try-restart", "--", target.Service)
 			continue
 		}
 		_ = runQuiet("systemctl", "try-restart", "--", target.Service)
 	}
-	return nil
+	for _, target := range changedOpenClaw {
+		runUserSystemctlWarn(target.User, "重启 openclaw 以加载配置 "+target.Service, "try-restart", "--", target.Service)
+	}
 }
 
 func telegramProxyEnvContent(cfg Config) string {
 	return fmt.Sprintf("# 由 proxyscene 管理\n%s", telegramProxyEnvironmentLines(cfg))
 }
 
+// telegramProxyEnvPairs 返回注入目标服务的 Telegram 专用代理环境变量。
+// 只注入 TELEGRAM_PROXY 这一个：它是 Hermes 实际消费的变量（其 config 描述为
+// "Proxy URL for Telegram connections (overrides HTTPS_PROXY)，支持 http/https/socks5"）。
+// 此前一并注入的 TELEGRAM_HTTP_PROXY / TELEGRAM_HTTPS_PROXY / TELEGRAM_SOCKS_PROXY 没有任何
+// 已知消费方，属冗余，已移除。绝不注入 HTTP_PROXY/ALL_PROXY 等宽口径变量——本场景只代理
+// Telegram，注入通用代理会把目标服务的全部出网都导流（OpenClaw 即只认通用变量，因此
+// 无法用环境变量做到「仅代理 Telegram」，需改用其 channels.telegram.proxy 配置项）。
 func telegramProxyEnvPairs(cfg Config) []string {
-	httpProxy := cfg.HTTPAddr(SceneTelegram)
-	socksProxy := cfg.TGSocksAddr()
 	return []string{
-		"TELEGRAM_PROXY=" + httpProxy,
-		"TELEGRAM_HTTP_PROXY=" + httpProxy,
-		"TELEGRAM_HTTPS_PROXY=" + httpProxy,
-		"TELEGRAM_SOCKS_PROXY=" + socksProxy,
+		"TELEGRAM_PROXY=" + cfg.HTTPAddr(SceneTelegram),
 	}
 }
 
@@ -342,8 +377,27 @@ func (a *App) restoreTelegram() error {
 	for _, err := range targetErrs {
 		fmt.Printf("警告：跳过无效的电报服务代理清理目标：%v\n", err)
 	}
+	proxyURL := a.cfg.HTTPAddr(SceneTelegram)
 	userManagers := map[string]bool{}
+	openClawRestart := []systemdTargetName{} // openclaw 目标中配置确有还原、需重启以重载的
 	for _, target := range targets {
+		if a.isOpenClawTarget(target) {
+			// 还原 openclaw 配置（仅当当前值仍是我们设置的托管值），并顺带清理旧版本可能写入的无效 drop-in。
+			if target.UserMode {
+				changed, err := a.restoreOpenClawTelegramProxy(target.User, proxyURL)
+				if err != nil {
+					fmt.Printf("警告：还原用户 %s 的 openclaw Telegram 代理配置失败：%v\n", target.User, err)
+				}
+				if changed {
+					openClawRestart = append(openClawRestart, target)
+				}
+				if path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service); err == nil {
+					_ = os.Remove(path)
+					_ = os.Remove(filepath.Dir(path))
+				}
+			}
+			continue
+		}
 		if target.UserMode {
 			path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service)
 			if err == nil {
@@ -361,12 +415,6 @@ func (a *App) restoreTelegram() error {
 	for userName := range userManagers {
 		runUserSystemctlWarn(userName, "重新加载用户级 systemd 配置", "daemon-reload")
 	}
-	for _, target := range targets {
-		if target.UserMode {
-			runUserSystemctlWarn(target.User, "重启用户级服务 "+target.Service, "try-restart", "--", target.Service)
-			continue
-		}
-		_ = runQuiet("systemctl", "try-restart", "--", target.Service)
-	}
+	a.restartTelegramTargets(targets, openClawRestart)
 	return nil
 }

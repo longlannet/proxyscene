@@ -94,7 +94,9 @@ func discoverTelegramTargetNames() []string {
 }
 
 func discoverSystemTelegramTargetNames() []string {
-	roots := []string{"/etc/systemd/system", "/lib/systemd/system", "/usr/lib/systemd/system"}
+	// /usr/local/lib/systemd/system 是本地（非发行版）系统单元的标准安装位置，
+	// 一并扫描，避免装在该处的网关被漏检。
+	roots := []string{"/etc/systemd/system", "/usr/local/lib/systemd/system", "/lib/systemd/system", "/usr/lib/systemd/system"}
 	values := []string{}
 	seen := map[string]bool{}
 	for _, root := range roots {
@@ -166,14 +168,41 @@ func walkTelegramUnitFiles(root string, visit func(path, service string)) {
 	})
 }
 
+// isTelegramRelatedUnit 判定一个 systemd 单元是否为「需要注入 Telegram 代理」的客户端网关。
+// 采用精确识别而非泛关键字子串，避免把名字里碰巧含 openclaw/hermes 的无关单元误判进来
+// （例如 openclaw-xhigh-guard.service 这种仅文件名带 openclaw 的守护单元）：
+//   - OpenClaw：要求带厂商标记 Environment=OPENCLAW_SERVICE_MARKER=openclaw 且
+//     OPENCLAW_SERVICE_KIND=gateway——只命中网关，排除 guard 与 node 等非 Telegram 角色。
+//   - Hermes：无专用 env 标记，按单元名 hermes-gateway[-<profile>] 或 ExecStart 调用
+//     hermes_cli / hermes-agent 的 gateway 子命令来识别（涵盖 profile 实例单元）。
 func isTelegramRelatedUnit(path, service string) bool {
-	if containsTelegramServiceKeyword(service) {
+	if isHermesGatewayUnitName(service) {
 		return true
 	}
 	content, err := readTelegramUnitContent(path)
 	if err != nil {
 		return false
 	}
+	return unitLooksLikeTelegramClient(content)
+}
+
+// isHermesGatewayUnitName 匹配 hermes 网关单元名：默认 profile 的 hermes-gateway.service，
+// 以及命名 profile 实例 hermes-gateway-<profile>.service（见 hermes 的 _SERVICE_BASE 规律）。
+func isHermesGatewayUnitName(service string) bool {
+	name := strings.TrimSuffix(service, ".service")
+	return name == "hermes-gateway" || strings.HasPrefix(name, "hermes-gateway-")
+}
+
+// unitLooksLikeTelegramClient 解析单元内容，按 OpenClaw 厂商标记或 Hermes 程序身份判定。
+func unitLooksLikeTelegramClient(content string) bool {
+	return unitHasOpenClawGatewayMarker(content) || unitIsHermesGatewayExec(content)
+}
+
+// unitHasOpenClawGatewayMarker 报告单元是否带 OpenClaw 网关的厂商标记
+// （Environment=OPENCLAW_SERVICE_MARKER=openclaw 且 OPENCLAW_SERVICE_KIND=gateway）。
+// 该标记是 OpenClaw 网关稳定、机器可读的身份信号，检测与 openclaw 路由都据此判定。
+func unitHasOpenClawGatewayMarker(content string) bool {
+	marker, gateway := false, false
 	for _, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -183,12 +212,34 @@ func isTelegramRelatedUnit(path, service string) bool {
 		if !ok {
 			continue
 		}
-		// 只按"该单元自身是否为 Telegram 客户端"来判定，匹配标识性字段。
-		// 不再匹配 After/Before/Wants/Requires/PartOf——这些只表达依赖/排序关系，
-		// 一个仅依赖 hermes 的无关服务不应被注入代理环境并强制重启。
-		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "description", "documentation", "execstart", "environment", "environmentfile":
-			if containsTelegramServiceKeyword(value) {
+		// Environment 行可能形如 Environment=OPENCLAW_SERVICE_MARKER=openclaw 或带引号、
+		// 多个赋值同行，子串判定对这些写法都成立。
+		if strings.EqualFold(strings.TrimSpace(key), "environment") {
+			if strings.Contains(value, "OPENCLAW_SERVICE_MARKER=openclaw") {
+				marker = true
+			}
+			if strings.Contains(value, "OPENCLAW_SERVICE_KIND=gateway") {
+				gateway = true
+			}
+		}
+	}
+	return marker && gateway
+}
+
+// unitIsHermesGatewayExec 报告单元的 ExecStart 是否调用 hermes_cli/hermes-agent 的 gateway 子命令。
+func unitIsHermesGatewayExec(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(key), "execstart") {
+			es := strings.ToLower(value)
+			if (strings.Contains(es, "hermes_cli") || strings.Contains(es, "hermes-agent")) && strings.Contains(es, "gateway") {
 				return true
 			}
 		}
@@ -210,11 +261,6 @@ func readTelegramUnitContent(path string) (string, error) {
 		b = b[:maxTelegramUnitReadBytes]
 	}
 	return string(b), nil
-}
-
-func containsTelegramServiceKeyword(s string) bool {
-	s = strings.ToLower(s)
-	return strings.Contains(s, "openclaw") || strings.Contains(s, "hermes")
 }
 
 func listLocalUserAccounts() []localUserAccount {

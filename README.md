@@ -120,7 +120,7 @@ curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.sh \
-  | sudo PROXYSCENE_VERSION=v0.5.0 \
+  | sudo PROXYSCENE_VERSION=v0.6.0 \
          PROXYSCENE_MINISIGN_PUBKEY=RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb \
          bash
 ```
@@ -457,10 +457,10 @@ HTTP  : 127.0.0.1:7892
 SOCKS : 127.0.0.1:7893
 ```
 
-默认目标服务：
+默认目标服务（仅锚定规范的系统级 hermes 网关；OpenClaw 网关、hermes 的 profile 实例、用户级单元都由自动发现覆盖）：
 
 ```text
-openclaw hermes hermes-gateway user:root:hermes-gateway
+hermes-gateway
 ```
 
 同时，程序会自动发现系统级和用户级 OpenClaw/Hermes 相关服务：
@@ -494,7 +494,7 @@ sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscen
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PROXYSCENE_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.5.0`。 |
+| `PROXYSCENE_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.6.0`。 |
 | `PROXYSCENE_REPO` | `longlannet/proxyscene` | 预编译二进制所在的 GitHub 仓库 `owner/name`。 |
 | `PROXYSCENE_BASE_URL` | 空 | 自定义预编译下载基址（必须 `https`），优先级高于 `PROXYSCENE_VERSION`/仓库默认地址。 |
 | `PROXYSCENE_MINISIGN_PUBKEY` | 内置发布公钥 | 默认用内置公钥验签（装有 minisign 时 best-effort，缺则跳过并告警、仅校验 SHA256）。显式设置本变量会把验签变为**强制**：缺 minisign 或验签失败即中止。 |
@@ -543,7 +543,7 @@ sudo XRAY_DOWNLOAD_SOURCE=xxv bash ./install.sh
 | `PROXYSCENE_TG_SOCKS_PORT` | `7893` | Telegram SOCKS 代理端口。 |
 | `PROXYSCENE_GLOBAL_SOCKS_PORT` | `7894` | 全局 SOCKS 代理端口。 |
 | `PROXYSCENE_DEV_TARGET_USER` | 空 | 开发代理要修改 git/npm 配置的目标用户。 |
-| `PROXYSCENE_TG_SERVICES` | `openclaw hermes hermes-gateway user:root:hermes-gateway` | Telegram 代理要注入环境变量的手动 systemd 服务列表；程序还会自动发现 OpenClaw/Hermes 系统级和用户级服务，用户级服务使用 `user:用户名:服务名`。 |
+| `PROXYSCENE_TG_SERVICES` | `hermes-gateway` | Telegram 代理的手动 systemd 目标服务列表（默认只锚定系统级 hermes 网关）；程序还会自动发现 OpenClaw/Hermes 的系统级和用户级网关，用户级服务使用 `user:用户名:服务名`。 |
 | `PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION` | `0` | 默认拒绝明文 HTTP 订阅；确需导入 HTTP 订阅时设为 `1`，程序会打印风险警告。 |
 | `PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION` | `0` | 默认拒绝订阅链接解析到环回/私网/链路本地/CGNAT 等非公网地址（含重定向跳转），以防 SSRF；订阅托管在内网时设为 `1`。 |
 | `PROXYSCENE_ALLOW_PUBLIC_BIND` | `0` | 代理监听地址默认只允许环回。本地 HTTP/SOCKS 入站无认证，绑定 `0.0.0.0` 或公网 IP 会形成开放代理；确需对外监听时设为 `1`。 |

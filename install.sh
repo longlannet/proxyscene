@@ -68,7 +68,7 @@ usage() {
     minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>
 
 管理程序获取方式（默认优先下载预编译二进制，目标机无需 Go；失败时回退源码编译）：
-  PROXYSCENE_VERSION=latest                    要下载的预编译版本，如 v0.5.0
+  PROXYSCENE_VERSION=latest                    要下载的预编译版本，如 v0.6.0
   PROXYSCENE_REPO=longlannet/proxyscene     预编译二进制所在的 GitHub 仓库 owner/name
   PROXYSCENE_BASE_URL=https://mirror/dl         自定义预编译下载基址（必须 https），优先级最高
   PROXYSCENE_MINISIGN_PUBKEY=RWxxxx             用 minisign 校验签名（联机校验 checksums.txt，离线校验整合包）

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -317,6 +318,76 @@ func ensureUserHomeUsable(home, userName string) error {
 		return fmt.Errorf("用户 %s 的家目录不是目录：%s", userName, home)
 	}
 	return nil
+}
+
+// readUserFileNoFollow 以 root 身份读取目标用户家目录内的文件，沿家目录→目标文件全程使用
+// O_NOFOLLOW：任何一级目录或最终文件是符号链接都拒绝。这与 writeUserFileAtomic 的防护一致，
+// 防止非 root 用户把自己的配置软链到 root 才可读的文件、诱导 root 把其内容读出并写进用户可读
+// 的文件（本地越权/信息泄露）。缺失（ENOENT）映射为 os.ErrNotExist，便于调用方将"配置不存在"
+// 当作跳过处理。
+func readUserFileNoFollow(userName, path string, max int64) ([]byte, error) {
+	identity, err := lookupLocalUserIdentity(userName)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureUserHomeUsable(identity.Home, userName); err != nil {
+		return nil, err
+	}
+	cleanHome := filepath.Clean(identity.Home)
+	cleanPath := filepath.Clean(path)
+	if cleanPath == cleanHome || !strings.HasPrefix(cleanPath, cleanHome+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("用户级配置路径必须位于用户 %s 的家目录内：%s", userName, path)
+	}
+	dir := filepath.Dir(cleanPath)
+	rel, err := filepath.Rel(cleanHome, dir)
+	if err != nil || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("用户级配置目录必须位于用户家目录内：%s", dir)
+	}
+	dirFD, err := openExistingUserDirChain(cleanHome, rel)
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.Close(dirFD)
+	base := filepath.Base(cleanPath)
+	fd, err := syscall.Openat(dirFD, base, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		if err == syscall.ENOENT {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("打开用户级配置失败（拒绝符号链接）：%s：%w", path, err)
+	}
+	f := os.NewFile(uintptr(fd), base)
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, max))
+}
+
+// openExistingUserDirChain 从 home 起沿 rel 逐级 openat 打开已存在的目录（不创建），
+// 全程 O_NOFOLLOW|O_DIRECTORY 拒绝符号链接；任一级缺失返回 os.ErrNotExist。
+func openExistingUserDirChain(home, rel string) (int, error) {
+	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_DIRECTORY | syscall.O_CLOEXEC
+	homeFD, err := syscall.Open(home, flags, 0)
+	if err != nil {
+		return -1, fmt.Errorf("打开用户家目录失败：%s：%w", home, err)
+	}
+	if rel == "." {
+		return homeFD, nil
+	}
+	current := homeFD
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		next, err := syscall.Openat(current, part, flags, 0)
+		_ = syscall.Close(current)
+		if err != nil {
+			if err == syscall.ENOENT {
+				return -1, os.ErrNotExist
+			}
+			return -1, fmt.Errorf("打开用户级配置目录 %s 失败（拒绝符号链接）：%w", part, err)
+		}
+		current = next
+	}
+	return current, nil
 }
 
 func runQuiet(name string, args ...string) error {
