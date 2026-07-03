@@ -2,6 +2,7 @@ package manager
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
 	"time"
 )
@@ -9,7 +10,7 @@ import (
 // Version 和 Commit 可在构建时通过 -ldflags "-X proxyscene/internal/manager.Version=..."
 // 注入（release 工作流会用 git tag 和 commit 覆盖）；源码直接构建时使用下面的默认值。
 var (
-	Version = "0.6.1"
+	Version = "0.7.0"
 	Commit  = ""
 )
 
@@ -64,8 +65,8 @@ func DefaultConfig() Config {
 		RestoreService:  envString("PROXYSCENE_BOOT_RESTORE_SERVICE_NAME", "proxyscene-restore.service"),
 		XrayServiceUser: envString("PROXYSCENE_SERVICE_USER", "proxyscene"),
 		// 默认只锚定规范的系统级 hermes 网关；openclaw 网关、hermes 的 profile 实例、用户级单元
-		// 都由精确自动发现覆盖（见 telegram_discovery.go）。此前写死的 openclaw/hermes/
-		// user:root:hermes-gateway 会对不存在的单元生成 phantom drop-in 并触发 exit-5 重启告警。
+		// 都由精确自动发现覆盖（见 telegram_discovery.go）。applyTelegram 对不存在的系统级
+		// 单元会跳过注入（不生成 phantom drop-in），因此这里锚定未安装的服务也无副作用。
 		TGTargetServices: splitFields(envString("PROXYSCENE_TG_SERVICES", "hermes-gateway")),
 		DevTargetUser:    envString("PROXYSCENE_DEV_TARGET_USER", ""),
 		TestURL:          envString("PROXYSCENE_TEST_URL", "https://www.google.com/generate_204"),
@@ -155,19 +156,34 @@ func (c Config) UserTelegramDropInPath(userName, service string) (string, error)
 	}
 	return filepath.Join(dir, "10-openclaw-hermes-telegram-proxy.conf"), nil
 }
+
+// HTTPAddr 等用 net.JoinHostPort 拼地址：IPv6 字面量会自动加方括号（http://[::1]:7890）。
 func (c Config) HTTPAddr(scene Scene) string {
 	switch scene {
 	case SceneDev:
-		return "http://" + c.ProxyHost + ":" + itoa(c.DevHTTPPort)
+		return "http://" + net.JoinHostPort(c.ProxyHost, itoa(c.DevHTTPPort))
 	case SceneTelegram:
-		return "http://" + c.ProxyHost + ":" + itoa(c.TGHTTPPort)
+		return "http://" + net.JoinHostPort(c.ProxyHost, itoa(c.TGHTTPPort))
 	default:
-		return "http://" + c.ProxyHost + ":" + itoa(c.GlobalHTTPPort)
+		return "http://" + net.JoinHostPort(c.ProxyHost, itoa(c.GlobalHTTPPort))
 	}
 }
-func (c Config) TGSocksAddr() string { return "socks5h://" + c.ProxyHost + ":" + itoa(c.TGSocksPort) }
+func (c Config) TGSocksAddr() string {
+	return "socks5h://" + net.JoinHostPort(c.ProxyHost, itoa(c.TGSocksPort))
+}
 func (c Config) GlobalSocksAddr() string {
-	return "socks5h://" + c.ProxyHost + ":" + itoa(c.GlobalSocksPort)
+	return "socks5h://" + net.JoinHostPort(c.ProxyHost, itoa(c.GlobalSocksPort))
+}
+
+// needsPrivilegedPortCap 报告是否有监听端口低于 1024（绑定需要 CAP_NET_BIND_SERVICE）。
+// 默认端口均为 789x，不需要任何 capability；仅在操作员显式配置特权端口时才授予。
+func (c Config) needsPrivilegedPortCap() bool {
+	for _, port := range []int{c.DevHTTPPort, c.TGHTTPPort, c.TGSocksPort, c.GlobalHTTPPort, c.GlobalSocksPort} {
+		if port < 1024 {
+			return true
+		}
+	}
+	return false
 }
 
 type Node struct {

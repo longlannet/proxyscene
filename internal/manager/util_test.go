@@ -110,3 +110,104 @@ func TestParsePasswdLine(t *testing.T) {
 		t.Fatalf("家目录为空的不完整记录应失败")
 	}
 }
+
+func TestValidateProxyHostRequiresIPLiteral(t *testing.T) {
+	t.Setenv("PROXYSCENE_ALLOW_PUBLIC_BIND", "0")
+	// 主机名不再被接受：xray listen 不支持主机名，晚失败会拖到配置检查阶段。
+	for _, host := range []string{"localhost", "example.com", "proxy.internal"} {
+		if err := validateProxyHost(host); err == nil {
+			t.Fatalf("主机名 %q 应被拒绝", host)
+		}
+	}
+	if err := validateProxyHost("::1"); err != nil {
+		t.Fatalf("IPv6 环回应通过：%v", err)
+	}
+	if err := validateProxyHost("2001:db8::1"); err == nil {
+		t.Fatalf("IPv6 非环回默认应被拒绝")
+	}
+	t.Setenv("PROXYSCENE_ALLOW_PUBLIC_BIND", "1")
+	if err := validateProxyHost("2001:db8::1"); err != nil {
+		t.Fatalf("显式 opt-in 后 IPv6 非环回应允许：%v", err)
+	}
+}
+
+func TestHTTPAddrIPv6Brackets(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ProxyHost = "::1"
+	if got := cfg.HTTPAddr(SceneGlobal); got != "http://[::1]:7890" {
+		t.Fatalf("HTTPAddr(global) = %q, want http://[::1]:7890", got)
+	}
+	if got := cfg.TGSocksAddr(); got != "socks5h://[::1]:7893" {
+		t.Fatalf("TGSocksAddr = %q, want socks5h://[::1]:7893", got)
+	}
+	cfg.ProxyHost = "127.0.0.1"
+	if got := cfg.HTTPAddr(SceneDev); got != "http://127.0.0.1:7891" {
+		t.Fatalf("HTTPAddr(dev) = %q, want http://127.0.0.1:7891", got)
+	}
+}
+
+func TestEnvBoolStrictTokens(t *testing.T) {
+	t.Setenv("PROXYSCENE_TEST_BOOL", "off")
+	if envBool("PROXYSCENE_TEST_BOOL", true) {
+		t.Fatalf("off 应解析为 false")
+	}
+	t.Setenv("PROXYSCENE_TEST_BOOL", "YES")
+	if !envBool("PROXYSCENE_TEST_BOOL", false) {
+		t.Fatalf("YES 应解析为 true")
+	}
+	// 无法识别的值应回退默认值，而不是静默当 false。
+	t.Setenv("PROXYSCENE_TEST_BOOL", "ture")
+	if !envBool("PROXYSCENE_TEST_BOOL", true) {
+		t.Fatalf("无法识别的值应回退默认值 true")
+	}
+}
+
+func TestEnvIntInvalidFallsBack(t *testing.T) {
+	t.Setenv("PROXYSCENE_TEST_INT", "not-a-number")
+	if got := envInt("PROXYSCENE_TEST_INT", 42); got != 42 {
+		t.Fatalf("非法值应回退默认值：got %d", got)
+	}
+	t.Setenv("PROXYSCENE_TEST_INT", "-1")
+	if got := envInt("PROXYSCENE_TEST_INT", 42); got != 42 {
+		t.Fatalf("非正数应回退默认值：got %d", got)
+	}
+	t.Setenv("PROXYSCENE_TEST_INT", "8080")
+	if got := envInt("PROXYSCENE_TEST_INT", 42); got != 8080 {
+		t.Fatalf("合法值应生效：got %d", got)
+	}
+}
+
+func TestNeedsPrivilegedPortCap(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.needsPrivilegedPortCap() {
+		t.Fatalf("默认端口(789x)不应需要特权端口能力")
+	}
+	cfg.GlobalHTTPPort = 443
+	if !cfg.needsPrivilegedPortCap() {
+		t.Fatalf("端口 443 应需要 CAP_NET_BIND_SERVICE")
+	}
+}
+
+func TestUseNodeInStoreChineseScopeAliases(t *testing.T) {
+	a := testApp(t)
+	st := newStore()
+	id, err := a.addNode(st, "trojan://secret@h:443", "", "")
+	if err != nil {
+		t.Fatalf("addNode: %v", err)
+	}
+	if err := a.useNodeInStore(st, id, "全局"); err != nil {
+		t.Fatalf("中文范围 全局 应被接受：%v", err)
+	}
+	if st.SceneNodes[SceneGlobal] != id {
+		t.Fatalf("全局 未生效：%+v", st.SceneNodes)
+	}
+	if err := a.useNodeInStore(st, id, "全部"); err != nil {
+		t.Fatalf("中文范围 全部 应被接受：%v", err)
+	}
+	if st.DefaultNodeID != id || st.SceneNodes[SceneDev] != id || st.SceneNodes[SceneTelegram] != id {
+		t.Fatalf("全部 未生效：default=%q scenes=%+v", st.DefaultNodeID, st.SceneNodes)
+	}
+	if err := a.useNodeInStore(st, id, "bogus"); err == nil {
+		t.Fatalf("未知范围应报错")
+	}
+}

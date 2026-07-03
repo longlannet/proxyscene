@@ -47,7 +47,11 @@ func (a *App) writeCheckedXrayConfig(st *Store) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, a.cfg.XrayConfig())
+	if err := os.Rename(tmp, a.cfg.XrayConfig()); err != nil {
+		return err
+	}
+	// 与 writeFileAtomic 的持久化语义一致：rename 后 fsync 父目录，崩溃后不丢这次改名。
+	return fsyncDir(a.cfg.CoreDir)
 }
 
 func (a *App) writeXrayConfigTo(st *Store, path string) error {

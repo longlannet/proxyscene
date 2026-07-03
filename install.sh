@@ -78,7 +78,7 @@ usage() {
   PROXYSCENE_REPO=longlannet/proxyscene     预编译二进制所在的 GitHub 仓库 owner/name
   PROXYSCENE_BASE_URL=https://mirror/dl         自定义预编译下载基址（必须 https），优先级最高
   PROXYSCENE_MINISIGN_PUBKEY=RWxxxx             用 minisign 校验签名（联机校验 checksums.txt，离线校验整合包）
-  PROXYSCENE_ALLOW_UNSIGNED=1                   minisign 不可用时仅用 SHA256 安装预编译二进制（默认 fail-closed，不推荐）
+  PROXYSCENE_ALLOW_UNSIGNED=1                   缺 minisign 或签名文件下载失败时仅用 SHA256 安装（默认两者都 fail-closed，不推荐）
   PROXYSCENE_BUILD_FROM_SOURCE=1                跳过预编译下载，强制本地源码编译
 
 常用环境变量：
@@ -92,7 +92,7 @@ usage() {
   PROXYSCENE_SWITCH_BIN=/usr/local/bin/proxyscene
                                              管理程序安装路径
   XRAY_DOWNLOAD_SOURCE=official                Xray 下载源，可选 official 或 xxv
-  XRAY_ZIP_URL=https://example.com/xray.zip    自定义 Xray zip 下载地址，优先级高于预设下载源
+  XRAY_ZIP_URL=https://example.com/xray.zip    自定义 Xray zip 下载地址（必须 https），优先级高于预设下载源
   XRAY_ZIP_SHA256=...                          Xray zip SHA256；自定义 XRAY_ZIP_URL 必须设置（否则 fail-closed）。官方与 xxv 源已内置校验
   ALLOW_UNVERIFIED_XRAY=1                       无法校验 Xray 完整性时仍安装（默认 fail-closed，不推荐）
   SKIP_XRAY_INSTALL=1                         不安装 Xray，要求核心目录已有可执行 xray
@@ -298,13 +298,14 @@ ensure_go() {
   trap 'rm -rf "$tmp"' EXIT
 
   log "下载 Go：$url"
-  run_quiet "下载 Go" curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$archive" "$url"
+  # 与 fetch_https 一致：限制 https-only（含重定向），防止任何一跳被降级为明文。
+  run_quiet "下载 Go" curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 3 --retry-delay 2 -o "$archive" "$url"
   if [[ -n "$GO_TARBALL_SHA256" ]]; then
     checksum="$GO_TARBALL_SHA256"
   else
     checksum_url="${url}.sha256"
     log "下载 Go SHA256：$checksum_url"
-    if ! checksum_text="$(curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 "$checksum_url" 2>/dev/null)"; then
+    if ! checksum_text="$(curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 3 --retry-delay 2 "$checksum_url" 2>/dev/null)"; then
       fatal "下载 Go SHA256 失败"
     fi
     checksum="$(printf '%s\n' "$checksum_text" | awk 'NF {print $1; exit}')"
@@ -355,7 +356,7 @@ xray_expected_sha256() {
   case "${XRAY_DOWNLOAD_SOURCE,,}" in
     official|github|xtls)
       local dgst_text checksum
-      if dgst_text="$(curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 "${url}.dgst" 2>/dev/null)"; then
+      if dgst_text="$(curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 3 --retry-delay 2 "${url}.dgst" 2>/dev/null)"; then
         # XTLS 官方 .dgst 把 SHA-256 标注为 `SHA2-256= <hex>`（不是 `SHA256=`）。
         # 用 sha2-?256 精确匹配 SHA2-256 行（不会误中 SHA2-512 / SHA3-256），再取 64 位十六进制。
         checksum="$(printf '%s\n' "$dgst_text" | grep -iE 'sha2-?256' | grep -oiE '[0-9a-f]{64}' | head -n1)"
@@ -417,9 +418,22 @@ ensure_core_dir() {
   fi
   if [[ "$created" == "1" ]]; then
     chmod 700 "$CORE_DIR"
+  else
+    # 已存在目录：必须属 root，并收紧组/其他用户的写位——宽权限目录里其他用户可
+    # 预先植入符号链接，把下面的 root 写入重定向到任意路径。
+    local owner
+    owner="$(stat -c '%u' "$CORE_DIR" 2>/dev/null || echo '')"
+    [[ "$owner" == "0" ]] || fatal "PROXYSCENE_MANAGER_DIR 必须属于 root（当前属主 uid=${owner:-未知}）：$CORE_DIR"
+    chmod g-w,o-w "$CORE_DIR"
   fi
-  printf '由 proxyscene 安装器管理\n' > "$CORE_DIR/.managed-by-proxyscene"
-  chmod 600 "$CORE_DIR/.managed-by-proxyscene"
+  local marker="$CORE_DIR/.managed-by-proxyscene"
+  # 与 Go 侧（writeFileAtomic + O_NOFOLLOW）一致：拒绝符号链接标记文件，
+  # 避免 root 的 `>` 写入被重定向到链接目标。
+  if [[ -L "$marker" ]]; then
+    fatal "标记文件不能是符号链接：$marker"
+  fi
+  printf '由 proxyscene 安装器管理\n' > "$marker"
+  chmod 600 "$marker"
 }
 
 install_xray() {
@@ -436,6 +450,15 @@ install_xray() {
     return 0
   fi
 
+  # 自定义下载地址必须是 https：Xray 以特权代理核心身份由 systemd 运行，
+  # 即便有 SHA256 兜底，也不接受明文通道分发。
+  if [[ -n "$XRAY_ZIP_URL" ]]; then
+    case "$XRAY_ZIP_URL" in
+      https://*) ;;
+      *) fatal "XRAY_ZIP_URL 必须是 https 地址：$XRAY_ZIP_URL" ;;
+    esac
+  fi
+
   local tmp zip url checksum
   tmp="$(mktemp -d)"
   zip="$tmp/xray.zip"
@@ -443,7 +466,7 @@ install_xray() {
   trap 'rm -rf "$tmp"' EXIT
 
   log "下载 Xray：$url"
-  run_quiet "下载 Xray" curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$zip" "$url"
+  run_quiet "下载 Xray" curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 3 --retry-delay 2 -o "$zip" "$url"
 
   local expected
   expected="$(xray_expected_sha256 "$url")"
@@ -514,10 +537,17 @@ release_base_url() {
 
 # fetch_https 仅允许 https（含重定向），并限制下载体积。
 fetch_https() {
-  local url="$1" out="$2" maxsize="$3"
+  local url="$1" out="$2" maxsize="$3" size
   curl -fL --proto '=https' --proto-redir '=https' \
     --connect-timeout 15 --retry 3 --retry-delay 2 \
-    --max-filesize "$maxsize" -o "$out" "$url"
+    --max-filesize "$maxsize" -o "$out" "$url" || return 1
+  # --max-filesize 对无 Content-Length 的流式响应不生效（curl 限制），下载后再复核一次。
+  size="$(stat -c '%s' "$out" 2>/dev/null || wc -c < "$out")"
+  if [[ "$size" -gt "$maxsize" ]]; then
+    log "下载内容超过大小上限（${size} > ${maxsize} 字节）：$url"
+    rm -f "$out"
+    return 1
+  fi
 }
 
 # install_manager_prebuilt 下载并安装预编译二进制；成功返回 0，否则返回 1 由调用方回退源码编译。
@@ -548,10 +578,13 @@ install_manager_prebuilt() {
       run_quiet "校验 checksums 签名" minisign -Vm "$tmp/checksums.txt" -x "$tmp/checksums.txt.minisig" -P "$MANAGER_MINISIGN_PUBKEY"
       log "minisign 签名校验通过"
     elif [[ "$MANAGER_MINISIGN_REQUIRED" == "1" ]]; then
-      rm -rf "$tmp"
       fatal "签名文件下载失败，无法按要求校验签名"
+    elif [[ "${PROXYSCENE_ALLOW_UNSIGNED:-0}" == "1" ]]; then
+      log "警告：签名文件下载失败，已按 PROXYSCENE_ALLOW_UNSIGNED=1 降级为仅校验 SHA256（不可信镜像可同源篡改 SHA256 与二进制，自担风险）"
     else
-      log "未获取到签名文件，跳过签名校验（仍会校验 SHA256）"
+      # 签名文件缺失与缺 minisign 一样 fail-closed：否则恶意镜像只要不提供 .minisig，
+      # 就能让内置公钥形同虚设（checksums.txt 与二进制同源，可一起伪造）。
+      fatal "签名文件 checksums.txt.minisig 下载失败。正规发布应附带签名；如确要仅用 SHA256 安装，请显式设置 PROXYSCENE_ALLOW_UNSIGNED=1（不推荐）。"
     fi
   elif [[ "$MANAGER_MINISIGN_REQUIRED" == "1" ]]; then
     fatal "设置了 PROXYSCENE_MINISIGN_PUBKEY 但未找到 minisign"

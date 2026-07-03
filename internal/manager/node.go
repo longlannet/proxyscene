@@ -617,6 +617,24 @@ func (a *App) renameNode(st *Store, id, name string) error {
 	return a.reloadIfEnabled(st)
 }
 
+// normalizeScope 把帮助文本中的中文范围别名归一化为内部 token，使
+// `node use <id> 全局` 这类照着帮助输入的用法也能工作。
+func normalizeScope(scope string) string {
+	switch strings.TrimSpace(scope) {
+	case "默认":
+		return "default"
+	case "全局":
+		return "global"
+	case "开发":
+		return "dev"
+	case "电报", "tg":
+		return "telegram"
+	case "全部":
+		return "all"
+	}
+	return strings.TrimSpace(scope)
+}
+
 func (a *App) useNodeInStore(st *Store, id, scope string) error {
 	if id == "" {
 		return fmt.Errorf("节点 ID 不能为空")
@@ -624,20 +642,18 @@ func (a *App) useNodeInStore(st *Store, id, scope string) error {
 	if st.findNode(id) == nil {
 		return fmt.Errorf("节点不存在：%s", id)
 	}
-	switch scope {
+	switch scope := normalizeScope(scope); scope {
 	case "", "default":
 		st.DefaultNodeID = id
 	case "global", "dev", "telegram":
 		st.SceneNodes[Scene(scope)] = id
-	case "tg":
-		st.SceneNodes[SceneTelegram] = id
 	case "all":
 		st.DefaultNodeID = id
 		st.SceneNodes[SceneGlobal] = id
 		st.SceneNodes[SceneDev] = id
 		st.SceneNodes[SceneTelegram] = id
 	default:
-		return fmt.Errorf("未知节点使用范围：%s，可用范围：default/global/dev/telegram/all", scope)
+		return fmt.Errorf("未知节点使用范围：%s，可用范围：default(默认)/global(全局)/dev(开发)/telegram(电报)/all(全部)", scope)
 	}
 	return nil
 }

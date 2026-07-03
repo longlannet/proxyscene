@@ -11,6 +11,12 @@ func (a *App) installXrayService() error {
 	if err := a.prepareXrayServiceRuntime(); err != nil {
 		return err
 	}
+	// 默认端口(789x)不需要任何 capability，清空 bounding set；仅在操作员显式配置
+	// <1024 的监听端口时才授予绑定特权端口所需的 CAP_NET_BIND_SERVICE。
+	capLines := "CapabilityBoundingSet="
+	if a.cfg.needsPrivilegedPortCap() {
+		capLines = "CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE"
+	}
 	unit := fmt.Sprintf(`[Unit]
 Description=Xray 代理主服务
 After=network-online.target nss-lookup.target
@@ -39,12 +45,11 @@ RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+%s
 
 [Install]
 WantedBy=multi-user.target
-`, a.cfg.XrayServiceUser, systemdPath(a.cfg.CoreDir), systemdQuote(a.cfg.XrayBin()), systemdQuote(a.cfg.XrayConfig()), systemdPath(a.cfg.CoreDir))
+`, a.cfg.XrayServiceUser, systemdPath(a.cfg.CoreDir), systemdQuote(a.cfg.XrayBin()), systemdQuote(a.cfg.XrayConfig()), systemdPath(a.cfg.CoreDir), capLines)
 	if err := writeFileAtomic("/etc/systemd/system/"+a.cfg.SystemdService, []byte(unit), 0o644); err != nil {
 		return err
 	}

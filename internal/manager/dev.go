@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 )
 
@@ -37,7 +36,9 @@ func (a *App) devTargetUser() (string, error) {
 	if err := validateUserName(user); err != nil {
 		return "", err
 	}
-	if err := exec.Command("id", "-u", user).Run(); err != nil {
+	// 用 lookupLocalUserIdentity（getent 带 30s 超时 + /etc/passwd 回退）而非无超时的
+	// `id -u`：NSS 后端卡死时不能在持有状态锁的情况下无限阻塞所有并发命令。
+	if _, err := lookupLocalUserIdentity(user); err != nil {
 		return "", fmt.Errorf("开发代理目标用户不存在：%s", user)
 	}
 	return user, nil

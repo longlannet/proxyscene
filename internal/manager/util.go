@@ -37,7 +37,16 @@ func envBool(key string, fallback bool) bool {
 	if v == "" {
 		return fallback
 	}
-	return v == "1" || v == "true" || v == "yes" || v == "on"
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	// 无法识别的值（例如拼错的 "ture"）不能静默当 false/true：打警告并用默认值，
+	// 避免操作员以为某个开关生效了而实际没有。
+	fmt.Printf("警告：环境变量 %s 的值无法识别（%q），使用默认值 %v\n", key, os.Getenv(key), fallback)
+	return fallback
 }
 
 func envInt(key string, fallback int) int {
@@ -47,6 +56,7 @@ func envInt(key string, fallback int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
+		fmt.Printf("警告：环境变量 %s 的值无效（%q），使用默认值 %d\n", key, v, fallback)
 		return fallback
 	}
 	return n
@@ -884,23 +894,23 @@ func validateTestURL(raw string) error {
 	return nil
 }
 
+// validateProxyHost 校验代理监听地址，只接受 IPv4/IPv6 字面量：xray 的 listen 字段不接受
+// 主机名，主机名会拖到启用场景做配置检查时才失败，这里提前拦截并给出明确报错。
+// net.ParseIP 不接受 zone（%eth0），因此合法值的字符集是十六进制、点、冒号——这同时保证
+// applyGlobal 的 %q 引用安全（见 scenes.go 的耦合注释）。IPv6 由 HTTPAddr 等经
+// net.JoinHostPort 自动加方括号。
 func validateProxyHost(host string) error {
 	if strings.TrimSpace(host) == "" {
 		return fmt.Errorf("代理监听地址不能为空")
 	}
-	if strings.ContainsAny(host, "\x00\n\r:/") {
-		return fmt.Errorf("代理监听地址包含非法字符：%s", host)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("代理监听地址必须是 IPv4/IPv6 字面量（xray 监听不支持主机名）：%s", host)
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		// 本地 HTTP/SOCKS 入站没有认证；绑定到非环回地址会把它暴露成开放代理。
-		// 默认只允许环回，确需对外监听时须显式设置 PROXYSCENE_ALLOW_PUBLIC_BIND=1。
-		if !ip.IsLoopback() && !envBool("PROXYSCENE_ALLOW_PUBLIC_BIND", false) {
-			return fmt.Errorf("代理监听地址 %s 非环回地址：无认证入站对外监听会形成开放代理；如确需，请设置 PROXYSCENE_ALLOW_PUBLIC_BIND=1", host)
-		}
-		return nil
-	}
-	if !regexp.MustCompile(`^[A-Za-z0-9.-]+$`).MatchString(host) {
-		return fmt.Errorf("代理监听地址格式无效：%s", host)
+	// 本地 HTTP/SOCKS 入站没有认证；绑定到非环回地址会把它暴露成开放代理。
+	// 默认只允许环回，确需对外监听时须显式设置 PROXYSCENE_ALLOW_PUBLIC_BIND=1。
+	if !ip.IsLoopback() && !envBool("PROXYSCENE_ALLOW_PUBLIC_BIND", false) {
+		return fmt.Errorf("代理监听地址 %s 非环回地址：无认证入站对外监听会形成开放代理；如确需，请设置 PROXYSCENE_ALLOW_PUBLIC_BIND=1", host)
 	}
 	return nil
 }

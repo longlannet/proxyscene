@@ -84,3 +84,16 @@ func TestIsTelegramRelatedUnitRejectsGuardByFile(t *testing.T) {
 		t.Errorf("openclaw 网关单元应被判为 Telegram 目标")
 	}
 }
+
+func TestUnitOpenClawMarkerExactMatch(t *testing.T) {
+	// 子串包含不应命中：赋值必须整体精确等于 marker/kind。
+	fake := "[Service]\nEnvironment=FOO_OPENCLAW_SERVICE_MARKER=openclawx\nEnvironment=PREFIX_OPENCLAW_SERVICE_KIND=gatewayy\n"
+	if unitHasOpenClawGatewayMarker(fake) {
+		t.Errorf("前后缀近似的赋值不应命中")
+	}
+	// 引号 + 同行多赋值的合法写法应命中。
+	quoted := "[Service]\nEnvironment=\"OPENCLAW_SERVICE_MARKER=openclaw\" \"OPENCLAW_SERVICE_KIND=gateway\"\n"
+	if !unitHasOpenClawGatewayMarker(quoted) {
+		t.Errorf("带引号/同行多赋值的 Environment 行应命中")
+	}
+}

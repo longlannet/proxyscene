@@ -15,7 +15,7 @@
 ## 功能特性
 
 - 单二进制 Go 管理程序，安装后命令为 `proxyscene`。
-- 安装脚本默认下载预编译二进制（带 SHA256 校验，装有 minisign 时默认验证签名），目标机无需安装 Go；下载失败时自动回退到本仓库源码编译。
+- 安装脚本默认下载预编译二进制并做 SHA256 + minisign 双重校验（缺 minisign 或签名文件默认拒绝安装，需显式 `PROXYSCENE_ALLOW_UNSIGNED=1` 才降级为仅 SHA256），目标机无需安装 Go；下载失败时自动回退到本仓库源码编译。
 - 支持离线安装：屏蔽 GitHub / 气隙环境下，下载自包含整合包（含 `install.sh` + 管理程序 + Xray + geo），解压后运行包内 `install.sh` 即可，全程不联网、不需要 Go。
 - 通过 GitHub Actions 在打 tag 时自动交叉编译多架构（amd64/arm64/386/armv7）、用 minisign 签名并发布 Release。
 - 支持 Xray 主服务和开机恢复服务的 systemd 管理。
@@ -116,7 +116,7 @@ curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.
 curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.sh | sudo bash -s -- 'vless://...'
 ```
 
-脚本内置了发布公钥：**只要目标机装了 `minisign`，默认就会验证 `checksums.txt.minisig` 签名**（best-effort），并始终校验二进制 SHA256。想把签名校验设为**强制**（缺 minisign 或验签失败即中止），显式传入公钥并可固定版本：
+脚本内置了发布公钥，**默认强制验证 `checksums.txt.minisig` 签名**，并始终校验二进制 SHA256：缺 minisign（脚本会尽力自动安装）**或签名文件下载失败都会中止安装**，需显式 `PROXYSCENE_ALLOW_UNSIGNED=1` 才降级为仅 SHA256（不推荐——不可信镜像可同源篡改 SHA256 与二进制）。显式传入公钥还可固定版本：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.sh \
@@ -221,7 +221,7 @@ sudo proxyscene status
 2. 安装基础依赖：curl、ca-certificates、tar、unzip。
 3. 安装 Xray 到核心目录。
 4. 安装管理程序 `proxyscene` 到 `/usr/local/bin/`：
-   - 默认下载对应架构的预编译二进制（`proxyscene_linux_<arch>.tar.gz`），用 `checksums.txt` 校验 SHA256；脚本内置发布公钥，装了 `minisign` 就默认验证签名（显式设 `PROXYSCENE_MINISIGN_PUBKEY` 则强制验签）。目标机无需 Go。
+   - 默认下载对应架构的预编译二进制（`proxyscene_linux_<arch>.tar.gz`），用 `checksums.txt` 校验 SHA256；脚本内置发布公钥并默认验签，缺 minisign 或签名文件都会中止（`PROXYSCENE_ALLOW_UNSIGNED=1` 可显式降级为仅 SHA256）。目标机无需 Go。
    - 下载失败，或设置 `PROXYSCENE_BUILD_FROM_SOURCE=1` 时，检查/准备 Go 并从本仓库源码编译 `cmd/proxyscene`（仅在源码目录可行）。
 5. 调用 `proxyscene install` 初始化状态目录和 systemd 服务。
 
@@ -497,7 +497,7 @@ sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscen
 | `PROXYSCENE_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.6.1`。 |
 | `PROXYSCENE_REPO` | `longlannet/proxyscene` | 预编译二进制所在的 GitHub 仓库 `owner/name`。 |
 | `PROXYSCENE_BASE_URL` | 空 | 自定义预编译下载基址（必须 `https`），优先级高于 `PROXYSCENE_VERSION`/仓库默认地址。 |
-| `PROXYSCENE_MINISIGN_PUBKEY` | 内置发布公钥 | 默认用内置公钥验签（装有 minisign 时 best-effort，缺则跳过并告警、仅校验 SHA256）。显式设置本变量会把验签变为**强制**：缺 minisign 或验签失败即中止。 |
+| `PROXYSCENE_MINISIGN_PUBKEY` | 内置发布公钥 | 默认用内置公钥验签，且**默认 fail-closed**：缺 minisign（会尽力自动安装）、签名文件下载失败或验签失败都会中止，仅 `PROXYSCENE_ALLOW_UNSIGNED=1` 可显式降级为仅 SHA256。显式设置本变量后连 `PROXYSCENE_ALLOW_UNSIGNED` 也不再放行。 |
 | `PROXYSCENE_BUILD_FROM_SOURCE` | `0` | 设为 `1` 时跳过预编译下载，强制本地源码编译（需要 Go）。 |
 | `--offline`（命令行选项） | — | 强制走离线本地安装，要求在解压后的整合包目录内运行（同目录有 `proxyscene`/`xray`）；通常无需显式指定，脚本会自动检测。 |
 | `GO_VERSION` | `1.22.12` | 源码编译时准备的 Go 版本（仅回退编译时用到）。 |
@@ -537,7 +537,7 @@ sudo XRAY_DOWNLOAD_SOURCE=xxv bash ./install.sh
 | `PROXYSCENE_SYSTEMD_SERVICE_NAME` | `proxyscene.service` | Xray 主服务名称。 |
 | `PROXYSCENE_BOOT_RESTORE_SERVICE_NAME` | `proxyscene-restore.service` | 开机恢复服务名称。 |
 | `PROXYSCENE_SERVICE_USER` | `proxyscene` | Xray 主服务运行用户；默认会自动创建专用系统用户。 |
-| `PROXYSCENE_HOST` | `127.0.0.1` | 本地代理监听地址。 |
+| `PROXYSCENE_HOST` | `127.0.0.1` | 本地代理监听地址。必须是 IPv4/IPv6 字面量（不支持主机名；IPv6 会自动加方括号）。默认只允许环回地址，非环回需 `PROXYSCENE_ALLOW_PUBLIC_BIND=1`。 |
 | `PROXYSCENE_GLOBAL_HTTP_PORT` | `7890` | 全局 HTTP 代理端口。 |
 | `PROXYSCENE_DEV_HTTP_PORT` | `7891` | 开发 HTTP 代理端口。 |
 | `PROXYSCENE_TG_HTTP_PORT` | `7892` | Telegram HTTP 代理端口。 |

@@ -209,16 +209,17 @@ func unitHasOpenClawGatewayMarker(content string) bool {
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
-		if !ok {
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "environment") {
 			continue
 		}
-		// Environment 行可能形如 Environment=OPENCLAW_SERVICE_MARKER=openclaw 或带引号、
-		// 多个赋值同行，子串判定对这些写法都成立。
-		if strings.EqualFold(strings.TrimSpace(key), "environment") {
-			if strings.Contains(value, "OPENCLAW_SERVICE_MARKER=openclaw") {
+		// Environment 行可能带引号或同行多个赋值（Environment="A=b" C=d）。按空白拆分、
+		// 去掉引号后对整个赋值做精确比较，避免 FOO_OPENCLAW_SERVICE_MARKER=openclawx
+		// 之类的子串误报。
+		for _, assign := range strings.Fields(value) {
+			switch strings.Trim(assign, `"'`) {
+			case "OPENCLAW_SERVICE_MARKER=openclaw":
 				marker = true
-			}
-			if strings.Contains(value, "OPENCLAW_SERVICE_KIND=gateway") {
+			case "OPENCLAW_SERVICE_KIND=gateway":
 				gateway = true
 			}
 		}
@@ -274,7 +275,8 @@ func listLocalUserAccounts() []localUserAccount {
 			continue
 		}
 		fields := strings.Split(line, ":")
-		if len(fields) < 6 {
+		// 与 parsePasswdLine 一致要求完整的 7 字段记录。
+		if len(fields) < 7 {
 			continue
 		}
 		name := fields[0]

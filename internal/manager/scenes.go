@@ -35,17 +35,21 @@ func (a *App) applySavedScenes(st *Store) error {
 	var errs []error
 	for _, scene := range []Scene{SceneGlobal, SceneDev, SceneTelegram} {
 		if st.SceneEnabled[scene] {
-			if err := a.applyScene(scene); err != nil {
-				errs = append(errs, fmt.Errorf("%s应用失败：%w", sceneName(scene), err))
-				continue
-			}
 			if scene == SceneTelegram {
+				// 只发现一次目标：应用与持久化使用同一份列表，避免两次发现结果不一致。
 				targets, err := a.telegramTargets(st, false)
 				if err != nil {
 					errs = append(errs, fmt.Errorf("%s目标解析失败：%w", sceneName(scene), err))
 					continue
 				}
+				if err := a.applyTelegram(targets); err != nil {
+					errs = append(errs, fmt.Errorf("%s应用失败：%w", sceneName(scene), err))
+					continue
+				}
 				st.TelegramTargets = canonicalTelegramTargetNames(targets)
+			} else if err := a.applyScene(scene); err != nil {
+				errs = append(errs, fmt.Errorf("%s应用失败：%w", sceneName(scene), err))
+				continue
 			}
 		} else {
 			if err := a.restoreScene(scene); err != nil {
@@ -97,9 +101,16 @@ func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
 			a.rollbackSceneState(st, scene, old)
 			return err
 		}
-		if err := a.applyScene(scene); err != nil {
+		// 电报场景复用上面已发现的 telegramTargets，保证应用与持久化的目标一致。
+		var applyErr error
+		if scene == SceneTelegram {
+			applyErr = a.applyTelegram(telegramTargets)
+		} else {
+			applyErr = a.applyScene(scene)
+		}
+		if applyErr != nil {
 			a.rollbackSceneState(st, scene, old)
-			return err
+			return applyErr
 		}
 		if scene == SceneTelegram {
 			st.TelegramTargets = canonicalTelegramTargetNames(telegramTargets)
@@ -184,7 +195,7 @@ func (a *App) applyScene(scene Scene) error {
 	case SceneDev:
 		return a.applyDev()
 	case SceneTelegram:
-		return a.applyTelegram()
+		return a.applyTelegram(nil)
 	default:
 		return fmt.Errorf("未知场景：%s", scene)
 	}
@@ -257,10 +268,16 @@ func (a *App) applyDev() error {
 	return nil
 }
 
-func (a *App) applyTelegram() error {
-	targets, err := a.telegramTargets(nil, false)
-	if err != nil {
-		return err
+// applyTelegram 应用电报场景。targets 为 nil 时自行发现（applyScene/回滚路径）；
+// setSceneWithStore/applySavedScenes 会把已发现的目标传入，避免同一次操作里发现两次
+// （两次自动发现结果可能不一致，持久化的应与实际应用的一致）。
+func (a *App) applyTelegram(targets []systemdTargetName) error {
+	if targets == nil {
+		var err error
+		targets, err = a.telegramTargets(nil, false)
+		if err != nil {
+			return err
+		}
 	}
 	if len(targets) == 0 {
 		return fmt.Errorf("没有可注入的 OpenClaw/Hermes systemd 目标服务")
@@ -272,7 +289,9 @@ func (a *App) applyTelegram() error {
 	if err != nil {
 		return err
 	}
-	dropIn := "[Service]\nEnvironmentFile=/etc/openclaw-hermes-tg-proxy.env\n"
+	// EnvironmentFile 带 `-` 前缀：env 文件缺失时单元仍能启动。restoreTelegram 先删 env
+	// 文件再删各 drop-in，中间窗口（或清理中途失败残留 drop-in）不能把目标服务打到起不来。
+	dropIn := "[Service]\nEnvironmentFile=-/etc/openclaw-hermes-tg-proxy.env\n"
 	proxyURL := a.cfg.HTTPAddr(SceneTelegram)
 	manageOpenClaw := envBool("PROXYSCENE_MANAGE_OPENCLAW_CONFIG", true)
 	userManagers := map[string]bool{}
@@ -318,7 +337,13 @@ func (a *App) applyTelegram() error {
 			}
 			continue
 		}
-		// 系统级 hermes：drop-in 内容固定（EnvironmentFile=），仅在 drop-in 新建或共享 env 文件
+		// 系统级 hermes：单元不存在时跳过，避免为配置里锚定但未安装的服务（默认含
+		// hermes-gateway）留下 phantom drop-in；安装后重开场景即可注入。
+		if !systemUnitExists(target.Service) {
+			fmt.Printf("提示：系统级目标 %s 未安装，已跳过注入；安装后请重新执行 proxyscene tg on\n", target.Service)
+			continue
+		}
+		// drop-in 内容固定（EnvironmentFile=），仅在 drop-in 新建或共享 env 文件
 		// 内容变化时才需重启。
 		changed, err := writeFileAtomicIfChanged(a.cfg.TelegramDropInPath(target.Service), []byte(dropIn), 0o644)
 		if err != nil {
@@ -416,7 +441,10 @@ func (a *App) restoreTelegram() error {
 					fmt.Printf("警告：还原用户 %s 的 openclaw Telegram 代理配置失败：%v\n", target.User, err)
 				}
 				if path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service); err == nil {
-					_ = os.Remove(path)
+					if removeFileReport(path) {
+						// 真的清掉了旧版遗留 drop-in 时，同样需要 reload 该用户的 user systemd 才生效。
+						userManagers[target.User] = true
+					}
 					_ = os.Remove(filepath.Dir(path))
 				}
 				if changed {
