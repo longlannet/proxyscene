@@ -46,6 +46,8 @@ func (a *App) applySavedScenes(st *Store) error {
 					errs = append(errs, fmt.Errorf("%s应用失败：%w", sceneName(scene), err))
 					continue
 				}
+				// 覆盖记录前先差集清理掉出集合的旧目标（如旧版本写死的 openclaw/hermes）。
+				a.cleanupStaleTelegramTargets(st, targets)
 				st.TelegramTargets = canonicalTelegramTargetNames(targets)
 			} else if err := a.applyScene(scene); err != nil {
 				errs = append(errs, fmt.Errorf("%s应用失败：%w", sceneName(scene), err))
@@ -113,6 +115,8 @@ func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
 			return applyErr
 		}
 		if scene == SceneTelegram {
+			// 覆盖记录前先差集清理掉出集合的旧目标（如旧版本写死的 openclaw/hermes）。
+			a.cleanupStaleTelegramTargets(st, telegramTargets)
 			st.TelegramTargets = canonicalTelegramTargetNames(telegramTargets)
 		}
 	} else {
@@ -316,8 +320,16 @@ func (a *App) applyTelegram(targets []systemdTargetName) error {
 				if changed {
 					restart = append(restart, target)
 				}
-			} else if systemUnitExists(target.Service) {
-				fmt.Printf("警告：系统级 openclaw 单元 %s 无法确定配置归属用户，已跳过，请手动设置 channels.telegram.proxy=%s\n", target.Service, proxyURL)
+			} else {
+				// 顺带清理 ≤v0.5.0 为系统级 openclaw 写过的无效 env drop-in（openclaw 不读 TELEGRAM_*）。
+				removed := removeFileReport(a.cfg.TelegramDropInPath(target.Service))
+				_ = os.Remove(a.cfg.TelegramDropInDir(target.Service))
+				if systemUnitExists(target.Service) {
+					if removed {
+						restart = append(restart, target)
+					}
+					fmt.Printf("警告：系统级 openclaw 单元 %s 无法确定配置归属用户，已跳过，请手动设置 channels.telegram.proxy=%s\n", target.Service, proxyURL)
+				}
 			}
 			continue
 		}
@@ -433,42 +445,11 @@ func (a *App) restoreTelegram() error {
 	userManagers := map[string]bool{}
 	restart := []systemdTargetName{} // 只重启确有清理（drop-in 删除 / openclaw 配置还原）的目标
 	for _, target := range targets {
-		if a.isOpenClawTarget(target) {
-			// 还原 openclaw 配置（仅当当前值仍是我们设置的托管值），并顺带清理旧版本可能写入的无效 drop-in。
-			if target.UserMode {
-				changed, err := a.restoreOpenClawTelegramProxy(target.User, proxyURL)
-				if err != nil {
-					fmt.Printf("警告：还原用户 %s 的 openclaw Telegram 代理配置失败：%v\n", target.User, err)
-				}
-				if path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service); err == nil {
-					if removeFileReport(path) {
-						// 真的清掉了旧版遗留 drop-in 时，同样需要 reload 该用户的 user systemd 才生效。
-						userManagers[target.User] = true
-					}
-					_ = os.Remove(filepath.Dir(path))
-				}
-				if changed {
-					restart = append(restart, target)
-				}
-			}
-			continue
+		restartNeeded, userReload := a.removeTelegramInjection(target, proxyURL)
+		if userReload {
+			userManagers[target.User] = true
 		}
-		if target.UserMode {
-			path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service)
-			if err == nil {
-				removed := removeFileReport(path)
-				// 删除清空后的 .service.d 目录；目录非空（有其他 drop-in）时 Remove 失败，忽略。
-				_ = os.Remove(filepath.Dir(path))
-				userManagers[target.User] = true
-				if removed {
-					restart = append(restart, target)
-				}
-			}
-			continue
-		}
-		removed := removeFileReport(a.cfg.TelegramDropInPath(target.Service))
-		_ = os.Remove(a.cfg.TelegramDropInDir(target.Service))
-		if removed {
+		if restartNeeded {
 			restart = append(restart, target)
 		}
 	}
@@ -478,4 +459,105 @@ func (a *App) restoreTelegram() error {
 	}
 	a.restartTelegramTargets(restart)
 	return nil
+}
+
+// removeTelegramInjection 移除单个目标的全部注入痕迹（drop-in / openclaw 托管配置值）。
+// 返回是否需要重启该目标（确有清理才重启）、以及是否动过该用户的 user systemd（需 daemon-reload）。
+// 供 restoreTelegram（关闭场景的全量清理）与 cleanupStaleTelegramTargets（差集清理）共用。
+func (a *App) removeTelegramInjection(target systemdTargetName, proxyURL string) (restartNeeded, userReload bool) {
+	if a.isOpenClawTarget(target) {
+		// 还原 openclaw 配置（仅当当前值仍是我们设置的托管值），并顺带清理旧版本可能写入的无效 drop-in。
+		if target.UserMode {
+			changed, err := a.restoreOpenClawTelegramProxy(target.User, proxyURL)
+			if err != nil {
+				fmt.Printf("警告：还原用户 %s 的 openclaw Telegram 代理配置失败：%v\n", target.User, err)
+			}
+			if path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service); err == nil {
+				if removeFileReport(path) {
+					// 真的清掉了旧版遗留 drop-in 时，同样需要 reload 该用户的 user systemd 才生效。
+					userReload = true
+				}
+				_ = os.Remove(filepath.Dir(path))
+			}
+			return changed, userReload
+		}
+		// 系统级 openclaw：≤v0.5.0 曾为其写过 EnvironmentFile= drop-in（env 注入对 openclaw 无效）。
+		// env 文件已在关闭场景时删除，残留 drop-in 会让现存或将来安装的同名单元因
+		// EnvironmentFile 缺失而无法启动，这里一并清理。
+		removed := removeFileReport(a.cfg.TelegramDropInPath(target.Service))
+		_ = os.Remove(a.cfg.TelegramDropInDir(target.Service))
+		return removed && systemUnitExists(target.Service), false
+	}
+	if target.UserMode {
+		path, err := a.cfg.UserTelegramDropInPath(target.User, target.Service)
+		if err != nil {
+			return false, false
+		}
+		removed := removeFileReport(path)
+		// 删除清空后的 .service.d 目录；目录非空（有其他 drop-in）时 Remove 失败，忽略。
+		_ = os.Remove(filepath.Dir(path))
+		return removed, true
+	}
+	removed := removeFileReport(a.cfg.TelegramDropInPath(target.Service))
+	_ = os.Remove(a.cfg.TelegramDropInDir(target.Service))
+	return removed, false
+}
+
+// staleTelegramTargets 返回 stored 记录中已不在 current 集合内的目标（解析失败的跳过并告警）。
+func staleTelegramTargets(stored []string, current []systemdTargetName) []systemdTargetName {
+	keep := map[string]bool{}
+	for _, target := range current {
+		keep[canonicalTelegramTargetName(target)] = true
+	}
+	stale := []systemdTargetName{}
+	seen := map[string]bool{}
+	for _, name := range stored {
+		target, err := parseSystemdTargetName(name)
+		if err != nil {
+			fmt.Printf("警告：跳过无效的历史电报代理目标记录：%v\n", err)
+			continue
+		}
+		key := canonicalTelegramTargetName(target)
+		if keep[key] || seen[key] {
+			continue
+		}
+		seen[key] = true
+		stale = append(stale, target)
+	}
+	return stale
+}
+
+// cleanupStaleTelegramTargets 在用新目标集合覆盖 TelegramTargets 记录之前，对「上次应用过、
+// 本次不再管理」的旧目标做差集清理。否则旧版本（≤v0.5.0 默认写死 openclaw/hermes/
+// user:root:hermes-gateway）留下的 drop-in 会随记录被覆盖而永久失管，日后 env 文件被删时
+// 让同名单元无法启动。尽力而为：清理失败仅告警，不阻断场景应用。
+func (a *App) cleanupStaleTelegramTargets(st *Store, current []systemdTargetName) {
+	if st == nil {
+		return
+	}
+	stale := staleTelegramTargets(st.TelegramTargets, current)
+	if len(stale) == 0 {
+		return
+	}
+	proxyURL := a.cfg.HTTPAddr(SceneTelegram)
+	userManagers := map[string]bool{}
+	restart := []systemdTargetName{}
+	for _, target := range stale {
+		fmt.Printf("清理不再管理的电报代理目标残留：%s\n", canonicalTelegramTargetName(target))
+		restartNeeded, userReload := a.removeTelegramInjection(target, proxyURL)
+		if userReload {
+			userManagers[target.User] = true
+		}
+		if restartNeeded {
+			restart = append(restart, target)
+		}
+	}
+	if len(restart) == 0 && len(userManagers) == 0 {
+		return
+	}
+	_ = runQuietLabel("重新加载 systemd 配置", "systemctl", "daemon-reload")
+	for userName := range userManagers {
+		runUserSystemctlWarn(userName, "重新加载用户级 systemd 配置", "daemon-reload")
+	}
+	a.restartTelegramTargets(restart)
 }

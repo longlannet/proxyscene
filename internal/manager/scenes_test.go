@@ -58,3 +58,38 @@ func TestTelegramProxySystemdEnvironmentLinesDoNotInjectBroadProxy(t *testing.T)
 		}
 	}
 }
+
+func TestStaleTelegramTargets(t *testing.T) {
+	// 模拟 ≤v0.5.0 时代的存量记录：升级后默认/发现集合只剩 hermes-gateway，
+	// 其余三个旧目标应被识别为需差集清理的残留。
+	stored := []string{
+		"openclaw.service",
+		"hermes.service",
+		"hermes-gateway.service",
+		"user:root:hermes-gateway.service",
+		"hermes.service", // 重复记录只应出现一次
+		"bad//name",      // 非法记录应被跳过而不是中断
+	}
+	current := []systemdTargetName{{Service: "hermes-gateway.service"}}
+	stale := staleTelegramTargets(stored, current)
+	got := map[string]bool{}
+	for _, target := range stale {
+		got[canonicalTelegramTargetName(target)] = true
+	}
+	want := []string{"openclaw.service", "hermes.service", "user:root:hermes-gateway.service"}
+	if len(stale) != len(want) {
+		t.Fatalf("stale 数量 = %d，期望 %d：%+v", len(stale), len(want), stale)
+	}
+	for _, name := range want {
+		if !got[name] {
+			t.Fatalf("缺少应清理的目标 %s：%+v", name, stale)
+		}
+	}
+	if got["hermes-gateway.service"] {
+		t.Fatalf("仍在集合内的目标不应被判为残留")
+	}
+	// 全部仍在集合内时应返回空。
+	if s := staleTelegramTargets([]string{"hermes-gateway.service"}, current); len(s) != 0 {
+		t.Fatalf("无残留时应为空，得到 %+v", s)
+	}
+}
