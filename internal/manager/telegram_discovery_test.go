@@ -85,6 +85,34 @@ func TestIsTelegramRelatedUnitRejectsGuardByFile(t *testing.T) {
 	}
 }
 
+func TestUnitFileExistsInRoots(t *testing.T) {
+	dir := t.TempDir()
+	if unitFileExistsInRoots("hermes-gateway", []string{dir}) {
+		t.Fatalf("missing unit should not exist")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "hermes-gateway.service"), []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatalf("write unit: %v", err)
+	}
+	if !unitFileExistsInRoots("hermes-gateway", []string{dir}) {
+		t.Fatalf("unit should be found with shorthand service name")
+	}
+}
+
+func TestPrivateUserUnitRootsIncludesLocalShare(t *testing.T) {
+	home := t.TempDir()
+	roots := privateUserUnitRoots(home)
+	want := map[string]bool{
+		filepath.Join(home, ".config/systemd/user"):      true,
+		filepath.Join(home, ".local/share/systemd/user"): true,
+	}
+	for _, root := range roots {
+		delete(want, root)
+	}
+	if len(want) != 0 {
+		t.Fatalf("private user unit roots missing entries: %v", want)
+	}
+}
+
 func TestUnitOpenClawMarkerExactMatch(t *testing.T) {
 	// 子串包含不应命中：赋值必须整体精确等于 marker/kind。
 	fake := "[Service]\nEnvironment=FOO_OPENCLAW_SERVICE_MARKER=openclawx\nEnvironment=PREFIX_OPENCLAW_SERVICE_KIND=gatewayy\n"

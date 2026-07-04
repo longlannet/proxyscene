@@ -42,9 +42,11 @@ func (a *App) locateTelegramUnitFile(t systemdTargetName) (string, bool) {
 		if err != nil || strings.TrimSpace(home) == "" {
 			return "", false
 		}
-		p := filepath.Join(home, ".config/systemd/user", t.Service)
-		if fileExists(p) {
-			return p, true
+		for _, root := range privateUserUnitRoots(home) {
+			p := filepath.Join(root, t.Service)
+			if fileExists(p) {
+				return p, true
+			}
 		}
 		return "", false
 	}

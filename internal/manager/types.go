@@ -64,10 +64,11 @@ func DefaultConfig() Config {
 		SystemdService:  envString("PROXYSCENE_SYSTEMD_SERVICE_NAME", "proxyscene.service"),
 		RestoreService:  envString("PROXYSCENE_BOOT_RESTORE_SERVICE_NAME", "proxyscene-restore.service"),
 		XrayServiceUser: envString("PROXYSCENE_SERVICE_USER", "proxyscene"),
-		// 默认只锚定规范的系统级 hermes 网关；openclaw 网关、hermes 的 profile 实例、用户级单元
-		// 都由精确自动发现覆盖（见 telegram_discovery.go）。applyTelegram 对不存在的系统级
-		// 单元会跳过注入（不生成 phantom drop-in），因此这里锚定未安装的服务也无副作用。
-		TGTargetServices: splitFields(envString("PROXYSCENE_TG_SERVICES", "hermes-gateway")),
+		// 默认锚定规范的系统级 hermes 网关和 root 的用户级 hermes 网关；openclaw 网关、
+		// hermes 的 profile 实例、其它用户级单元都由精确自动发现覆盖（见 telegram_discovery.go）。
+		// applyTelegram 对不存在的目标会跳过注入（不生成 phantom drop-in），因此这里锚定
+		// root 用户级 hermes 不会在未安装时留下残留 drop-in。
+		TGTargetServices: splitFields(envString("PROXYSCENE_TG_SERVICES", "hermes-gateway user:root:hermes-gateway")),
 		DevTargetUser:    envString("PROXYSCENE_DEV_TARGET_USER", ""),
 		TestURL:          envString("PROXYSCENE_TEST_URL", "https://www.google.com/generate_204"),
 	}

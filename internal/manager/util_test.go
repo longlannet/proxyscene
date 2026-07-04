@@ -58,6 +58,23 @@ func TestDefaultConfigValidates(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigIncludesRootUserHermesTarget(t *testing.T) {
+	t.Setenv("PROXYSCENE_TG_SERVICES", "")
+	cfg := DefaultConfig()
+	wantSystem, wantUser := false, false
+	for _, svc := range cfg.TGTargetServices {
+		switch svc {
+		case "hermes-gateway":
+			wantSystem = true
+		case "user:root:hermes-gateway":
+			wantUser = true
+		}
+	}
+	if !wantSystem || !wantUser {
+		t.Fatalf("default TG targets = %v, want hermes-gateway and user:root:hermes-gateway", cfg.TGTargetServices)
+	}
+}
+
 func TestValidateProxyHostLoopbackOnly(t *testing.T) {
 	t.Setenv("PROXYSCENE_ALLOW_PUBLIC_BIND", "0")
 	if err := validateProxyHost("127.0.0.1"); err != nil {

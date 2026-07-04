@@ -119,21 +119,56 @@ func discoverUserTelegramTargetNames() []string {
 		if err := ensureUserHomeUsable(account.Home, account.Name); err != nil {
 			continue
 		}
-		root := filepath.Join(account.Home, ".config/systemd/user")
-		walkTelegramUnitFiles(root, func(path, service string) {
-			if !isTelegramRelatedUnit(path, service) {
-				return
-			}
-			name := "user:" + account.Name + ":" + service
-			if seen[name] {
-				return
-			}
-			seen[name] = true
-			values = append(values, name)
-		})
+		for _, root := range privateUserUnitRoots(account.Home) {
+			walkTelegramUnitFiles(root, func(path, service string) {
+				if !isTelegramRelatedUnit(path, service) {
+					return
+				}
+				name := "user:" + account.Name + ":" + service
+				if seen[name] {
+					return
+				}
+				seen[name] = true
+				values = append(values, name)
+			})
+		}
 	}
 	sort.Strings(values)
 	return values
+}
+
+func privateUserUnitRoots(home string) []string {
+	return []string{
+		filepath.Join(home, ".config/systemd/user"),
+		filepath.Join(home, ".local/share/systemd/user"),
+	}
+}
+
+func globalUserUnitRoots() []string {
+	return []string{"/etc/systemd/user", "/run/systemd/user", "/usr/local/lib/systemd/user", "/lib/systemd/user", "/usr/lib/systemd/user"}
+}
+
+func userUnitSearchRoots(home string) []string {
+	roots := append([]string{}, privateUserUnitRoots(home)...)
+	return append(roots, globalUserUnitRoots()...)
+}
+
+func unitFileExistsInRoots(service string, roots []string) bool {
+	service = normalizeSystemdServiceName(service)
+	for _, root := range roots {
+		if fileExists(filepath.Join(root, service)) {
+			return true
+		}
+	}
+	return false
+}
+
+func userUnitExists(userName, service string) bool {
+	home, err := userHomeDir(userName)
+	if err != nil || ensureUserHomeUsable(home, userName) != nil {
+		return false
+	}
+	return unitFileExistsInRoots(service, userUnitSearchRoots(home))
 }
 
 func walkTelegramUnitFiles(root string, visit func(path, service string)) {

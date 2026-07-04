@@ -302,6 +302,12 @@ func (a *App) applyTelegram(targets []systemdTargetName) error {
 	warnedBus := map[string]bool{}
 	restart := []systemdTargetName{} // 只重启确有改动的目标
 	for _, target := range targets {
+		// 默认目标包含 root 用户级 Hermes，以覆盖常见的 systemctl --user 部署；但只有
+		// 目标 unit 确实存在时才写 drop-in，避免再次产生 phantom drop-in。
+		if target.UserMode && !userUnitExists(target.User, target.Service) {
+			fmt.Printf("提示：用户级目标 %s 未安装，已跳过注入；安装后请重新执行 proxyscene tg on\n", canonicalTelegramTargetName(target))
+			continue
+		}
 		// 用户级目标需要其 systemd 用户总线在运行（linger/已登录）才能注入/重启生效，先做可见提示。
 		if target.UserMode && !warnedBus[target.User] {
 			warnIfUserBusMissing(target.User)
