@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -143,7 +144,11 @@ func TestParsePasswdLine(t *testing.T) {
 }
 
 func TestOutputAsUserUsesIdentityHomeWithoutCallerEnvironment(t *testing.T) {
-	identity, err := lookupLocalUserIdentity("root")
+	currentUser, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := lookupLocalUserIdentity(currentUser.Username)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +158,7 @@ func TestOutputAsUserUsesIdentityHomeWithoutCallerEnvironment(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "http://attacker.invalid:8080")
 	t.Setenv("XDG_RUNTIME_DIR", "/tmp/attacker-runtime")
 
-	out, err := outputAsUser("root", "/bin/sh", "-c", `printf '%s\n%s\n%s\n%s\n%s\n' "$HOME" "$XDG_RUNTIME_DIR" "${GIT_CONFIG_GLOBAL-unset}" "${NPM_CONFIG_USERCONFIG-unset}" "${HTTPS_PROXY-unset}"`)
+	out, err := outputAsUser(identity.Name, "/bin/sh", "-c", `printf '%s\n%s\n%s\n%s\n%s\n' "$HOME" "$XDG_RUNTIME_DIR" "${GIT_CONFIG_GLOBAL-unset}" "${NPM_CONFIG_USERCONFIG-unset}" "${HTTPS_PROXY-unset}"`)
 	if err != nil {
 		t.Fatal(err)
 	}

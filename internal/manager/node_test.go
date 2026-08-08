@@ -101,6 +101,20 @@ func TestRenameNodeSanitizesName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("addNode: %v", err)
 	}
+	oldRun := systemctlRun
+	oldOutput := systemctlOutput
+	t.Cleanup(func() {
+		systemctlRun = oldRun
+		systemctlOutput = oldOutput
+	})
+	systemctlRun = func(string, ...string) error {
+		t.Fatal("renameNode must not invoke systemctl")
+		return nil
+	}
+	systemctlOutput = func(string, ...string) (string, error) {
+		t.Fatal("renameNode must not query systemctl")
+		return "", nil
+	}
 	if err := a.renameNode(st, id, "ne\x1bw\x07"); err != nil {
 		t.Fatalf("renameNode: %v", err)
 	}

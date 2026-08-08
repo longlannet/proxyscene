@@ -1627,7 +1627,7 @@ func (a *App) removeNode(st *Store, id string) error {
 }
 
 func (a *App) renameNode(st *Store, id, name string) error {
-	return a.commitNodeStoreMutation(st, func(candidate *Store) error {
+	return a.commitStoreMutation(st, func(candidate *Store) error {
 		n := candidate.findNode(id)
 		if n == nil {
 			return fmt.Errorf("节点不存在：%s", id)
@@ -1643,7 +1643,7 @@ func (a *App) renameNode(st *Store, id, name string) error {
 		n.Name = name
 		n.UpdatedAt = time.Now()
 		return nil
-	})
+	}, storeRuntimeSyncNone)
 }
 
 // normalizeScope 把帮助文本中的中文范围别名归一化为内部 token，使
