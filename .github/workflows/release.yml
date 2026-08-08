@@ -1,80 +1,313 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: proxyscene-release-publication
+  cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish release
+  build:
+    name: Build release artifacts
     runs-on: ubuntu-latest
-    env:
-      # 优先用新名 PROXYSCENE_MINISIGN_SECRET_KEY，回退旧名 XRAY_PROXY_MINISIGN_SECRET_KEY，
-      # 以便平滑改名：可先在仓库 Settings 新增同值的 PROXYSCENE_MINISIGN_SECRET_KEY，再删旧的。
-      PROXYSCENE_MINISIGN_SECRET_KEY: ${{ secrets.PROXYSCENE_MINISIGN_SECRET_KEY || secrets.XRAY_PROXY_MINISIGN_SECRET_KEY }}
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
     steps:
-      - name: Checkout
+      - name: Checkout selected main commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve and require current main source
+        id: source
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          stable_tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Release workflow 必须从 main 分支启动，实际为 $GITHUB_REF" >&2
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ $stable_tag_re ]]; then
+            echo "版本必须是无前导零的稳定版本 vMAJOR.MINOR.PATCH：$VERSION" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          main_commit="$(git rev-parse 'refs/remotes/origin/main^{commit}')"
+          if [[ "$commit" != "$head_commit" ]]; then
+            echo "checkout 不匹配 workflow event commit：event=$commit checkout=$head_commit" >&2
+            exit 1
+          fi
+          if [[ "$commit" != "$main_commit" ]]; then
+            echo "启动时选定提交必须仍是 main HEAD：event=$commit checkout=$head_commit main=$main_commit" >&2
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils jq shellcheck unzip
+      - name: Verify module cache
+        run: go mod verify
+      - name: Formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' -t go_files < <(git ls-files -z '*.go')
+          unformatted="$(gofmt -l "${go_files[@]}")"
+          if [[ -n "$unformatted" ]]; then
+            echo "以下 Go 文件未格式化：" >&2
+            printf '%s\n' "$unformatted" >&2
+            exit 1
+          fi
       - name: Test
         run: go test ./...
+      - name: Race test
+        run: go test -race ./...
       - name: Vet
         run: go vet ./...
-      - name: Build artifacts
+      - name: Static analysis
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+      - name: Shell validation
+        run: |
+          bash -n install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
+          shellcheck install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
+          bash scripts/install-test.sh
+      - name: Workflow validation
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
+      - name: Require clean source before build
         shell: bash
         env:
-          # 固定 Xray 版本以保证可复现构建（不跟 latest 漂移）。升级 Xray 时手动 bump 此处、
-          # build-bundle.sh、install.sh 的默认值（以及 xxv 镜像 SHA256）。
-          XRAY_RELEASE_BASE: https://github.com/XTLS/Xray-core/releases/download/v26.3.27
-          VERSION: ${{ github.ref_name }}
-          COMMIT: ${{ github.sha }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y unzip
-          # 构建逻辑统一在 scripts/build-bundle.sh（CI 以 dry-run 验证）。
-          scripts/build-bundle.sh
-      - name: Sign artifacts
-        if: ${{ env.PROXYSCENE_MINISIGN_SECRET_KEY != '' }}
+          head="$(git rev-parse HEAD)"
+          if [[ "$head" != "$SOURCE_COMMIT" ]]; then
+            echo "构建前 HEAD 不匹配选定 main commit：期望 $SOURCE_COMMIT，实际 $head" >&2
+            exit 1
+          fi
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "$status" ]]; then
+            echo "构建前工作树不干净：" >&2
+            printf '%s\n' "$status" >&2
+            exit 1
+          fi
+      - name: Build artifacts twice
         shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y minisign
+          first="$(mktemp -d "${RUNNER_TEMP}/proxyscene-release-first.XXXXXX")"
+          second="$(mktemp -d "${RUNNER_TEMP}/proxyscene-release-second.XXXXXX")"
           cleanup() {
-            rm -f minisign.key
+            rm -rf -- "$first" "$second"
           }
           trap cleanup EXIT
-          printf '%s' "$PROXYSCENE_MINISIGN_SECRET_KEY" > minisign.key
-          chmod 600 minisign.key
-          # 签名 checksums.txt（联机安装校验用）。
-          minisign -S -W -m dist/checksums.txt -s minisign.key -x dist/checksums.txt.minisig
-          # 逐个签名离线整合包（离线安装用内置公钥直接验 .minisig）。
-          for b in dist/proxyscene_bundle_linux_*.tar.gz; do
-            minisign -S -W -m "$b" -s minisign.key -x "$b.minisig"
-          done
-      - name: Require signatures on canonical repo
-        # 防止"签名 Secret 缺失时静默发布未签名产物"：官方仓库必须有签名才放行；
-        # fork（github.repository 不同）缺少 Secret 属正常，跳过此检查。
-        if: ${{ github.repository == 'longlannet/proxyscene' }}
+          DIST="$first" scripts/build-bundle.sh
+          DIST="$second" scripts/build-bundle.sh
+          diff -qr -- "$first" "$second"
+          mv -- "$first" dist
+          rm -rf -- "$second"
+          trap - EXIT
+          echo "两次独立四架构构建逐字节一致"
+      - name: Verify release set
         shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -euo pipefail
-          test -f dist/checksums.txt.minisig || { echo "缺少 checksums.txt.minisig（签名 Secret 是否丢失？）"; exit 1; }
-          for f in dist/proxyscene_bundle_linux_*.tar.gz; do
-            test -f "$f.minisig" || { echo "缺少签名：$f.minisig"; exit 1; }
-          done
-          echo "所有产物签名齐全"
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+          scripts/verify-release-artifacts.sh
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          tar xzf dist/proxyscene_bundle_linux_amd64.tar.gz -C "$verify_dir"
+          PROXYSCENE_TEST_XRAY="$verify_dir/proxyscene_bundle_linux_amd64/xray" \
+            go test ./internal/manager -run '^TestGeneratedTransportConfigsPassPinnedXray$'
+      - name: Disposable systemd install and v0.7.1 upgrade canary
+        shell: bash
+        env:
+          V071_BUNDLE_URL: https://github.com/longlannet/proxyscene/releases/download/v0.7.1/proxyscene_bundle_linux_amd64.tar.gz
+          V071_BUNDLE_SHA256: 08a12e5716166c76095c54f6ea8227db8f623a719051479ceb7d6720c5c0da38
+        run: |
+          set -euo pipefail
+          canary_dir="$(mktemp -d "${RUNNER_TEMP}/proxyscene-systemd-canary.XXXXXX")"
+          cleanup() {
+            rm -rf -- "$canary_dir"
+          }
+          trap cleanup EXIT
+          old_bundle="$canary_dir/proxyscene_bundle_linux_amd64-v0.7.1.tar.gz"
+          curl -q -fsSL --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 \
+            --max-filesize 104857600 -o "$old_bundle" "$V071_BUNDLE_URL"
+          printf '%s  %s\n' "$V071_BUNDLE_SHA256" "$old_bundle" | sha256sum -c -
+          PROXYSCENE_CONTAINER_TEST=1 bash scripts/systemd-integration-test.sh \
+            dist/proxyscene_bundle_linux_amd64.tar.gz "$old_bundle"
+      - name: Require clean source after build
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          if [[ "$head" != "$SOURCE_COMMIT" ]]; then
+            echo "构建后 HEAD 不匹配选定 main commit：期望 $SOURCE_COMMIT，实际 $head" >&2
+            exit 1
+          fi
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "$status" ]]; then
+            echo "构建后工作树不干净：" >&2
+            printf '%s\n' "$status" >&2
+            exit 1
+          fi
+      - name: Upload release set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          files: dist/*
-          generate_release_notes: true
+          name: release-set
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download release set
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-set
+          path: dist
+      - name: Create Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_COMMIT: ${{ needs.build.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          stable_tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$GITHUB_REF" == "refs/heads/main" && "$VERSION" =~ $stable_tag_re ]]
+          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          ( cd dist && sha256sum -c checksums.txt )
+
+          api_status() {
+            curl -q -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/$1"
+          }
+
+          main_commit="$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" --jq '.commit.sha')"
+          [[ "$main_commit" == "$EXPECTED_COMMIT" ]] || {
+            echo "构建后 main 已移动；请重新发起发布" >&2
+            exit 1
+          }
+          [[ "$(api_status "git/ref/tags/$VERSION")" == "404" ]] || {
+            echo "目标 tag 已存在或无法确认不存在：$VERSION" >&2
+            exit 1
+          }
+          [[ "$(api_status "releases/tags/$VERSION")" == "404" ]] || {
+            echo "目标 Release 已存在或无法确认不存在：$VERSION" >&2
+            exit 1
+          }
+
+          gh release create "$VERSION" dist/* \
+            --target "$EXPECTED_COMMIT" \
+            --title "$VERSION" \
+            --generate-notes \
+            --draft
+          gh release edit "$VERSION" --draft=false --latest
+
+  verify:
+    name: Verify published release
+    needs:
+      - build
+      - publish
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+    permissions:
+      contents: read
+    steps:
+      - name: Download local release set
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-set
+          path: dist
+      - name: Verify immutable Latest and downloaded assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          EXPECTED_COMMIT: ${{ needs.build.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$VERSION" > "$verify_dir/tag-ref.json"
+          jq -e --arg commit "$EXPECTED_COMMIT" '
+            .object.type == "commit" and .object.sha == $commit
+          ' "$verify_dir/tag-ref.json" >/dev/null
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$VERSION" > "$verify_dir/release.json"
+          jq -e --arg version "$VERSION" '
+            .tag_name == $version and
+            .immutable == true and
+            .draft == false and
+            .prerelease == false
+          ' "$verify_dir/release.json" >/dev/null
+          gh api "repos/${GITHUB_REPOSITORY}/releases/latest" > "$verify_dir/latest.json"
+          jq -e --arg version "$VERSION" '
+            .tag_name == $version and .immutable == true and
+            .draft == false and .prerelease == false
+          ' "$verify_dir/latest.json" >/dev/null
+
+          : > "$verify_dir/local-assets.tsv"
+          for file in dist/*; do
+            test -f "$file"
+            printf '%s\tsha256:%s\n' \
+              "$(basename "$file")" "$(sha256sum "$file" | awk '{print $1}')" \
+              >> "$verify_dir/local-assets.tsv"
+          done
+          LC_ALL=C sort -o "$verify_dir/local-assets.tsv" "$verify_dir/local-assets.tsv"
+          jq -er '.assets[] | [.name, .digest] | @tsv' "$verify_dir/release.json" \
+            | LC_ALL=C sort > "$verify_dir/remote-assets.tsv"
+          diff -u "$verify_dir/local-assets.tsv" "$verify_dir/remote-assets.tsv"
+
+          mkdir "$verify_dir/downloaded"
+          gh release download "$VERSION" --dir "$verify_dir/downloaded"
+          local_names="$(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          downloaded_names="$(find "$verify_dir/downloaded" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          [[ "$downloaded_names" == "$local_names" ]]
+          while IFS= read -r name; do
+            cmp -- "dist/$name" "$verify_dir/downloaded/$name"
+          done <<< "$local_names"
+          ( cd "$verify_dir/downloaded" && sha256sum -c checksums.txt )

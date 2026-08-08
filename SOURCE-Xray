@@ -1,0 +1,32 @@
+Xray-core Corresponding Source Notice
+=====================================
+
+The unmodified Xray-core executable in the proxyscene offline bundles is from:
+
+- Release: v26.3.27
+- Source commit: d2758a023cd7f4174a5a5fa4ff66e487d4342ba0
+- Upstream source: https://github.com/XTLS/Xray-core/tree/v26.3.27
+- Upstream build Go version recorded in the ELF: go1.26.1
+
+The same immutable proxyscene GitHub Release carries
+`xray_source_v26.3.27.tar.gz`. Its SHA256 is listed in that Release's
+`checksums.txt`. The source archive contains the exact Xray-core source module
+and the source module zip, go.mod, and module metadata for every Go module
+recorded in the redistributed ELF by `go version -m`. It also contains the
+license and notice collection used by the binary bundle.
+
+The upstream Linux build command is recorded in Xray-core's release workflow.
+For ordinary Linux targets it builds `./main` with CGO disabled, trim paths,
+disabled VCS stamping, `-gcflags=all=-l=4`, and linker flags that set the Xray
+build identifier and remove the Go build ID. See the exact source and workflow
+at the commit above for the authoritative build instructions.
+
+proxyscene does not modify the Xray-core executable. The Xray-core project is
+licensed under MPL-2.0. The linked dependency set includes GPL-3.0-or-later,
+LGPL-3.0-with-linking-exception, MPL-2.0, and permissively licensed modules;
+their exact versions, Go module sums, licenses, and notices are recorded in
+`THIRD_PARTY_LICENSES-Xray`.
+
+The generated proxyscene routing configuration does not use `geoip.dat` or
+`geosite.dat`. Those data files are not extracted, installed, or redistributed
+by current proxyscene releases.

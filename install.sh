@@ -1,58 +1,85 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -Eeuo pipefail
+umask 077
+
+TRUSTED_ROOT_PATH="/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PATH="$TRUSTED_ROOT_PATH"
+export PATH
 
 SCRIPT_NAME="proxyscene 安装器"
-DEFAULT_GO_VERSION="1.22.12"
+DEFAULT_GO_VERSION="1.26.5"
 DEFAULT_CORE_DIR="/opt/proxyscene"
 DEFAULT_INSTALL_BIN="/usr/local/bin/proxyscene"
-DEFAULT_XRAY_DOWNLOAD_SOURCE="official"
-DEFAULT_XRAY_ZIP_URL=""
-DEFAULT_XRAY_XXV_ZIP_URL="https://xxv.cc/7c9fxLN4nm4BFU8fjD.zip"
-# xxv 镜像当前与官方 amd64 Xray-linux-64.zip 字节一致；固定其 SHA256 使该路径默认可校验
-# （xxv 用于屏蔽 GitHub 的环境，无法回连官方 .dgst，故只能内置常量）。刷新镜像/升级 Xray 时
-# 与下面的固定版本一起 bump。
-DEFAULT_XRAY_XXV_ZIP_SHA256="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
-# 固定 Xray 版本以保证可复现安装（与 release.yml/build-bundle.sh 一起手动 bump）。
-DEFAULT_XRAY_GITHUB_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/download/v26.3.27"
-# 本项目 Release 的 minisign 公钥；离线安装默认用它验签离线整合包。
-DEFAULT_MANAGER_MINISIGN_PUBKEY="RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb"
+DEFAULT_SYSTEMD_SERVICE="proxyscene.service"
+DEFAULT_RESTORE_SERVICE="proxyscene-restore.service"
+DEFAULT_REPO="longlannet/proxyscene"
+DEFAULT_MANAGER_VERSION="latest"
+DEFAULT_XRAY_VERSION="v26.3.27"
+DEFAULT_XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/download/${DEFAULT_XRAY_VERSION}"
+DEFAULT_DOWNLOAD_TIMEOUT=300
+INSTALL_LOCK_PATH="/run/proxyscene-install.lock"
+TRANSACTION_TMP_ROOT="/run/proxyscene-install-tmp"
+HOST_OWNERSHIP_PATH="/etc/proxyscene-host-ownership.json"
+HOST_LOCK_PATH="/run/proxyscene-host-ownership.lock"
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+
+# Repository-reviewed digests for the four supported Xray release archives.
+XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
+XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
+XRAY_SHA256_386="d1eeb0d9a9106eefd286fbb73595c2dfe1c48c56aa91ba1c9aefe04f188d0927"
+XRAY_SHA256_ARMV7="c7265ae13c63ca0241a037df4ef960ad37938c8a67d984cc08834b2cfdf5654b"
+
+# Repository-reviewed Go 1.26.5 archive digests and exact byte sizes. Go does
+# not publish per-archive .sha256 URLs; custom Go versions therefore require an
+# explicit GO_TARBALL_SHA256 instead of changing checksum provenance silently.
+GO_SHA256_386="88c162b204e6eefcc32499453b492e80209f4a4c78c33092636901c540fb0d05"
+GO_SHA256_AMD64="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+GO_SHA256_ARM64="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
+GO_SHA256_ARMV6L="6dae9edab81c13bccf962dec15f1fd2ec26c14a6821b4d2c92dab4130c289d7a"
+GO_SIZE_386=65203409
+GO_SIZE_AMD64=66879095
+GO_SIZE_ARM64=63759990
+GO_SIZE_ARMV6L=65406756
 
 GO_VERSION="${GO_VERSION:-$DEFAULT_GO_VERSION}"
 GO_TARBALL_SHA256="${GO_TARBALL_SHA256:-}"
-GO_INSTALL_DIR="${GO_INSTALL_DIR:-/usr/local}"
-GO_ROOT="$GO_INSTALL_DIR/go"
+GO_BIN=""
 CORE_DIR="${PROXYSCENE_MANAGER_DIR:-$DEFAULT_CORE_DIR}"
 INSTALL_BIN="${PROXYSCENE_SWITCH_BIN:-$DEFAULT_INSTALL_BIN}"
-XRAY_ZIP_URL="${XRAY_ZIP_URL:-$DEFAULT_XRAY_ZIP_URL}"
-XRAY_XXV_ZIP_URL="${XRAY_XXV_ZIP_URL:-$DEFAULT_XRAY_XXV_ZIP_URL}"
-XRAY_XXV_ZIP_SHA256="${XRAY_XXV_ZIP_SHA256:-$DEFAULT_XRAY_XXV_ZIP_SHA256}"
-XRAY_GITHUB_RELEASE_BASE="${XRAY_GITHUB_RELEASE_BASE:-$DEFAULT_XRAY_GITHUB_RELEASE_BASE}"
-XRAY_DOWNLOAD_SOURCE="${XRAY_DOWNLOAD_SOURCE:-$DEFAULT_XRAY_DOWNLOAD_SOURCE}"
+SYSTEMD_SERVICE="${PROXYSCENE_SYSTEMD_SERVICE_NAME:-$DEFAULT_SYSTEMD_SERVICE}"
+RESTORE_SERVICE="${PROXYSCENE_BOOT_RESTORE_SERVICE_NAME:-$DEFAULT_RESTORE_SERVICE}"
+XRAY_RELEASE_BASE="${XRAY_RELEASE_BASE:-$DEFAULT_XRAY_RELEASE_BASE}"
+XRAY_ZIP_URL="${XRAY_ZIP_URL:-}"
 XRAY_ZIP_SHA256="${XRAY_ZIP_SHA256:-}"
 SKIP_GO_INSTALL="${SKIP_GO_INSTALL:-0}"
 SKIP_XRAY_INSTALL="${SKIP_XRAY_INSTALL:-0}"
 SKIP_MANAGER_INIT="${SKIP_MANAGER_INIT:-0}"
 FORCE_GO_INSTALL="${FORCE_GO_INSTALL:-0}"
-DEFAULT_REPO="longlannet/proxyscene"
 MANAGER_REPO="${PROXYSCENE_REPO:-$DEFAULT_REPO}"
-MANAGER_VERSION="${PROXYSCENE_VERSION:-latest}"
+MANAGER_VERSION="${PROXYSCENE_VERSION:-$DEFAULT_MANAGER_VERSION}"
 MANAGER_BASE_URL="${PROXYSCENE_BASE_URL:-}"
-# 默认用内置发布公钥；显式设置 PROXYSCENE_MINISIGN_PUBKEY 时则强制要求验签成功。
-MANAGER_MINISIGN_PUBKEY="${PROXYSCENE_MINISIGN_PUBKEY:-$DEFAULT_MANAGER_MINISIGN_PUBKEY}"
-MANAGER_MINISIGN_REQUIRED=0
-[[ -n "${PROXYSCENE_MINISIGN_PUBKEY:-}" ]] && MANAGER_MINISIGN_REQUIRED=1
 BUILD_FROM_SOURCE="${PROXYSCENE_BUILD_FROM_SOURCE:-0}"
-FORCE_OFFLINE_LOCAL=0
-NODE_URL=""
+
+OFFLINE_REQUESTED=0
+SHOW_HELP=0
+RESOLVED_MANAGER_VERSION=""
+TX_DIR=""
+TX_ACTIVE=0
+CORE_DIR_CREATED=0
+GO_TOOLCHAIN_DIR=""
+INSTALL_LOCK_FD=""
+HOST_LOCK_FD=""
+STORE_LOCK_FD=""
+declare -a TX_DESTS=()
+declare -a TX_BACKUPS=()
+declare -a TX_EXISTED=()
 
 log() { printf '[%s] %s\n' "$SCRIPT_NAME" "$*"; }
 fatal() { printf '[%s] 错误：%s\n' "$SCRIPT_NAME" "$*" >&2; exit 1; }
+
 run_quiet() {
-  local desc="$1"
+  local desc="$1" err
   shift
-  # 丢弃 stdout，但在失败时回放 stderr：否则 minisign 验签失败、go 编译错误、apt 锁等
-  # root 操作失败只会显示笼统的“失败”，操作员无法区分被篡改的签名与一次网络抖动。
-  local err
   if ! err="$("$@" 2>&1 >/dev/null)"; then
     [[ -n "$err" ]] && printf '%s\n' "$err" >&2
     fatal "${desc}失败"
@@ -62,79 +89,307 @@ run_quiet() {
 usage() {
   cat <<'EOF'
 用法：
-  sudo bash ./install.sh [节点链接]
+  sudo bash ./install.sh
+  sudo bash ./install.sh --offline
 
-离线安装（适合屏蔽 GitHub 的网络环境，全程不联网、不需要 Go）：
-  从 Release 下载自包含整合包，解压后在其目录内运行本脚本即可：
-    tar xzf proxyscene_bundle_linux_<arch>.tar.gz
-    cd proxyscene_bundle_linux_<arch>
-    sudo ./install.sh [节点链接]
-  脚本检测到同目录的 proxyscene/xray 二进制即走离线本地安装（也可显式加 --offline）。
-  自包含包无法验证它自身；如需校验，请在解压前用随包的 .minisig + 公钥验证整个 tar：
-    minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>
+联机安装：
+  请从一个明确版本的 GitHub Release 下载 install.sh 和 checksums.txt，先按
+  checksums.txt 校验 install.sh、审阅脚本，再设置同一 PROXYSCENE_VERSION 执行。
+  latest 会先通过 GitHub API 解析为明确 tag，随后所有文件都从该 tag 下载。
 
-管理程序获取方式（默认优先下载预编译二进制，目标机无需 Go；失败时回退源码编译）：
-  PROXYSCENE_VERSION=latest                    要下载的预编译版本，如 v0.6.1
-  PROXYSCENE_REPO=longlannet/proxyscene     预编译二进制所在的 GitHub 仓库 owner/name
-  PROXYSCENE_BASE_URL=https://mirror/dl         自定义预编译下载基址（必须 https），优先级最高
-  PROXYSCENE_MINISIGN_PUBKEY=RWxxxx             用 minisign 校验签名（联机校验 checksums.txt，离线校验整合包）
-  PROXYSCENE_ALLOW_UNSIGNED=1                   缺 minisign 或签名文件下载失败时仅用 SHA256 安装（默认两者都 fail-closed，不推荐）
-  PROXYSCENE_BUILD_FROM_SOURCE=1                跳过预编译下载，强制本地源码编译
+离线安装：
+  先用 Release 的 checksums.txt 校验完整 bundle tar，解压后必须显式执行：
+    sudo ./install.sh --offline
+  包内 bundle-manifest.sha256 会在任何文件复制前再次校验所有组件。
 
-常用环境变量：
-  GO_VERSION=1.22.12                         缺少 Go 或版本过低时准备的 Go 版本（仅源码编译用到）
-  GO_TARBALL_SHA256=...                      Go 安装包 SHA256；留空时从 go.dev 官方 .sha256 文件获取并校验
-  GO_INSTALL_DIR=/usr/local                   Go 安装父目录
-  SKIP_GO_INSTALL=1                           不安装 Go，要求系统已有 go 命令
-  FORCE_GO_INSTALL=1                          即使已有 Go 版本可用，也重新准备指定版本
-  PROXYSCENE_MANAGER_DIR=/opt/proxyscene
-                                             管理器核心目录
+管理程序变量：
+  PROXYSCENE_VERSION=latest                    明确 tag（推荐）或 latest
+  PROXYSCENE_REPO=longlannet/proxyscene        GitHub 仓库 owner/name
+  PROXYSCENE_BASE_URL=https://mirror/tag       固定 tag 的自定义下载基址；必须同时显式指定版本
+  PROXYSCENE_BUILD_FROM_SOURCE=1                只从当前源码目录编译
+
+常用变量：
+  GO_VERSION=1.26.5                            源码编译需要的 Go 版本；改版本时必须显式提供 SHA256
+  GO_TARBALL_SHA256=...                        非默认 Go 版本必填；默认版本使用仓库内四架构固定值
+  SKIP_GO_INSTALL=1                            只使用 PATH 中已有的受支持 Go
+  FORCE_GO_INSTALL=1                           强制使用事务目录中的临时指定 Go
+  PROXYSCENE_MANAGER_DIR=/opt/proxyscene       Xray 与状态目录
   PROXYSCENE_SWITCH_BIN=/usr/local/bin/proxyscene
-                                             管理程序安装路径
-  XRAY_DOWNLOAD_SOURCE=official                Xray 下载源，可选 official 或 xxv
-  XRAY_ZIP_URL=https://example.com/xray.zip    自定义 Xray zip 下载地址（必须 https），优先级高于预设下载源
-  XRAY_ZIP_SHA256=...                          Xray zip SHA256；自定义 XRAY_ZIP_URL 必须设置（否则 fail-closed）。官方与 xxv 源已内置校验
-  ALLOW_UNVERIFIED_XRAY=1                       无法校验 Xray 完整性时仍安装（默认 fail-closed，不推荐）
-  SKIP_XRAY_INSTALL=1                         不安装 Xray，要求核心目录已有可执行 xray
-  SKIP_MANAGER_INIT=1                         只安装依赖和程序，不执行管理器初始化
+  XRAY_RELEASE_BASE=https://.../v26.3.27       固定版本 Xray 的下载基址
+  XRAY_ZIP_URL=https://mirror/xray.zip         自定义当前架构 Xray zip；必须同时提供 SHA256
+  XRAY_ZIP_SHA256=...                          自定义 Xray zip 的固定 SHA256
+  SKIP_XRAY_INSTALL=1                          保留经文件类型、属主和架构检查的现有 Xray
+  SKIP_MANAGER_INIT=1                          不执行管理器初始化
+
+  自定义或保留现有 Xray 时无法从哈希证明上游版本，xray-version.txt 会记录
+  custom-sha256:<摘要> 或 existing-sha256:<摘要>，不会误写固定官方版本。
 EOF
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --offline)
-      FORCE_OFFLINE_LOCAL=1
-      ;;
-    -*)
-      fatal "未知选项：$1"
-      ;;
-    *)
-      [[ -z "$NODE_URL" ]] || fatal "只接受一个可选节点链接参数"
-      NODE_URL="$1"
-      ;;
-  esac
-  shift
-done
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        SHOW_HELP=1
+        ;;
+      --offline)
+        OFFLINE_REQUESTED=1
+        ;;
+      -*)
+        fatal "未知选项：$1"
+        ;;
+      *)
+        fatal "不接受位置参数；安装后请用 proxyscene install 交互录入，或使用 node add/import --stdin"
+        ;;
+    esac
+    shift
+  done
+}
 
 require_root() {
-  if [[ "$(id -u)" != "0" ]]; then
-    fatal "请用 root 运行，例如：sudo bash ./install.sh"
+  [[ "$(id -u)" == "0" ]] || fatal "请用 root 运行，例如：sudo bash ./install.sh"
+}
+
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+validate_boolean_flag() {
+  local name="$1" value="$2"
+  [[ "$value" == "0" || "$value" == "1" ]] || fatal "$name 只能是 0 或 1"
+}
+
+url_has_userinfo() {
+  local authority="${1#https://}"
+  authority="${authority%%/*}"
+  [[ "$authority" == *"@"* ]]
+}
+
+script_dir() {
+  local source="${BASH_SOURCE[0]:-}"
+  [[ -n "$source" && -f "$source" ]] || return 1
+  (cd "$(dirname "$source")" && pwd -P)
+}
+
+repo_dir() { script_dir; }
+bundle_dir() { script_dir; }
+
+arch_release_for_machine() {
+  case "$1" in
+    x86_64|amd64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    i386|i686) printf '386\n' ;;
+    armv7l|armhf) printf 'armv7\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+arch_release() { arch_release_for_machine "$(uname -m)"; }
+
+arch_go() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64\n' ;;
+    aarch64|arm64) printf 'arm64\n' ;;
+    i386|i686) printf '386\n' ;;
+    armv6l|armv7l|armhf) printf 'armv6l\n' ;;
+    *) fatal "不支持的 Go 架构：$(uname -m)" ;;
+  esac
+}
+
+xray_asset_arch_for_release_arch() {
+  case "$1" in
+    amd64) printf '64\n' ;;
+    arm64) printf 'arm64-v8a\n' ;;
+    386) printf '32\n' ;;
+    armv7) printf 'arm32-v7a\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+xray_sha256_for_release_arch() {
+  case "$1" in
+    amd64) printf '%s\n' "$XRAY_SHA256_AMD64" ;;
+    arm64) printf '%s\n' "$XRAY_SHA256_ARM64" ;;
+    386) printf '%s\n' "$XRAY_SHA256_386" ;;
+    armv7) printf '%s\n' "$XRAY_SHA256_ARMV7" ;;
+    *) return 1 ;;
+  esac
+}
+
+go_tarball_sha256_for_arch() {
+  case "$1" in
+    386) printf '%s\n' "$GO_SHA256_386" ;;
+    amd64) printf '%s\n' "$GO_SHA256_AMD64" ;;
+    arm64) printf '%s\n' "$GO_SHA256_ARM64" ;;
+    armv6l) printf '%s\n' "$GO_SHA256_ARMV6L" ;;
+    *) return 1 ;;
+  esac
+}
+
+go_tarball_size_for_arch() {
+  case "$1" in
+    386) printf '%s\n' "$GO_SIZE_386" ;;
+    amd64) printf '%s\n' "$GO_SIZE_AMD64" ;;
+    arm64) printf '%s\n' "$GO_SIZE_ARM64" ;;
+    armv6l) printf '%s\n' "$GO_SIZE_ARMV6L" ;;
+    *) return 1 ;;
+  esac
+}
+
+elf_machine_for_release_arch() {
+  case "$1" in
+    amd64) printf '62\n' ;;
+    arm64) printf '183\n' ;;
+    386) printf '3\n' ;;
+    armv7) printf '40\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+is_sha256_hex() { [[ "$1" =~ ^[0-9A-Fa-f]{64}$ ]]; }
+
+normalize_sha256() {
+  is_sha256_hex "$1" || return 1
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+sha256_file() {
+  local file="$1"
+  if need_cmd sha256sum; then
+    sha256sum "$file" | awk '{print $1}'
+  elif need_cmd shasum; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  elif need_cmd openssl; then
+    openssl dgst -sha256 "$file" | awk '{print $NF}'
+  else
+    fatal "找不到 sha256sum、shasum 或 openssl，无法校验 SHA256"
   fi
 }
 
-repo_dir() {
-  local source="${BASH_SOURCE[0]}"
-  local dir
-  dir="$(cd "$(dirname "$source")" && pwd -P)"
-  printf '%s\n' "$dir"
+verify_sha256_file() {
+  local label="$1" file="$2" expected="$3" actual
+  expected="$(normalize_sha256 "$expected")" || fatal "${label} SHA256 格式无效：$expected"
+  actual="$(normalize_sha256 "$(sha256_file "$file")")" || fatal "无法读取 ${label} SHA256"
+  [[ "$actual" == "$expected" ]] || fatal "${label} SHA256 不匹配：期望 $expected，实际 $actual"
 }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1
+manifest_sha_for_asset() {
+  local manifest="$1" asset="$2" result
+  result="$(awk -v a="$asset" '
+    {
+      name=$2
+      sub(/^\*/, "", name)
+      if (name == a) { count++; value=$1 }
+    }
+    END {
+      if (count != 1) exit 1
+      print value
+    }
+  ' "$manifest")" || return 1
+  is_sha256_hex "$result" || return 1
+  printf '%s\n' "$result"
+}
+
+version_ge() {
+  local have="$1" want="$2" smallest
+  smallest="$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n1)"
+  [[ "$smallest" == "$want" ]]
+}
+
+is_stable_go_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+parse_go_version_output() {
+  local output="$1"
+  if [[ "$output" =~ ^go[[:space:]]+version[[:space:]]+go([0-9]+\.[0-9]+\.[0-9]+)([[:space:]]|$) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+go_version_meets_requirement() {
+  local have="$1" want="$2"
+  is_stable_go_version "$have" && is_stable_go_version "$want" && version_ge "$have" "$want"
+}
+
+go_version_matches_exactly() {
+  local have="$1" want="$2"
+  is_stable_go_version "$have" && is_stable_go_version "$want" && [[ "$have" == "$want" ]]
+}
+
+validate_release_tag() { [[ "$1" =~ ^v[0-9][0-9A-Za-z._-]*$ ]]; }
+
+parse_release_tag_json() {
+  jq -er 'select(type == "object") | .tag_name | select(type == "string" and length > 0)'
+}
+
+release_json_is_immutable() {
+  jq -e 'type == "object" and .immutable == true' >/dev/null
+}
+
+verified_release_tag_json() {
+  local expected="$1" json tag
+  json="$(cat)" || return 1
+  tag="$(printf '%s\n' "$json" | parse_release_tag_json)" || return 1
+  validate_release_tag "$tag" || return 1
+  [[ "$expected" == "latest" || "$tag" == "$expected" ]] || return 1
+  printf '%s\n' "$json" | release_json_is_immutable || return 1
+  printf '%s\n' "$tag"
+}
+
+path_is_normalized_absolute() {
+  local path="$1"
+  [[ -n "$path" && "$path" == /* && "$path" != "/" && "$path" != */ ]] || return 1
+  [[ "$path" != *[$' \t\r\n']* && "$path" != *//* ]] || return 1
+  [[ "$path" != *'/../'* && "$path" != */.. && "$path" != *'/./'* && "$path" != */. ]] || return 1
+}
+
+install_mode_for_flag() {
+  [[ "$1" == "1" ]] && printf 'offline\n' || printf 'online\n'
+}
+
+validate_common_inputs() {
+  validate_boolean_flag SKIP_GO_INSTALL "$SKIP_GO_INSTALL"
+  validate_boolean_flag SKIP_XRAY_INSTALL "$SKIP_XRAY_INSTALL"
+  validate_boolean_flag SKIP_MANAGER_INIT "$SKIP_MANAGER_INIT"
+  validate_boolean_flag FORCE_GO_INSTALL "$FORCE_GO_INSTALL"
+  validate_boolean_flag PROXYSCENE_BUILD_FROM_SOURCE "$BUILD_FROM_SOURCE"
+  is_stable_go_version "$GO_VERSION" || fatal "GO_VERSION 必须是完整稳定版本号：$GO_VERSION"
+  version_ge "$GO_VERSION" "$DEFAULT_GO_VERSION" || fatal "GO_VERSION 不能低于 $DEFAULT_GO_VERSION"
+  [[ -z "$GO_TARBALL_SHA256" ]] || normalize_sha256 "$GO_TARBALL_SHA256" >/dev/null \
+    || fatal "GO_TARBALL_SHA256 格式无效"
+  if [[ "$GO_VERSION" != "$DEFAULT_GO_VERSION" && -z "$GO_TARBALL_SHA256" ]]; then
+    fatal "非默认 GO_VERSION=$GO_VERSION 必须显式设置 GO_TARBALL_SHA256"
+  fi
+  validate_installer_service_name "$SYSTEMD_SERVICE" "PROXYSCENE_SYSTEMD_SERVICE_NAME"
+  validate_installer_service_name "$RESTORE_SERVICE" "PROXYSCENE_BOOT_RESTORE_SERVICE_NAME"
+  [[ "$SYSTEMD_SERVICE" != "$RESTORE_SERVICE" ]] \
+    || fatal "Xray 主服务和开机恢复服务不能使用同一个 systemd unit：$SYSTEMD_SERVICE"
+}
+
+validate_installer_service_name() {
+  local name="$1" field="$2" stem
+  [[ "$name" =~ ^[A-Za-z0-9_.@:-]+\.service$ && "$name" != *".."* ]] \
+    || fatal "$field 必须是安全的 .service 名称：$name"
+  stem="${name%.service}"
+  [[ "$stem" == "proxyscene" || "$stem" == proxyscene-* || "$stem" == proxyscene@* ]] \
+    || fatal "$field 必须位于 proxyscene 命名空间：$name"
+}
+
+validate_online_inputs() {
+  local release_arch
+  release_arch="$(arch_release)" || fatal "当前架构没有受支持的安装产物：$(uname -m)"
+  if [[ "$BUILD_FROM_SOURCE" != "1" ]]; then
+    validate_release_inputs
+  fi
+  if [[ -n "$XRAY_ZIP_URL" ]]; then
+    [[ "$XRAY_ZIP_URL" == https://* ]] || fatal "XRAY_ZIP_URL 必须是 https 地址"
+    url_has_userinfo "$XRAY_ZIP_URL" && fatal "XRAY_ZIP_URL 不能包含 URL userinfo 凭据"
+    [[ -n "$XRAY_ZIP_SHA256" ]] || fatal "自定义 XRAY_ZIP_URL 必须同时设置 XRAY_ZIP_SHA256"
+    normalize_sha256 "$XRAY_ZIP_SHA256" >/dev/null || fatal "XRAY_ZIP_SHA256 格式无效"
+  else
+    [[ "$XRAY_RELEASE_BASE" == https://* ]] || fatal "XRAY_RELEASE_BASE 必须是 https 地址"
+    url_has_userinfo "$XRAY_RELEASE_BASE" && fatal "XRAY_RELEASE_BASE 不能包含 URL userinfo 凭据"
+    xray_sha256_for_release_arch "$release_arch" >/dev/null || fatal "缺少 Xray 固定 SHA256：$release_arch"
+  fi
 }
 
 has_package() {
@@ -145,18 +400,15 @@ has_package() {
     rpm -q "$pkg" >/dev/null 2>&1
   elif need_cmd apk; then
     apk info -e "$pkg" >/dev/null 2>&1
-  elif need_cmd pacman; then
-    pacman -Q "$pkg" >/dev/null 2>&1
   else
     return 1
   fi
 }
 
 install_packages() {
-  local packages=("curl" "ca-certificates" "tar" "unzip")
-  local commands=("curl" "" "tar" "unzip")
-  local missing=()
-  local i pkg cmd
+  local packages=(curl ca-certificates tar unzip coreutils jq)
+  local commands=(curl "" tar unzip od jq)
+  local missing=() i pkg cmd
   for i in "${!packages[@]}"; do
     pkg="${packages[$i]}"
     cmd="${commands[$i]}"
@@ -166,9 +418,7 @@ install_packages() {
       missing+=("$pkg")
     fi
   done
-  if [[ ${#missing[@]} -eq 0 ]]; then
-    return 0
-  fi
+  [[ ${#missing[@]} -gt 0 ]] || return 0
 
   log "安装基础依赖：${missing[*]}"
   if need_cmd apt-get; then
@@ -187,503 +437,705 @@ install_packages() {
   fi
 }
 
-# ensure_minisign_best_effort 在默认（下载预编译）路径下尽力安装 minisign，使发布签名
-# 默认即可校验。失败不致命：装不上时由 install_manager_prebuilt 决定 fail-closed 或要求
-# 显式 PROXYSCENE_ALLOW_UNSIGNED=1，避免在缺少 minisign 包的发行版上直接卡死安装。
-ensure_minisign_best_effort() {
-  [[ "$BUILD_FROM_SOURCE" == "1" ]] && return 0
-  [[ -n "$MANAGER_MINISIGN_PUBKEY" ]] || return 0
-  need_cmd minisign && return 0
-  log "尝试安装 minisign 以校验发布签名（失败不影响后续，可设 PROXYSCENE_ALLOW_UNSIGNED=1 仅用 SHA256）"
-  if need_cmd apt-get; then
-    env DEBIAN_FRONTEND=noninteractive apt-get install -y minisign >/dev/null 2>&1 || true
-  elif need_cmd dnf; then
-    dnf install -y minisign >/dev/null 2>&1 || true
-  elif need_cmd yum; then
-    yum install -y minisign >/dev/null 2>&1 || true
-  elif need_cmd apk; then
-    apk add --no-cache minisign >/dev/null 2>&1 || true
-  elif need_cmd zypper; then
-    zypper --non-interactive install minisign >/dev/null 2>&1 || true
-  elif need_cmd pacman; then
-    pacman -Sy --noconfirm minisign >/dev/null 2>&1 || true
-  fi
-}
-
-arch_go() {
-  case "$(uname -m)" in
-    x86_64|amd64) printf 'amd64\n' ;;
-    aarch64|arm64) printf 'arm64\n' ;;
-    i386|i686) printf '386\n' ;;
-    armv6l) printf 'armv6l\n' ;;
-    armv7l|armhf) printf 'armv6l\n' ;;
-    *) fatal "不支持的 Go 架构：$(uname -m)" ;;
-  esac
-}
-
-arch_xray() {
-  case "$(uname -m)" in
-    x86_64|amd64) printf '64\n' ;;
-    aarch64|arm64) printf 'arm64-v8a\n' ;;
-    i386|i686) printf '32\n' ;;
-    armv7l|armhf) printf 'arm32-v7a\n' ;;
-    armv6l) printf 'arm32-v6\n' ;;
-    *) fatal "不支持的 Xray 架构：$(uname -m)" ;;
-  esac
-}
-
-version_ge() {
-  local have="$1"
-  local want="$2"
-  local smallest
-  smallest="$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n1)"
-  [[ "$smallest" == "$want" ]]
-}
-
-current_go_version() {
-  if ! need_cmd go; then
-    return 1
-  fi
-  go version | awk '{print $3}' | sed 's/^go//'
-}
-
-sha256_file() {
-  local file="$1"
-  if need_cmd sha256sum; then
-    sha256sum "$file" | awk '{print $1}'
-  elif need_cmd shasum; then
-    shasum -a 256 "$file" | awk '{print $1}'
-  elif need_cmd openssl; then
-    openssl dgst -sha256 "$file" | awk '{print $NF}'
-  else
-    fatal "找不到 sha256sum、shasum 或 openssl，无法校验 SHA256"
-  fi
-}
-
-is_sha256_hex() {
-  [[ "$1" =~ ^[0-9A-Fa-f]{64}$ ]]
-}
-
-verify_sha256_file() {
-  local label="$1"
-  local file="$2"
-  local expected="$3"
-  local actual
-  is_sha256_hex "$expected" || fatal "${label} SHA256 格式无效：$expected"
-  actual="$(sha256_file "$file")"
-  [[ "$actual" == "$expected" ]] || fatal "${label} SHA256 不匹配：期望 $expected，实际 $actual"
-}
-
-ensure_go() {
-  if [[ "$SKIP_GO_INSTALL" == "1" ]]; then
-    need_cmd go || fatal "SKIP_GO_INSTALL=1 但找不到 go 命令"
-    log "使用已有 Go：版本 $(current_go_version)"
-    return 0
-  fi
-
-  local have=""
-  if have="$(current_go_version 2>/dev/null)" && [[ -n "$have" && "$FORCE_GO_INSTALL" != "1" ]]; then
-    if version_ge "$have" "1.22"; then
-      log "使用已有 Go：版本 $have"
-      return 0
-    fi
-    log "已有 Go 版本过低：$have，将安装 Go $GO_VERSION"
-  fi
-
-  local arch url tmp archive checksum checksum_url checksum_text
-  arch="$(arch_go)"
-  url="https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz"
-  tmp="$(mktemp -d)"
-  archive="$tmp/go.tar.gz"
-  trap 'rm -rf "$tmp"' EXIT
-
-  log "下载 Go：$url"
-  # 与 fetch_https 一致：限制 https-only（含重定向），防止任何一跳被降级为明文。
-  run_quiet "下载 Go" curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 3 --retry-delay 2 -o "$archive" "$url"
-  if [[ -n "$GO_TARBALL_SHA256" ]]; then
-    checksum="$GO_TARBALL_SHA256"
-  else
-    checksum_url="${url}.sha256"
-    log "下载 Go SHA256：$checksum_url"
-    if ! checksum_text="$(curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 3 --retry-delay 2 "$checksum_url" 2>/dev/null)"; then
-      fatal "下载 Go SHA256 失败"
-    fi
-    checksum="$(printf '%s\n' "$checksum_text" | awk 'NF {print $1; exit}')"
-  fi
-  verify_sha256_file "Go" "$archive" "$checksum"
-  rm -rf "$GO_ROOT"
-  run_quiet "解压 Go" tar -C "$GO_INSTALL_DIR" -xzf "$archive"
-  mkdir -p /usr/local/bin
-  ln -sf "$GO_ROOT/bin/go" /usr/local/bin/go
-  ln -sf "$GO_ROOT/bin/gofmt" /usr/local/bin/gofmt
-  log "Go 安装完成：版本 $(/usr/local/bin/go version | awk '{print $3}' | sed 's/^go//')"
-  rm -rf "$tmp"
-  trap - EXIT
-}
-
-xray_download_url() {
-  if [[ -n "$XRAY_ZIP_URL" ]]; then
-    printf '%s\n' "$XRAY_ZIP_URL"
-    return 0
-  fi
-  case "${XRAY_DOWNLOAD_SOURCE,,}" in
-    official|github|xtls)
-      printf '%s/Xray-linux-%s.zip\n' "$XRAY_GITHUB_RELEASE_BASE" "$(arch_xray)"
-      ;;
-    xxv|xxv.cc|mirror)
-      printf '%s\n' "$XRAY_XXV_ZIP_URL"
-      ;;
-    *)
-      fatal "未知 Xray 下载源：$XRAY_DOWNLOAD_SOURCE，可选 official 或 xxv"
-      ;;
-  esac
-}
-
-# xray_expected_sha256 解析期望的 Xray zip SHA256：
-#   1) 显式设置的 XRAY_ZIP_SHA256 优先；
-#   2) 官方源（未自定义 XRAY_ZIP_URL）：拉取官方 .dgst 校验文件并提取 SHA256；
-#   3) xxv 镜像源：用内置的固定 XRAY_XXV_ZIP_SHA256（镜像即官方 amd64 zip，屏蔽 GitHub 时也能校验）；
-#   4) 其余情况返回空（由调用方 fail-closed 或 opt-out）。
-xray_expected_sha256() {
-  local url="$1"
-  if [[ -n "$XRAY_ZIP_SHA256" ]]; then
-    printf '%s\n' "$XRAY_ZIP_SHA256"
-    return 0
-  fi
-  if [[ -n "$XRAY_ZIP_URL" ]]; then
-    return 0
-  fi
-  case "${XRAY_DOWNLOAD_SOURCE,,}" in
-    official|github|xtls)
-      local dgst_text checksum
-      if dgst_text="$(curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 3 --retry-delay 2 "${url}.dgst" 2>/dev/null)"; then
-        # XTLS 官方 .dgst 把 SHA-256 标注为 `SHA2-256= <hex>`（不是 `SHA256=`）。
-        # 用 sha2-?256 精确匹配 SHA2-256 行（不会误中 SHA2-512 / SHA3-256），再取 64 位十六进制。
-        checksum="$(printf '%s\n' "$dgst_text" | grep -iE 'sha2-?256' | grep -oiE '[0-9a-f]{64}' | head -n1)"
-        if is_sha256_hex "$checksum"; then
-          printf '%s\n' "$checksum"
-        fi
-      fi
-      ;;
-    xxv|xxv.cc|mirror)
-      if is_sha256_hex "$XRAY_XXV_ZIP_SHA256"; then
-        printf '%s\n' "$XRAY_XXV_ZIP_SHA256"
-      fi
-      ;;
-  esac
-  return 0
-}
-
-validate_core_dir() {
-  if [[ -z "$CORE_DIR" || "$CORE_DIR" != /* ]]; then
-    fatal "PROXYSCENE_MANAGER_DIR 必须是绝对路径：$CORE_DIR"
-  fi
-  if [[ "$CORE_DIR" == *[$' \t\r\n']* || "$CORE_DIR" == *//* ]]; then
-    fatal "PROXYSCENE_MANAGER_DIR 不能包含空白字符或重复斜杠：$CORE_DIR"
-  fi
-  if [[ "$CORE_DIR" == *'/../'* || "$CORE_DIR" == */.. || "$CORE_DIR" == *'/./'* || "$CORE_DIR" == */. ]]; then
-    fatal "PROXYSCENE_MANAGER_DIR 必须使用规范化路径：$CORE_DIR"
-  fi
-  case "$CORE_DIR" in
-    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/opt|/var/tmp)
-      fatal "PROXYSCENE_MANAGER_DIR 不能使用系统目录本身：$CORE_DIR"
-      ;;
-  esac
-  case "$CORE_DIR/" in
-    /etc/*|/usr/*|/bin/*|/sbin/*|/lib/*|/lib64/*|/proc/*|/sys/*|/dev/*|/run/*|/home/*|/root/*|/tmp/*|/var/tmp/*)
-      fatal "PROXYSCENE_MANAGER_DIR 不能位于敏感系统目录下：$CORE_DIR"
-      ;;
-  esac
-  case "$CORE_DIR/" in
-    /opt/*|/var/lib/*|/var/opt/*) ;;
-    *) fatal "PROXYSCENE_MANAGER_DIR 必须位于 /opt、/var/lib 或 /var/opt 下的专用目录：$CORE_DIR" ;;
-  esac
-  if [[ -L "$CORE_DIR" ]]; then
-    fatal "PROXYSCENE_MANAGER_DIR 不能是符号链接：$CORE_DIR"
-  fi
-  if [[ -e "$CORE_DIR" && ! -d "$CORE_DIR" ]]; then
-    fatal "PROXYSCENE_MANAGER_DIR 已存在但不是目录：$CORE_DIR"
-  fi
-}
-
-ensure_core_dir() {
-  validate_core_dir
-  local created=0
-  if [[ ! -e "$CORE_DIR" ]]; then
-    mkdir -p "$CORE_DIR"
-    created=1
-  fi
-  if [[ -L "$CORE_DIR" || ! -d "$CORE_DIR" ]]; then
-    fatal "PROXYSCENE_MANAGER_DIR 不可用：$CORE_DIR"
-  fi
-  if [[ "$created" == "1" ]]; then
-    chmod 700 "$CORE_DIR"
-  else
-    # 已存在目录：必须属 root，并收紧组/其他用户的写位——宽权限目录里其他用户可
-    # 预先植入符号链接，把下面的 root 写入重定向到任意路径。
-    local owner
-    owner="$(stat -c '%u' "$CORE_DIR" 2>/dev/null || echo '')"
-    [[ "$owner" == "0" ]] || fatal "PROXYSCENE_MANAGER_DIR 必须属于 root（当前属主 uid=${owner:-未知}）：$CORE_DIR"
-    chmod g-w,o-w "$CORE_DIR"
-  fi
-  local marker="$CORE_DIR/.managed-by-proxyscene"
-  # 与 Go 侧（writeFileAtomic + O_NOFOLLOW）一致：拒绝符号链接标记文件，
-  # 避免 root 的 `>` 写入被重定向到链接目标。
-  if [[ -L "$marker" ]]; then
-    fatal "标记文件不能是符号链接：$marker"
-  fi
-  printf '由 proxyscene 安装器管理\n' > "$marker"
-  chmod 600 "$marker"
-}
-
-install_xray() {
-  ensure_core_dir
-
-  if [[ "$SKIP_XRAY_INSTALL" == "1" ]]; then
-    [[ -x "$CORE_DIR/xray" ]] || fatal "SKIP_XRAY_INSTALL=1 但 $CORE_DIR/xray 不存在或不可执行"
-    log "跳过 Xray 安装，使用已有文件：$CORE_DIR/xray"
-    return 0
-  fi
-
-  if [[ -x "$CORE_DIR/xray" ]]; then
-    log "Xray 已存在：$CORE_DIR/xray"
-    return 0
-  fi
-
-  # 自定义下载地址必须是 https：Xray 以特权代理核心身份由 systemd 运行，
-  # 即便有 SHA256 兜底，也不接受明文通道分发。
-  if [[ -n "$XRAY_ZIP_URL" ]]; then
-    case "$XRAY_ZIP_URL" in
-      https://*) ;;
-      *) fatal "XRAY_ZIP_URL 必须是 https 地址：$XRAY_ZIP_URL" ;;
-    esac
-  fi
-
-  local tmp zip url checksum
-  tmp="$(mktemp -d)"
-  zip="$tmp/xray.zip"
-  url="$(xray_download_url)"
-  trap 'rm -rf "$tmp"' EXIT
-
-  log "下载 Xray：$url"
-  run_quiet "下载 Xray" curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 3 --retry-delay 2 -o "$zip" "$url"
-
-  local expected
-  expected="$(xray_expected_sha256 "$url")"
-  if [[ -n "$expected" ]]; then
-    verify_sha256_file "Xray" "$zip" "$expected"
-    log "Xray SHA256 校验通过"
-  elif [[ "${ALLOW_UNVERIFIED_XRAY:-0}" == "1" ]]; then
-    log "警告：已通过 ALLOW_UNVERIFIED_XRAY=1 跳过 Xray 完整性校验，安装未经验证的二进制（自担风险）"
-  else
-    # Xray 以特权代理核心身份由 systemd 运行；无法校验完整性时 fail-closed，
-    # 避免被篡改/MITM 的下载源（如自定义 URL 或镜像源）直接获得 root 代码执行。
-    fatal "无法校验 Xray 完整性（未提供 XRAY_ZIP_SHA256 且该下载源无官方校验和）。请设置 XRAY_ZIP_SHA256，或改用官方源 XRAY_DOWNLOAD_SOURCE=official，或显式 ALLOW_UNVERIFIED_XRAY=1 自担风险安装。"
-  fi
-
-  run_quiet "解压 Xray" unzip -oq "$zip" -d "$tmp/xray"
-  if [[ -f "$tmp/xray/xray" ]]; then
-    install -m 700 "$tmp/xray/xray" "$CORE_DIR/xray"
-  fi
-  local name
-  for name in geoip.dat geosite.dat; do
-    if [[ -f "$tmp/xray/$name" ]]; then
-      install -m 600 "$tmp/xray/$name" "$CORE_DIR/$name"
-    fi
-  done
-  [[ -x "$CORE_DIR/xray" ]] || fatal "Xray 解压后未找到可执行文件"
-  log "Xray 安装完成：$CORE_DIR/xray"
-  rm -rf "$tmp"
-  trap - EXIT
-}
-
-arch_release() {
-  case "$(uname -m)" in
-    x86_64|amd64) printf 'amd64\n' ;;
-    aarch64|arm64) printf 'arm64\n' ;;
-    i386|i686) printf '386\n' ;;
-    armv7l|armhf) printf 'armv7\n' ;;
-    *) return 1 ;;
-  esac
-}
-
-validate_release_inputs() {
-  case "$MANAGER_REPO" in
-    ""|/*|*/*/*|*" "*|*..*) fatal "PROXYSCENE_REPO 格式无效，应为 owner/name：$MANAGER_REPO" ;;
-  esac
-  case "$MANAGER_VERSION" in
-    ""|*/*|*" "*|*"?"*|*"#"*) fatal "PROXYSCENE_VERSION 无效：$MANAGER_VERSION" ;;
-  esac
-  if [[ -n "$MANAGER_BASE_URL" ]]; then
-    case "$MANAGER_BASE_URL" in
-      https://*) ;;
-      *) fatal "PROXYSCENE_BASE_URL 必须是 https 地址：$MANAGER_BASE_URL" ;;
-    esac
-    case "$MANAGER_BASE_URL" in
-      *"?"*|*"#"*) fatal "PROXYSCENE_BASE_URL 不能包含 ? 或 #" ;;
-    esac
-  fi
-}
-
-release_base_url() {
-  if [[ -n "$MANAGER_BASE_URL" ]]; then
-    printf '%s\n' "${MANAGER_BASE_URL%/}"
-  elif [[ "$MANAGER_VERSION" == "latest" ]]; then
-    printf 'https://github.com/%s/releases/latest/download\n' "$MANAGER_REPO"
-  else
-    printf 'https://github.com/%s/releases/download/%s\n' "$MANAGER_REPO" "$MANAGER_VERSION"
-  fi
-}
-
-# fetch_https 仅允许 https（含重定向），并限制下载体积。
 fetch_https() {
   local url="$1" out="$2" maxsize="$3" size
-  curl -fL --proto '=https' --proto-redir '=https' \
-    --connect-timeout 15 --retry 3 --retry-delay 2 \
+  curl -q -fL --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --max-time "$DEFAULT_DOWNLOAD_TIMEOUT" \
+    --retry 3 --retry-delay 2 \
     --max-filesize "$maxsize" -o "$out" "$url" || return 1
-  # --max-filesize 对无 Content-Length 的流式响应不生效（curl 限制），下载后再复核一次。
   size="$(stat -c '%s' "$out" 2>/dev/null || wc -c < "$out")"
   if [[ "$size" -gt "$maxsize" ]]; then
-    log "下载内容超过大小上限（${size} > ${maxsize} 字节）：$url"
+    log "下载内容超过大小上限（${size} > ${maxsize} 字节）"
     rm -f "$out"
     return 1
   fi
 }
 
-# install_manager_prebuilt 下载并安装预编译二进制；成功返回 0，否则返回 1 由调用方回退源码编译。
-install_manager_prebuilt() {
-  local arch base asset tmp expected
-  arch="$(arch_release)" || { log "当前架构 $(uname -m) 无预编译二进制"; return 1; }
-  validate_release_inputs
-  base="$(release_base_url)"
-  asset="proxyscene_linux_${arch}.tar.gz"
-  tmp="$(mktemp -d)"
-  # 覆盖所有 fatal/exit 退出路径的临时目录清理（成功路径在 return 前清除该 trap）。
-  trap 'rm -rf "$tmp"' EXIT
-
-  log "下载预编译管理程序：$base/$asset"
-  if ! fetch_https "$base/$asset" "$tmp/$asset" 104857600; then
-    log "预编译二进制下载失败"
-    rm -rf "$tmp"
-    return 1
-  fi
-  if ! fetch_https "$base/checksums.txt" "$tmp/checksums.txt" 1048576; then
-    log "校验和文件下载失败"
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  if [[ -n "$MANAGER_MINISIGN_PUBKEY" ]] && need_cmd minisign; then
-    if fetch_https "$base/checksums.txt.minisig" "$tmp/checksums.txt.minisig" 1048576; then
-      run_quiet "校验 checksums 签名" minisign -Vm "$tmp/checksums.txt" -x "$tmp/checksums.txt.minisig" -P "$MANAGER_MINISIGN_PUBKEY"
-      log "minisign 签名校验通过"
-    elif [[ "$MANAGER_MINISIGN_REQUIRED" == "1" ]]; then
-      fatal "签名文件下载失败，无法按要求校验签名"
-    elif [[ "${PROXYSCENE_ALLOW_UNSIGNED:-0}" == "1" ]]; then
-      log "警告：签名文件下载失败，已按 PROXYSCENE_ALLOW_UNSIGNED=1 降级为仅校验 SHA256（不可信镜像可同源篡改 SHA256 与二进制，自担风险）"
+validate_trusted_directory_chain() {
+  local path="$1" current="" component owner mode mode_value
+  local -a components
+  path_is_normalized_absolute "$path" || fatal "路径必须是规范化绝对路径：$path"
+  IFS='/' read -r -a components <<< "${path#/}"
+  for component in "${components[@]}"; do
+    current="${current}/${component}"
+    [[ ! -L "$current" ]] || fatal "路径祖先不能是符号链接：$current"
+    if [[ -e "$current" ]]; then
+      [[ -d "$current" ]] || fatal "路径祖先不是目录：$current"
+      owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
+      mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+      [[ "$owner" == "0" && "$mode" =~ ^[0-7]+$ ]] || fatal "路径祖先必须属于 root：$current"
+      mode_value=$((8#$mode))
+      (( (mode_value & 0022) == 0 )) || fatal "路径祖先不能由组或其他用户写入：$current"
     else
-      # 签名文件缺失与缺 minisign 一样 fail-closed：否则恶意镜像只要不提供 .minisig，
-      # 就能让内置公钥形同虚设（checksums.txt 与二进制同源，可一起伪造）。
-      fatal "签名文件 checksums.txt.minisig 下载失败。正规发布应附带签名；如确要仅用 SHA256 安装，请显式设置 PROXYSCENE_ALLOW_UNSIGNED=1（不推荐）。"
+      return 0
     fi
-  elif [[ "$MANAGER_MINISIGN_REQUIRED" == "1" ]]; then
-    fatal "设置了 PROXYSCENE_MINISIGN_PUBKEY 但未找到 minisign"
-  elif [[ "${PROXYSCENE_ALLOW_UNSIGNED:-0}" == "1" ]]; then
-    log "警告：PROXYSCENE_ALLOW_UNSIGNED=1，未做签名校验，仅校验 SHA256（镜像等不可信源可同源篡改 SHA256 与二进制，自担风险）。"
+  done
+}
+
+validate_root_regular_file() {
+  local path="$1" label="$2" owner mode mode_value
+  [[ -e "$path" || -L "$path" ]] || fatal "$label 不存在：$path"
+  [[ ! -L "$path" && -f "$path" ]] || fatal "$label 必须是非符号链接常规文件：$path"
+  owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+  [[ "$owner" == "0" && "$mode" =~ ^[0-7]+$ ]] || fatal "$label 必须属于 root：$path"
+  mode_value=$((8#$mode))
+  (( (mode_value & 0022) == 0 )) || fatal "$label 不能由组或其他用户写入：$path"
+  (( (mode_value & 07000) == 0 )) || fatal "$label 不能带 setuid、setgid 或 sticky 位：$path"
+}
+
+validate_source_regular_file() {
+  local path="$1" label="$2"
+  [[ -f "$path" && ! -L "$path" ]] || fatal "$label 必须是非符号链接常规文件：$path"
+}
+
+validate_elf_arch() {
+  local path="$1" expected_arch="$2" label="$3" magic machine expected_machine
+  magic="$(od -An -N4 -t x1 "$path" | tr -d ' \n')"
+  [[ "$magic" == "7f454c46" ]] || fatal "$label 不是 ELF 文件：$path"
+  machine="$(od -An -j18 -N2 -t u1 "$path" | awk 'NF >= 2 { print $1 + (256 * $2); exit }')"
+  expected_machine="$(elf_machine_for_release_arch "$expected_arch")" || fatal "不支持的 ELF 架构：$expected_arch"
+  [[ "$machine" == "$expected_machine" ]] || fatal "$label 架构不匹配：需要 $expected_arch（ELF machine $expected_machine），实际 $machine"
+}
+
+validate_core_dir() {
+  path_is_normalized_absolute "$CORE_DIR" || fatal "PROXYSCENE_MANAGER_DIR 必须是无尾斜杠的规范化绝对路径：$CORE_DIR"
+  case "$CORE_DIR" in
+    /opt/*|/var/lib/*|/var/opt/*) ;;
+    *) fatal "PROXYSCENE_MANAGER_DIR 必须位于 /opt、/var/lib 或 /var/opt 下：$CORE_DIR" ;;
+  esac
+  local parent
+  parent="$(dirname "$CORE_DIR")"
+  [[ -d "$parent" ]] || fatal "PROXYSCENE_MANAGER_DIR 的父目录必须预先存在：$parent"
+  validate_trusted_directory_chain "$parent"
+  [[ ! -L "$CORE_DIR" ]] || fatal "PROXYSCENE_MANAGER_DIR 不能是符号链接：$CORE_DIR"
+  [[ ! -e "$CORE_DIR" || -d "$CORE_DIR" ]] || fatal "PROXYSCENE_MANAGER_DIR 已存在但不是目录：$CORE_DIR"
+  [[ ! -e "$CORE_DIR" ]] || validate_trusted_directory_chain "$CORE_DIR"
+}
+
+validate_install_bin() {
+  path_is_normalized_absolute "$INSTALL_BIN" || fatal "PROXYSCENE_SWITCH_BIN 必须是无尾斜杠的规范化绝对路径：$INSTALL_BIN"
+  [[ "$(basename "$INSTALL_BIN")" == "proxyscene" ]] \
+    || fatal "PROXYSCENE_SWITCH_BIN 的文件名必须是 proxyscene：$INSTALL_BIN"
+  local parent
+  parent="$(dirname "$INSTALL_BIN")"
+  [[ -d "$parent" ]] || fatal "PROXYSCENE_SWITCH_BIN 的父目录必须预先存在：$parent"
+  validate_trusted_directory_chain "$parent"
+  if [[ -e "$INSTALL_BIN" || -L "$INSTALL_BIN" ]]; then
+    validate_root_regular_file "$INSTALL_BIN" "现有管理程序"
+    if ! install_bin_is_owned "$CORE_DIR" "$INSTALL_BIN"; then
+      fatal "PROXYSCENE_SWITCH_BIN 已存在但没有匹配的 proxyscene ownership：$INSTALL_BIN"
+    fi
+  fi
+}
+
+install_bin_is_owned() {
+  local core_dir="$1" install_bin="$2"
+  local ownership="$core_dir/installation-ownership.json" marker="$core_dir/.managed-by-proxyscene" marker_text
+  if [[ -f "$ownership" && ! -L "$ownership" ]]; then
+    validate_root_regular_file "$ownership" "安装 ownership 记录"
+    [[ "$(stat -c '%a' "$ownership" 2>/dev/null || true)" == "600" ]] || return 1
+    ownership_record_matches "$ownership" "$core_dir" "$install_bin" "$SYSTEMD_SERVICE" "$RESTORE_SERVICE"
+    return
+  fi
+  # Historical markers identify only the CoreDir. Require the exact legacy unit
+  # pair to bind that directory to the historical default binary; a copied or
+  # stale marker alone must not replace another installation's shared binary.
+  [[ "$install_bin" == "$DEFAULT_INSTALL_BIN" ]] || return 1
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  validate_root_regular_file "$marker" "管理目录 marker"
+  marker_text="$(tr -d '\r\n' < "$marker")"
+  [[ "$marker_text" == "由 proxyscene 安装器管理" || "$marker_text" == "由 proxyscene 管理" ]] \
+    || return 1
+  legacy_unit_pair_matches "$core_dir" "$install_bin"
+}
+
+systemd_quote_for_installer() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//%/%%}"
+  printf '"%s"\n' "$value"
+}
+
+legacy_unit_pair_matches() {
+  local core_dir="$1" install_bin="$2"
+  local main_unit="$SYSTEMD_UNIT_DIR/$SYSTEMD_SERVICE"
+  local restore_unit="$SYSTEMD_UNIT_DIR/$RESTORE_SERVICE"
+  local main_exec restore_exec
+  [[ -f "$main_unit" && ! -L "$main_unit" && -f "$restore_unit" && ! -L "$restore_unit" ]] || return 1
+  validate_root_regular_file "$main_unit" "旧版 Xray systemd unit"
+  validate_root_regular_file "$restore_unit" "旧版恢复 systemd unit"
+  main_exec="ExecStart=$(systemd_quote_for_installer "$core_dir/xray") run -config $(systemd_quote_for_installer "$core_dir/config.json")"
+  restore_exec="ExecStart=$(systemd_quote_for_installer "$install_bin") boot-restore"
+  grep -Fxq -- "$main_exec" "$main_unit" && grep -Fxq -- "$restore_exec" "$restore_unit"
+}
+
+ownership_record_matches() {
+  local path="$1" core_dir="$2" install_bin="$3" systemd_service="$4" restore_service="$5"
+  local size
+  size="$(stat -c '%s' "$path" 2>/dev/null || true)"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -le 65536 ]] || return 1
+  jq -e -s \
+    --arg core "$core_dir" \
+    --arg bin "$install_bin" \
+    --arg systemd "$systemd_service" \
+    --arg restore "$restore_service" '
+      length == 1 and
+      (.[0] |
+        type == "object" and
+        keys == ["core_dir", "install_bin", "restore_service", "systemd_service", "version"] and
+        .version == 1 and
+        .core_dir == $core and
+        .install_bin == $bin and
+        .systemd_service == $systemd and
+        .restore_service == $restore)
+    ' "$path" >/dev/null 2>&1
+}
+
+render_installation_ownership() {
+  jq -n \
+    --arg core "$CORE_DIR" \
+    --arg bin "$INSTALL_BIN" \
+    --arg systemd "$SYSTEMD_SERVICE" \
+    --arg restore "$RESTORE_SERVICE" '{
+      version: 1,
+      core_dir: $core,
+      install_bin: $bin,
+      systemd_service: $systemd,
+      restore_service: $restore
+    }'
+}
+
+stage_installation_ownership() {
+  local source="$TX_DIR/installation-ownership.json"
+  render_installation_ownership > "$source" || fatal "无法生成安装 ownership 记录"
+  ownership_record_matches "$source" "$CORE_DIR" "$INSTALL_BIN" "$SYSTEMD_SERVICE" "$RESTORE_SERVICE" \
+    || fatal "生成的安装 ownership 记录无效"
+  transactional_replace "$source" "$CORE_DIR/installation-ownership.json" 600 "安装 ownership 记录"
+}
+
+validate_host_ownership_for_install() {
+  if [[ ! -e "$HOST_OWNERSHIP_PATH" && ! -L "$HOST_OWNERSHIP_PATH" ]]; then
+    return 0
+  fi
+  validate_root_regular_file "$HOST_OWNERSHIP_PATH" "主机 ownership 记录"
+  [[ "$(stat -c '%a' "$HOST_OWNERSHIP_PATH" 2>/dev/null || true)" == "600" ]] \
+    || fatal "主机 ownership 记录权限必须为 0600：$HOST_OWNERSHIP_PATH"
+  ownership_record_matches \
+    "$HOST_OWNERSHIP_PATH" "$CORE_DIR" "$INSTALL_BIN" "$SYSTEMD_SERVICE" "$RESTORE_SERVICE" \
+    || fatal "主机已由另一套 proxyscene 安装接管，或 ownership 记录损坏：$HOST_OWNERSHIP_PATH"
+}
+
+validate_managed_core_dir() {
+  local marker="$CORE_DIR/.managed-by-proxyscene" marker_text
+  [[ -d "$CORE_DIR" ]] || return 0
+  if ! find "$CORE_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    return 0
+  fi
+  validate_root_regular_file "$marker" "现有管理目录标记"
+  marker_text="$(tr -d '\r\n' < "$marker")"
+  [[ "$marker_text" == "由 proxyscene 安装器管理" || "$marker_text" == "由 proxyscene 管理" ]] \
+    || fatal "现有目录不是可识别的 proxyscene 管理目录：$CORE_DIR"
+}
+
+acquire_install_lock() {
+  local lock_dir
+  umask 077
+  need_cmd flock || fatal "缺少 flock（通常由 util-linux 提供），无法取得安装锁"
+  lock_dir="$(dirname "$INSTALL_LOCK_PATH")"
+  [[ -d "$lock_dir" ]] || fatal "安装锁目录不存在：$lock_dir"
+  validate_trusted_directory_chain "$lock_dir"
+  if [[ -e "$INSTALL_LOCK_PATH" || -L "$INSTALL_LOCK_PATH" ]]; then
+    validate_root_regular_file "$INSTALL_LOCK_PATH" "现有安装锁"
+  fi
+  if ! exec {INSTALL_LOCK_FD}>>"$INSTALL_LOCK_PATH"; then
+    fatal "无法打开安装锁：$INSTALL_LOCK_PATH"
+  fi
+  chmod 600 "$INSTALL_LOCK_PATH" || fatal "无法收紧安装锁权限：$INSTALL_LOCK_PATH"
+  validate_root_regular_file "$INSTALL_LOCK_PATH" "安装锁"
+  flock -n "$INSTALL_LOCK_FD" || fatal "另一个 proxyscene 安装器正在运行"
+}
+
+acquire_host_runtime_lock() {
+  local lock_dir
+  umask 077
+  lock_dir="$(dirname "$HOST_LOCK_PATH")"
+  [[ -d "$lock_dir" ]] || fatal "主机 ownership 锁目录不存在：$lock_dir"
+  validate_trusted_directory_chain "$lock_dir"
+  if [[ -e "$HOST_LOCK_PATH" || -L "$HOST_LOCK_PATH" ]]; then
+    validate_root_regular_file "$HOST_LOCK_PATH" "现有主机 ownership 锁"
+  fi
+  if ! exec {HOST_LOCK_FD}>>"$HOST_LOCK_PATH"; then
+    fatal "无法打开主机 ownership 锁：$HOST_LOCK_PATH"
+  fi
+  chmod 600 "$HOST_LOCK_PATH" || fatal "无法收紧主机 ownership 锁权限：$HOST_LOCK_PATH"
+  validate_root_regular_file "$HOST_LOCK_PATH" "主机 ownership 锁"
+  flock -n "$HOST_LOCK_FD" || fatal "另一个 proxyscene 状态事务正在运行，请稍后重试"
+}
+
+acquire_store_runtime_lock() {
+  local lock_path
+  umask 077
+  [[ -d "$CORE_DIR" ]] || return 0
+  validate_trusted_directory_chain "$CORE_DIR"
+  lock_path="$CORE_DIR/.state.lock"
+  if [[ -e "$lock_path" || -L "$lock_path" ]]; then
+    validate_root_regular_file "$lock_path" "现有状态锁"
+  fi
+  if ! exec {STORE_LOCK_FD}>>"$lock_path"; then
+    fatal "无法打开状态锁：$lock_path"
+  fi
+  chmod 600 "$lock_path" || fatal "无法收紧状态锁权限：$lock_path"
+  validate_root_regular_file "$lock_path" "状态锁"
+  flock -n "$STORE_LOCK_FD" || fatal "另一个 proxyscene 状态事务正在运行，请稍后重试"
+}
+
+release_runtime_locks() {
+  if [[ -n "$STORE_LOCK_FD" ]]; then
+    flock -u "$STORE_LOCK_FD" || fatal "无法释放状态锁"
+    exec {STORE_LOCK_FD}>&-
+    STORE_LOCK_FD=""
+  fi
+  if [[ -n "$HOST_LOCK_FD" ]]; then
+    flock -u "$HOST_LOCK_FD" || fatal "无法释放主机 ownership 锁"
+    exec {HOST_LOCK_FD}>&-
+    HOST_LOCK_FD=""
+  fi
+}
+
+cleanup_executable_go_toolchain() {
+  local path="${GO_TOOLCHAIN_DIR:-}" parent base
+  [[ -n "$path" ]] || return 0
+  parent="${path%/*}"
+  base="${path##*/}"
+  [[ "$parent" == "$CORE_DIR" && "$base" == .proxyscene-go-toolchain.* && \
+    "$base" != ".proxyscene-go-toolchain." ]] || return 1
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    GO_TOOLCHAIN_DIR=""
+    GO_BIN=""
+    return 0
+  fi
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  rm -rf -- "$path" || return 1
+  GO_TOOLCHAIN_DIR=""
+  GO_BIN=""
+}
+
+rollback_transaction() {
+  local i dest backup existed restore status=0
+  set +e
+  for ((i=${#TX_DESTS[@]}-1; i>=0; i--)); do
+    dest="${TX_DESTS[$i]}"
+    backup="${TX_BACKUPS[$i]}"
+    existed="${TX_EXISTED[$i]}"
+    if [[ "$existed" == "1" ]]; then
+      restore="$(mktemp "$(dirname "$dest")/.proxyscene-restore.XXXXXX")" || { status=1; continue; }
+      cp -p "$backup" "$restore" && mv -f "$restore" "$dest" || status=1
+      rm -f "$restore"
+    else
+      rm -f "$dest" || status=1
+    fi
+  done
+  cleanup_executable_go_toolchain || status=1
+  if [[ "$CORE_DIR_CREATED" == "1" ]]; then
+    rmdir "$CORE_DIR" 2>/dev/null || true
+  fi
+  [[ -z "$TX_DIR" ]] || rm -rf "$TX_DIR"
+  TX_ACTIVE=0
+  set -e
+  if [[ "$status" != "0" ]]; then
+    printf '[%s] 警告：安装失败，且至少一个文件未能自动回滚。\n' "$SCRIPT_NAME" >&2
   else
-    # 随发布内置了公钥，默认应做密码学验签。minisign 缺失时 fail-closed：要么安装
-    # minisign（install_packages 已尽力自动安装），要么显式 PROXYSCENE_ALLOW_UNSIGNED=1。
-    fatal "未安装 minisign，无法对发布产物做密码学验签。请安装 minisign（Debian/Ubuntu/Alpine/Arch 包名均为 minisign），或显式设置 PROXYSCENE_ALLOW_UNSIGNED=1 仅用 SHA256 安装（不推荐）。"
+    printf '[%s] 安装失败，已回滚本次二进制和数据文件替换。\n' "$SCRIPT_NAME" >&2
   fi
+}
 
-  # checksums.txt 每行形如 "<64hex>  <asset>"（二进制模式为 "<hex> *<asset>"）。
-  expected="$(awk -v a="$asset" '{name=$2; sub(/^\*/,"",name); if (name==a) {print $1; exit}}' "$tmp/checksums.txt")"
-  if [[ -z "$expected" ]]; then
-    fatal "checksums.txt 中找不到 $asset 的校验和"
+transaction_exit_handler() {
+  local status=$?
+  if [[ "$TX_ACTIVE" == "1" ]]; then
+    rollback_transaction
   fi
-  verify_sha256_file "管理程序" "$tmp/$asset" "$expected"
-  log "管理程序 SHA256 校验通过"
+  return "$status"
+}
 
-  run_quiet "解压管理程序" tar -xzf "$tmp/$asset" -C "$tmp" proxyscene
-  [[ -f "$tmp/proxyscene" ]] || fatal "压缩包中未找到 proxyscene"
-  run_quiet "安装管理程序" install -D -m 755 "$tmp/proxyscene" "$INSTALL_BIN"
-  log "预编译管理程序已安装：$INSTALL_BIN（版本 $("$INSTALL_BIN" version 2>/dev/null || echo 未知)）"
-  rm -rf "$tmp"
+prepare_transaction_tmp_root() {
+  local parent
+  parent="$(dirname "$TRANSACTION_TMP_ROOT")"
+  [[ -d "$parent" ]] || fatal "事务临时目录的父目录不存在：$parent"
+  validate_trusted_directory_chain "$parent"
+  if [[ -e "$TRANSACTION_TMP_ROOT" || -L "$TRANSACTION_TMP_ROOT" ]]; then
+    [[ ! -L "$TRANSACTION_TMP_ROOT" && -d "$TRANSACTION_TMP_ROOT" ]] \
+      || fatal "事务临时根必须是非符号链接目录：$TRANSACTION_TMP_ROOT"
+  else
+    mkdir -m 0700 -- "$TRANSACTION_TMP_ROOT" \
+      || fatal "无法创建事务临时根：$TRANSACTION_TMP_ROOT"
+  fi
+  chmod 0700 -- "$TRANSACTION_TMP_ROOT" \
+    || fatal "无法收紧事务临时根权限：$TRANSACTION_TMP_ROOT"
+  validate_trusted_directory_chain "$TRANSACTION_TMP_ROOT"
+}
+
+begin_transaction() {
+  prepare_transaction_tmp_root
+  TX_DIR="$(mktemp -d "$TRANSACTION_TMP_ROOT/transaction.XXXXXX")" \
+    || fatal "无法创建事务临时目录"
+  TX_ACTIVE=1
+  trap transaction_exit_handler EXIT
+  chmod 0700 -- "$TX_DIR" || fatal "无法收紧事务临时目录权限：$TX_DIR"
+  validate_trusted_directory_chain "$TX_DIR"
+}
+
+commit_transaction() {
+  cleanup_executable_go_toolchain || fatal "无法删除临时 Go 工具链"
+  rm -rf -- "$TX_DIR" || fatal "无法删除安装事务临时目录"
+  TX_DIR=""
+  TX_ACTIVE=0
   trap - EXIT
-  return 0
+}
+
+transactional_replace() {
+  local source="$1" dest="$2" mode="$3" label="$4"
+  local parent stage backup existed index
+  validate_source_regular_file "$source" "$label"
+  parent="$(dirname "$dest")"
+  [[ -d "$parent" ]] || fatal "$label 目标父目录不存在：$parent"
+  validate_trusted_directory_chain "$parent"
+  existed=0
+  backup=""
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    validate_root_regular_file "$dest" "现有 $label"
+    existed=1
+    index="${#TX_DESTS[@]}"
+    backup="$TX_DIR/backup-$index"
+    cp -p "$dest" "$backup"
+  fi
+  # Register the rollback record before rename so every visible replacement is journaled.
+  TX_DESTS+=("$dest")
+  TX_BACKUPS+=("$backup")
+  TX_EXISTED+=("$existed")
+  stage="$(mktemp "$parent/.proxyscene-new.XXXXXX")" || fatal "无法为 $label 创建同目录暂存文件"
+  if ! install -m "$mode" "$source" "$stage"; then
+    rm -f "$stage"
+    fatal "无法暂存 $label"
+  fi
+  if ! chown 0:0 "$stage"; then
+    rm -f "$stage"
+    fatal "无法设置 $label 的属主"
+  fi
+  if ! mv -f "$stage" "$dest"; then
+    rm -f "$stage"
+    fatal "无法原子替换 $label"
+  fi
+}
+
+ensure_core_dir() {
+  validate_core_dir
+  if [[ ! -e "$CORE_DIR" ]]; then
+    mkdir -m 0700 -- "$CORE_DIR"
+    CORE_DIR_CREATED=1
+  fi
+  validate_trusted_directory_chain "$CORE_DIR"
+  printf '由 proxyscene 安装器管理\n' > "$TX_DIR/managed-marker"
+  transactional_replace "$TX_DIR/managed-marker" "$CORE_DIR/.managed-by-proxyscene" 600 "管理目录标记"
+}
+
+current_go_version() {
+  local command_path="$1" output
+  output="$("$command_path" version 2>/dev/null)" || return 1
+  parse_go_version_output "$output"
+}
+
+prepare_executable_go_toolchain_dir() {
+  [[ -d "$CORE_DIR" ]] || fatal "临时 Go 工具链要求核心目录已创建：$CORE_DIR"
+  [[ -z "$GO_TOOLCHAIN_DIR" ]] || fatal "临时 Go 工具链目录已存在：$GO_TOOLCHAIN_DIR"
+  validate_trusted_directory_chain "$CORE_DIR"
+  GO_TOOLCHAIN_DIR="$(mktemp -d "$CORE_DIR/.proxyscene-go-toolchain.XXXXXX")" \
+    || fatal "无法在核心目录创建临时 Go 工具链目录"
+  chmod 0700 -- "$GO_TOOLCHAIN_DIR" || fatal "无法收紧临时 Go 工具链目录权限"
+  validate_trusted_directory_chain "$GO_TOOLCHAIN_DIR"
+}
+
+install_go_toolchain() {
+  local arch url archive checksum expected_size actual_size stage actual
+  arch="$(arch_go)"
+  url="https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz"
+  archive="$TX_DIR/go.tar.gz"
+  log "下载 Go：$url"
+  fetch_https "$url" "$archive" 209715200 || fatal "下载 Go 失败"
+  if [[ -n "$GO_TARBALL_SHA256" ]]; then
+    checksum="$GO_TARBALL_SHA256"
+    expected_size=""
+  else
+    [[ "$GO_VERSION" == "$DEFAULT_GO_VERSION" ]] \
+      || fatal "非默认 GO_VERSION=$GO_VERSION 必须显式设置 GO_TARBALL_SHA256"
+    checksum="$(go_tarball_sha256_for_arch "$arch")" \
+      || fatal "缺少 Go $GO_VERSION 的固定 SHA256：$arch"
+    expected_size="$(go_tarball_size_for_arch "$arch")" \
+      || fatal "缺少 Go $GO_VERSION 的固定归档大小：$arch"
+    actual_size="$(stat -c '%s' "$archive")"
+    [[ "$actual_size" == "$expected_size" ]] \
+      || fatal "Go 归档大小不匹配：期望 $expected_size，实际 $actual_size"
+  fi
+  verify_sha256_file "Go" "$archive" "$checksum"
+
+  # /run is commonly mounted noexec. Keep downloads, backups and caches in the
+  # fixed transaction root, but place the executable toolchain on CoreDir's
+  # filesystem, which must also execute the managed Xray binary.
+  prepare_executable_go_toolchain_dir
+  stage="$GO_TOOLCHAIN_DIR"
+  tar --no-same-owner --no-same-permissions -C "$stage" -xzf "$archive"
+  validate_source_regular_file "$stage/go/bin/go" "Go 工具链"
+  [[ -x "$stage/go/bin/go" ]] || fatal "Go 归档中的 go/bin/go 不可执行"
+  GO_BIN="$stage/go/bin/go"
+  actual="$(current_go_version "$GO_BIN")" || fatal "下载的 Go 无法报告稳定版本"
+  go_version_matches_exactly "$actual" "$GO_VERSION" \
+    || fatal "下载的 Go 版本不匹配：期望 $GO_VERSION，实际 $actual"
+  log "临时 Go 已准备：版本 $actual；安装结束后自动删除"
+}
+
+ensure_go() {
+  local existing="" have=""
+  if need_cmd go; then
+    existing="$(command -v go)"
+    have="$(current_go_version "$existing" 2>/dev/null || true)"
+  fi
+  if [[ "$SKIP_GO_INSTALL" == "1" ]]; then
+    [[ -n "$existing" && -n "$have" ]] || fatal "SKIP_GO_INSTALL=1 但找不到可用 go"
+    go_version_meets_requirement "$have" "$GO_VERSION" \
+      || fatal "现有 Go $have 低于显式要求 $GO_VERSION"
+    GO_BIN="$existing"
+    return 0
+  fi
+  if [[ -n "$have" && "$FORCE_GO_INSTALL" != "1" ]] && go_version_meets_requirement "$have" "$GO_VERSION"; then
+    GO_BIN="$existing"
+    log "使用已有 Go：版本 $have"
+    return 0
+  fi
+  install_go_toolchain
+}
+
+xray_download_url_for_arch() {
+  local release_arch="$1" asset_arch
+  if [[ -n "$XRAY_ZIP_URL" ]]; then
+    [[ "$XRAY_ZIP_URL" == https://* ]] || fatal "XRAY_ZIP_URL 必须是 https 地址"
+    [[ -n "$XRAY_ZIP_SHA256" ]] || fatal "自定义 XRAY_ZIP_URL 必须同时设置 XRAY_ZIP_SHA256"
+    printf '%s\n' "$XRAY_ZIP_URL"
+    return 0
+  fi
+  asset_arch="$(xray_asset_arch_for_release_arch "$release_arch")" || fatal "不支持的 Xray 架构：$release_arch"
+  printf '%s/Xray-linux-%s.zip\n' "${XRAY_RELEASE_BASE%/}" "$asset_arch"
+}
+
+xray_expected_sha256_for_arch() {
+  local release_arch="$1"
+  if [[ -n "$XRAY_ZIP_URL" ]]; then
+    normalize_sha256 "$XRAY_ZIP_SHA256" || fatal "XRAY_ZIP_SHA256 格式无效"
+  else
+    xray_sha256_for_release_arch "$release_arch" || fatal "缺少 Xray 固定 SHA256：$release_arch"
+  fi
+}
+
+xray_marker_for_source() {
+  local source="$1" value="$2" digest
+  case "$source" in
+    official)
+      validate_release_tag "$value" || return 1
+      printf '%s\n' "$value"
+      ;;
+    custom|existing)
+      digest="$(normalize_sha256 "$value")" || return 1
+      printf '%s-sha256:%s\n' "$source" "$digest"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+install_xray() {
+  local release_arch url expected unpack file marker marker_source digest
+  release_arch="$(arch_release)" || fatal "当前架构没有受支持的 Xray 产物：$(uname -m)"
+  if [[ "$SKIP_XRAY_INSTALL" == "1" ]]; then
+    validate_root_regular_file "$CORE_DIR/xray" "现有 Xray"
+    [[ -x "$CORE_DIR/xray" ]] || fatal "现有 Xray 不可执行：$CORE_DIR/xray"
+    validate_elf_arch "$CORE_DIR/xray" "$release_arch" "现有 Xray"
+    digest="$(sha256_file "$CORE_DIR/xray")" || fatal "无法计算现有 Xray SHA256"
+    marker="$(xray_marker_for_source existing "$digest")" || fatal "无法生成现有 Xray 来源标记"
+    printf '%s\n' "$marker" > "$TX_DIR/xray-version.txt"
+    transactional_replace "$TX_DIR/xray-version.txt" "$CORE_DIR/xray-version.txt" 600 "Xray 来源标记"
+    log "按 SKIP_XRAY_INSTALL=1 保留现有 Xray；版本未知，已记录二进制 SHA256"
+    return 0
+  fi
+
+  url="$(xray_download_url_for_arch "$release_arch")"
+  expected="$(xray_expected_sha256_for_arch "$release_arch")"
+  marker_source=official
+  if [[ -n "$XRAY_ZIP_URL" ]]; then
+    marker_source=custom
+    log "下载自定义 Xray 归档（架构 $release_arch，版本未知）"
+  else
+    log "下载固定 Xray ${DEFAULT_XRAY_VERSION}（架构 $release_arch）"
+  fi
+  fetch_https "$url" "$TX_DIR/xray.zip" 104857600 || fatal "下载 Xray 失败"
+  verify_sha256_file "Xray" "$TX_DIR/xray.zip" "$expected"
+  unpack="$TX_DIR/xray-unpack"
+  mkdir "$unpack"
+  unzip -oq "$TX_DIR/xray.zip" -d "$unpack"
+  for file in xray LICENSE; do
+    validate_source_regular_file "$unpack/$file" "Xray 归档中的 $file"
+  done
+  validate_elf_arch "$unpack/xray" "$release_arch" "Xray"
+
+  transactional_replace "$unpack/xray" "$CORE_DIR/xray" 700 "Xray"
+  transactional_replace "$unpack/LICENSE" "$CORE_DIR/LICENSE-Xray" 600 "Xray 许可证"
+  if [[ "$marker_source" == "official" ]]; then
+    marker="$(xray_marker_for_source official "$DEFAULT_XRAY_VERSION")" || fatal "无法生成官方 Xray 版本标记"
+  else
+    marker="$(xray_marker_for_source custom "$expected")" || fatal "无法生成自定义 Xray 来源标记"
+  fi
+  printf '%s\n' "$marker" > "$TX_DIR/xray-version.txt"
+  transactional_replace "$TX_DIR/xray-version.txt" "$CORE_DIR/xray-version.txt" 600 "Xray 来源标记"
+}
+
+validate_release_inputs() {
+  [[ "$MANAGER_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fatal "PROXYSCENE_REPO 格式无效：$MANAGER_REPO"
+  [[ "$MANAGER_VERSION" == "latest" ]] || validate_release_tag "$MANAGER_VERSION" || fatal "PROXYSCENE_VERSION 必须是 v 开头的安全 tag：$MANAGER_VERSION"
+  if [[ -n "$MANAGER_BASE_URL" ]]; then
+    [[ "$MANAGER_BASE_URL" == https://* && "$MANAGER_BASE_URL" != *"?"* && "$MANAGER_BASE_URL" != *"#"* ]] \
+      || fatal "PROXYSCENE_BASE_URL 必须是无查询参数的 https 地址"
+    [[ "$MANAGER_VERSION" != "latest" ]] || fatal "自定义 PROXYSCENE_BASE_URL 时必须显式指定 PROXYSCENE_VERSION"
+    url_has_userinfo "$MANAGER_BASE_URL" && fatal "PROXYSCENE_BASE_URL 不能包含 URL userinfo 凭据"
+  fi
+}
+
+resolve_manager_version() {
+  local metadata metadata_url tag
+  metadata="$TX_DIR/release-metadata.json"
+  if [[ "$MANAGER_VERSION" == "latest" ]]; then
+    log "解析 GitHub latest 为明确且不可变的 tag"
+    metadata_url="https://api.github.com/repos/${MANAGER_REPO}/releases/latest"
+  else
+    metadata_url="https://api.github.com/repos/${MANAGER_REPO}/releases/tags/${MANAGER_VERSION}"
+  fi
+  fetch_https "$metadata_url" "$metadata" 1048576 || fatal "下载 GitHub Release 元数据失败"
+  tag="$(verified_release_tag_json "$MANAGER_VERSION" < "$metadata")" \
+    || fatal "GitHub Release 元数据未同时满足安全 tag 精确匹配和 immutable=true"
+  RESOLVED_MANAGER_VERSION="$tag"
+  log "目标 Release 已固定并确认 immutable：$RESOLVED_MANAGER_VERSION"
+}
+
+release_base_url() {
+  if [[ -n "$MANAGER_BASE_URL" ]]; then
+    printf '%s\n' "${MANAGER_BASE_URL%/}"
+  else
+    printf 'https://github.com/%s/releases/download/%s\n' "$MANAGER_REPO" "$RESOLVED_MANAGER_VERSION"
+  fi
+}
+
+release_checksums_url() {
+  printf 'https://github.com/%s/releases/download/%s/checksums.txt\n' \
+    "$MANAGER_REPO" "$RESOLVED_MANAGER_VERSION"
+}
+
+install_manager_prebuilt() {
+  local arch base checksums_url asset manifest expected unpack
+  arch="$(arch_release)" || fatal "当前架构没有受支持的预编译管理程序：$(uname -m)"
+  validate_release_inputs
+  resolve_manager_version
+  base="$(release_base_url)"
+  checksums_url="$(release_checksums_url)"
+  asset="proxyscene_linux_${arch}.tar.gz"
+  manifest="$TX_DIR/release-checksums.txt"
+
+  log "从官方不可变 Release 下载 $RESOLVED_MANAGER_VERSION 的 checksums.txt"
+  fetch_https "$checksums_url" "$manifest" 1048576 || fatal "下载 Release checksums.txt 失败"
+  expected="$(manifest_sha_for_asset "$manifest" "$asset")" || fatal "checksums.txt 中必须且只能包含一个 $asset"
+  log "下载预编译管理程序：$RESOLVED_MANAGER_VERSION / $asset"
+  fetch_https "$base/$asset" "$TX_DIR/$asset" 104857600 || fatal "下载预编译管理程序失败"
+  verify_sha256_file "管理程序归档" "$TX_DIR/$asset" "$expected"
+
+  unpack="$TX_DIR/manager-unpack"
+  mkdir "$unpack"
+  tar -xzf "$TX_DIR/$asset" -C "$unpack" \
+    proxyscene LICENSE NOTICE SOURCE-Xray THIRD_PARTY_LICENSES THIRD_PARTY_LICENSES-Xray
+  validate_source_regular_file "$unpack/proxyscene" "管理程序"
+  validate_source_regular_file "$unpack/LICENSE" "项目许可证"
+  validate_source_regular_file "$unpack/NOTICE" "第三方声明"
+  validate_source_regular_file "$unpack/SOURCE-Xray" "Xray 对应源码说明"
+  validate_source_regular_file "$unpack/THIRD_PARTY_LICENSES" "第三方许可证"
+  validate_source_regular_file "$unpack/THIRD_PARTY_LICENSES-Xray" "Xray 第三方许可证"
+  validate_elf_arch "$unpack/proxyscene" "$arch" "管理程序"
+  transactional_replace "$unpack/proxyscene" "$INSTALL_BIN" 755 "管理程序"
+  transactional_replace "$unpack/LICENSE" "$CORE_DIR/LICENSE-proxyscene" 600 "项目许可证"
+  transactional_replace "$unpack/NOTICE" "$CORE_DIR/NOTICE" 600 "第三方声明"
+  transactional_replace "$unpack/SOURCE-Xray" "$CORE_DIR/SOURCE-Xray" 600 "Xray 对应源码说明"
+  transactional_replace "$unpack/THIRD_PARTY_LICENSES" "$CORE_DIR/THIRD_PARTY_LICENSES" 600 "第三方许可证"
+  transactional_replace "$unpack/THIRD_PARTY_LICENSES-Xray" "$CORE_DIR/THIRD_PARTY_LICENSES-Xray" 600 "Xray 第三方许可证"
+  log "已暂存管理程序 $RESOLVED_MANAGER_VERSION，全部依赖验证后统一提交"
 }
 
 build_manager() {
-  local dir out
-  dir="$(repo_dir)"
-  out="$(mktemp "$dir/.proxyscene-build.XXXXXX")"
-  trap 'rm -f "$out"' EXIT
+  local dir out arch
+  dir="$(repo_dir)" || fatal "无法确定源码目录"
   [[ -f "$dir/go.mod" ]] || fatal "未找到 go.mod：$dir/go.mod"
-
+  out="$TX_DIR/proxyscene-source-build"
+  arch="$(arch_release)" || fatal "不支持的管理程序架构：$(uname -m)"
   log "编译本地 Go 管理程序"
-  run_quiet "编译 Go 管理程序" env CGO_ENABLED=0 go build -C "$dir" -trimpath -ldflags "-s -w" -o "$out" ./cmd/proxyscene
-  run_quiet "安装 Go 管理程序" install -D -m 755 "$out" "$INSTALL_BIN"
-  rm -f "$out"
-  trap - EXIT
-  log "Go 管理程序已安装：$INSTALL_BIN"
+  run_quiet "编译 Go 管理程序" env \
+    CGO_ENABLED=0 GOENV=off GOFLAGS= GOTOOLCHAIN=local GOWORK=off \
+    GOCACHE="$TX_DIR/go-cache" GOMODCACHE="$TX_DIR/go-mod-cache" GOPATH="$TX_DIR/go-path" \
+    "$GO_BIN" build -C "$dir" \
+    -trimpath -buildvcs=false -ldflags "-s -w -buildid=" -o "$out" ./cmd/proxyscene
+  validate_elf_arch "$out" "$arch" "本地构建管理程序"
+  transactional_replace "$out" "$INSTALL_BIN" 755 "管理程序"
+  transactional_replace "$dir/LICENSE" "$CORE_DIR/LICENSE-proxyscene" 600 "项目许可证"
+  transactional_replace "$dir/NOTICE" "$CORE_DIR/NOTICE" 600 "第三方声明"
+  transactional_replace "$dir/SOURCE-Xray" "$CORE_DIR/SOURCE-Xray" 600 "Xray 对应源码说明"
+  transactional_replace "$dir/THIRD_PARTY_LICENSES" "$CORE_DIR/THIRD_PARTY_LICENSES" 600 "第三方许可证"
+  transactional_replace "$dir/THIRD_PARTY_LICENSES-Xray" "$CORE_DIR/THIRD_PARTY_LICENSES-Xray" 600 "Xray 第三方许可证"
 }
 
-# install_manager 默认优先下载预编译二进制（目标机无需 Go），失败时回退本地源码编译。
 install_manager() {
   if [[ "$BUILD_FROM_SOURCE" == "1" ]]; then
-    log "按 PROXYSCENE_BUILD_FROM_SOURCE=1 从源码编译管理程序"
     ensure_go
     build_manager
     return 0
   fi
-  if install_manager_prebuilt; then
-    return 0
-  fi
-  # 预编译失败时才回退源码编译，但这只有在源码目录（有 go.mod）里才可能。
-  # 通过 `curl | sudo bash` 在任意目录运行时拿不到仓库，给出清晰指引而不是含糊的 go.mod 报错。
-  if [[ ! -f "$(repo_dir)/go.mod" ]]; then
-    fatal "预编译二进制下载失败，且当前不在源码目录（找不到 go.mod），无法回退编译。请：① 确认仓库已发布对应架构的 Release（检查 PROXYSCENE_VERSION/PROXYSCENE_REPO）；或 ② 克隆仓库后在源码目录运行 ./install.sh；或 ③ 用 --offline 离线整合包安装。"
-  fi
-  log "改用本地源码编译管理程序"
-  ensure_go
-  build_manager
+  install_manager_prebuilt
 }
 
-# bundle_dir 返回 install.sh 物理所在目录；通过管道（curl|bash）运行时 BASH_SOURCE 为空，返回空。
-bundle_dir() {
-  local src="${BASH_SOURCE[0]:-}"
-  [[ -n "$src" && -f "$src" ]] || return 0
-  (cd "$(dirname "$src")" && pwd -P)
+verify_bundle_manifest() {
+  local bdir="$1" manifest="$1/bundle-manifest.sha256" file expected count
+  local -a required=(LICENSE LICENSE-Xray NOTICE SOURCE-Xray THIRD_PARTY_LICENSES THIRD_PARTY_LICENSES-Xray install.sh proxyscene xray xray-version.txt)
+  validate_trusted_directory_chain "$bdir"
+  validate_root_regular_file "$manifest" "bundle manifest"
+  count="$(awk 'NF {count++} END {print count+0}' "$manifest")"
+  [[ "$count" == "${#required[@]}" ]] || fatal "bundle manifest 条目数错误：$count"
+  for file in "${required[@]}"; do
+    validate_root_regular_file "$bdir/$file" "bundle 组件 $file"
+    expected="$(manifest_sha_for_asset "$manifest" "$file")" || fatal "bundle manifest 缺少或重复：$file"
+    verify_sha256_file "bundle 组件 $file" "$bdir/$file" "$expected"
+  done
+  [[ "$(tr -d '\r\n' < "$bdir/xray-version.txt")" == "$DEFAULT_XRAY_VERSION" ]] \
+    || fatal "bundle Xray 版本与安装器固定版本不一致"
 }
 
-# is_self_contained_bundle 判断 install.sh 同目录是否为自包含整合包（解压后形态：
-# install.sh 与 proxyscene / xray 二进制同处一目录）。
-is_self_contained_bundle() {
-  local bdir="$1"
-  [[ -n "$bdir" && -f "$bdir/proxyscene" && -f "$bdir/xray" && ! -f "$bdir/go.mod" ]]
-}
-
-# install_offline_local 从 install.sh 同目录的整合包文件离线安装（不联网、不需要 Go）。
-# 自包含整合包里 install.sh 与二进制同处一目录，解压后直接运行本脚本即走这里。
-# 注意：自包含包无法验证它自身（脚本与二进制都在包内）；如需密码学保证，请在解压前用随包的
-# .minisig + 公钥验证整个 tar。安装前对每个文件强制"常规文件且非符号链接"检查。
 install_offline_local() {
-  local bdir="$1" f
-  require_root
-  for f in proxyscene xray; do
-    [[ -f "$bdir/$f" && ! -L "$bdir/$f" ]] || fatal "整合包缺少 $f 或不是常规文件：$bdir/$f"
-  done
-  log "离线本地安装（来自 $bdir，不联网、不需要 Go）"
-  log "提示：未对整合包做验签；如需校验，请在解压前执行：minisign -Vm <包>.tar.gz -x <包>.tar.gz.minisig -P <公钥>"
-  ensure_core_dir
-  run_quiet "安装管理程序" install -D -m 755 "$bdir/proxyscene" "$INSTALL_BIN"
-  run_quiet "安装 Xray" install -m 700 "$bdir/xray" "$CORE_DIR/xray"
-  for f in geoip.dat geosite.dat; do
-    if [[ -f "$bdir/$f" && ! -L "$bdir/$f" ]]; then
-      install -m 600 "$bdir/$f" "$CORE_DIR/$f"
-    fi
-  done
-  log "离线安装完成：$INSTALL_BIN（版本 $("$INSTALL_BIN" version 2>/dev/null || echo 未知)）、$CORE_DIR/xray"
+  local bdir="$1" arch
+  arch="$(arch_release)" || fatal "当前架构没有受支持的离线包：$(uname -m)"
+  validate_elf_arch "$bdir/proxyscene" "$arch" "bundle 管理程序"
+  validate_elf_arch "$bdir/xray" "$arch" "bundle Xray"
+  log "bundle manifest 校验通过，开始离线替换"
+  transactional_replace "$bdir/proxyscene" "$INSTALL_BIN" 755 "管理程序"
+  transactional_replace "$bdir/xray" "$CORE_DIR/xray" 700 "Xray"
+  transactional_replace "$bdir/LICENSE-Xray" "$CORE_DIR/LICENSE-Xray" 600 "Xray 许可证"
+  transactional_replace "$bdir/LICENSE" "$CORE_DIR/LICENSE-proxyscene" 600 "项目许可证"
+  transactional_replace "$bdir/NOTICE" "$CORE_DIR/NOTICE" 600 "第三方声明"
+  transactional_replace "$bdir/SOURCE-Xray" "$CORE_DIR/SOURCE-Xray" 600 "Xray 对应源码说明"
+  transactional_replace "$bdir/THIRD_PARTY_LICENSES" "$CORE_DIR/THIRD_PARTY_LICENSES" 600 "第三方许可证"
+  transactional_replace "$bdir/THIRD_PARTY_LICENSES-Xray" "$CORE_DIR/THIRD_PARTY_LICENSES-Xray" 600 "Xray 第三方许可证"
+  transactional_replace "$bdir/xray-version.txt" "$CORE_DIR/xray-version.txt" 600 "Xray 版本标记"
 }
 
 init_manager() {
@@ -691,48 +1143,76 @@ init_manager() {
     log "跳过管理服务初始化"
     return 0
   fi
-
-  if [[ -n "$NODE_URL" ]]; then
-    log "初始化管理服务并导入节点"
-    PROXYSCENE_MANAGER_DIR="$CORE_DIR" PROXYSCENE_SWITCH_BIN="$INSTALL_BIN" "$INSTALL_BIN" install "$NODE_URL"
-  else
-    log "初始化管理服务，不导入节点"
-    PROXYSCENE_MANAGER_DIR="$CORE_DIR" PROXYSCENE_SWITCH_BIN="$INSTALL_BIN" "$INSTALL_BIN" install --skip-node
+  if ! PROXYSCENE_MANAGER_DIR="$CORE_DIR" PROXYSCENE_SWITCH_BIN="$INSTALL_BIN" \
+    PROXYSCENE_SYSTEMD_SERVICE_NAME="$SYSTEMD_SERVICE" \
+    PROXYSCENE_BOOT_RESTORE_SERVICE_NAME="$RESTORE_SERVICE" \
+    PROXYSCENE_INHERITED_INSTALL_LOCK_FD="$INSTALL_LOCK_FD" \
+    PROXYSCENE_INHERITED_HOST_LOCK_FD="$HOST_LOCK_FD" \
+    PROXYSCENE_INHERITED_STORE_LOCK_FD="$STORE_LOCK_FD" \
+    "$INSTALL_BIN" install --skip-node; then
+    return 1
   fi
 }
 
-validate_install_bin() {
-  [[ -n "$INSTALL_BIN" ]] || fatal "PROXYSCENE_SWITCH_BIN 不能为空"
-  [[ "$INSTALL_BIN" == /* ]] || fatal "PROXYSCENE_SWITCH_BIN 必须是绝对路径：$INSTALL_BIN"
-  if [[ "$INSTALL_BIN" == *[$' \t\r\n']* ]]; then
-    fatal "PROXYSCENE_SWITCH_BIN 不能包含空白字符：$INSTALL_BIN"
+commit_files_then_init() {
+  commit_transaction
+  # The manager validates and reuses these inherited flock file descriptions.
+  # Keep all three locks held until initialization has committed the units and
+  # runtime state; releasing here would leave a file-commit/init race window.
+  if ! init_manager; then
+    release_runtime_locks
+    fatal "管理器初始化失败；已验证的程序和数据文件已保留，避免 systemd 指向被回滚的文件。修复原因后运行 sudo proxyscene install --skip-node 重试"
   fi
-  if [[ -L "$INSTALL_BIN" ]]; then
-    fatal "PROXYSCENE_SWITCH_BIN 不能是符号链接：$INSTALL_BIN"
-  fi
+  release_runtime_locks
 }
 
 main() {
-  validate_install_bin
-  local bdir
-  bdir="$(bundle_dir)"
-  # 自包含整合包：install.sh 与二进制同处一目录（解压后形态），或显式 --offline。
-  if [[ "$FORCE_OFFLINE_LOCAL" == "1" ]] || is_self_contained_bundle "$bdir"; then
-    if ! is_self_contained_bundle "$bdir"; then
-      fatal "--offline 需要在解压后的整合包目录内运行（同目录应有 proxyscene 与 xray 二进制）"
-    fi
-    install_offline_local "$bdir"
-    init_manager
-    log "离线安装完成。运行：sudo $INSTALL_BIN"
+  parse_args "$@"
+  if [[ "$SHOW_HELP" == "1" ]]; then
+    usage
     return 0
   fi
   require_root
+  validate_common_inputs
+  validate_core_dir
+  validate_managed_core_dir
+  validate_install_bin
+
+  if [[ "$(install_mode_for_flag "$OFFLINE_REQUESTED")" == "offline" ]]; then
+    local bdir
+    bdir="$(bundle_dir)" || fatal "--offline 必须从解压后的 bundle 内执行"
+    verify_bundle_manifest "$bdir"
+    acquire_install_lock
+    acquire_host_runtime_lock
+    acquire_store_runtime_lock
+    validate_install_bin
+    validate_host_ownership_for_install
+    begin_transaction
+    ensure_core_dir
+    install_offline_local "$bdir"
+    stage_installation_ownership
+    commit_files_then_init
+    log "离线安装完成。请运行 sudo proxyscene install 交互录入节点。"
+    return 0
+  fi
+
+  validate_online_inputs
+  acquire_install_lock
   install_packages
-  ensure_minisign_best_effort
+  acquire_host_runtime_lock
+  acquire_store_runtime_lock
+  validate_install_bin
+  validate_host_ownership_for_install
+  begin_transaction
+  ensure_core_dir
   install_xray
   install_manager
-  init_manager
-  log "安装完成。运行：sudo $INSTALL_BIN"
+  stage_installation_ownership
+  commit_files_then_init
+  log "安装完成。请运行 sudo proxyscene install 交互录入节点。"
 }
 
-main "$@"
+# Sourcing this file is always inert. Tests additionally set PROXYSCENE_INSTALL_TESTING=1.
+if [[ "${BASH_SOURCE[0]:-}" == "$0" && "${PROXYSCENE_INSTALL_TESTING:-0}" != "1" ]]; then
+  main "$@"
+fi

@@ -7,7 +7,7 @@
 
 `proxyscene` 是一个面向 Linux 服务器的 Xray 代理管理器。项目由一个安装脚本和一个 Go 编写的单二进制管理程序组成：
 
-- `install.sh`：负责安装期工作——安装 Xray、安装 `proxyscene` 管理程序、初始化 systemd。支持离线整合包安装（推荐，解压即装、不联网、不需要 Go）、联机下载预编译二进制（失败回退源码编译）、源码编译三种方式。
+- `install.sh`：负责安装期工作——校验并更新固定版本 Xray、安装 `proxyscene` 管理程序、初始化 systemd。支持显式离线 bundle、固定 Release 下载和源码编译三种方式。
 - `proxyscene`：负责运行期管理，包括节点管理、场景开关、Xray 配置生成、systemd 服务管理和开机恢复。
 
 > 当前项目适合在使用 systemd 的 Linux 服务器上运行。大多数管理命令需要 root 权限，建议统一使用 `sudo` 执行。
@@ -15,14 +15,14 @@
 ## 功能特性
 
 - 单二进制 Go 管理程序，安装后命令为 `proxyscene`。
-- 安装脚本默认下载预编译二进制并做 SHA256 + minisign 双重校验（缺 minisign 或签名文件默认拒绝安装，需显式 `PROXYSCENE_ALLOW_UNSIGNED=1` 才降级为仅 SHA256），目标机无需安装 Go；下载失败时自动回退到本仓库源码编译。
-- 支持离线安装：屏蔽 GitHub / 气隙环境下，下载自包含整合包（含 `install.sh` + 管理程序 + Xray + geo），解压后运行包内 `install.sh` 即可，全程不联网、不需要 Go。
-- 通过 GitHub Actions 在打 tag 时自动交叉编译多架构（amd64/arm64/386/armv7）、用 minisign 签名并发布 Release。
+- Release 的 `checksums.txt` 覆盖版本化 `install.sh`、管理程序包、离线 bundle 和固定 Xray 对应源码归档；安装器解析 `latest` 后固定到一个明确 tag，再按 SHA256 校验下载内容。
+- 支持离线安装：先用 Release checksum 校验自包含 bundle，解压后显式运行 `install.sh --offline`；包内 manifest 会在复制前复核全部组件。
+- GitHub Actions 从 `main` 手动发起发布，交叉编译 amd64/arm64/386/armv7，校验 SHA256 后发布为 immutable Latest。
 - 支持 Xray 主服务和开机恢复服务的 systemd 管理。
 - 支持三类代理场景：
   - 全局代理：写入系统 profile 和 apt 代理配置。
   - 开发代理：为目标用户设置 git/npm 代理，并在关闭时恢复。
-  - Telegram 服务代理：为指定 systemd 服务注入代理环境。
+  - Telegram 服务代理：为 Hermes systemd 服务注入专用环境，并事务化托管用户级 OpenClaw 的 Telegram 配置。
 - 支持多节点管理：添加、删除、改名、列表、订阅导入、测速、自动选择。
 - 支持基础节点协议解析：VLESS、VMess、Trojan、Shadowsocks。
 - 支持按场景选择不同节点。
@@ -36,14 +36,26 @@ proxyscene/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml          # 格式/测试/vet/shellcheck
-│       └── release.yml     # 打 tag 交叉编译多架构 + 校验和/签名 + 发布 Release
+│       └── release.yml     # main 手动发布多架构 + SHA256 + immutable Release
 ├── .gitignore
 ├── LICENSE
-├── NOTICE              # 离线整合包再分发 Xray(MPL-2.0) 的署名声明
+├── LICENSE-GPL-3.0             # Xray GPL 依赖所需的完整 GPL-3.0 文本
+├── NOTICE                       # manager 依赖与离线 Xray 的第三方声明
+├── SOURCE-Xray                  # 固定 Xray ELF 与同版对应源码资产说明
+├── THIRD_PARTY_LICENSES         # manager 静态链接依赖的完整许可证文本
+├── THIRD_PARTY_LICENSES-Xray    # 固定 Xray ELF 已链接依赖的许可证与 module sum
 ├── SECURITY.md
 ├── go.mod
+├── go.sum
 ├── install.sh
 ├── README.md
+├── scripts/
+│   ├── build-bundle.sh
+│   ├── build-xray-source-archive.sh
+│   ├── generate-xray-third-party-licenses.sh
+│   ├── install-test.sh
+│   ├── systemd-integration-test.sh
+│   └── verify-release-artifacts.sh
 ├── cmd/
 │   └── proxyscene/
 │       └── main.go
@@ -51,12 +63,19 @@ proxyscene/
     └── manager/
         ├── app.go
         ├── dev.go
+        ├── global_journal.go
         ├── node.go
+        ├── openclaw.go
+        ├── openclaw_json5.go
+        ├── ownership.go
         ├── scenes.go
         ├── store.go
         ├── systemd.go
         ├── telegram_discovery.go
+        ├── telegram_journal.go
+        ├── telegram_runtime.go
         ├── types.go
+        ├── user_identity.go
         ├── util.go
         └── xray.go
 ```
@@ -66,100 +85,117 @@ proxyscene/
 - Linux。
 - systemd。
 - root 或 sudo 权限。
-- 可用的软件包管理器之一：apt、dnf、yum、apk、zypper。
-- 可访问网络，用于安装依赖、Xray 和管理程序。
-- Go 1.22 或更高版本**仅在源码编译时需要**（默认走预编译二进制，目标机无需 Go）。若需源码编译且系统没有可用 Go，安装脚本会自动准备。
+- `flock`（通常由 `util-linux` 提供）。安装器必须先取得全局锁，不能等开始改包以后再自动安装它。
+- 联机安装需要可访问 HTTPS，并需要可用的软件包管理器之一：apt、dnf、yum、apk、zypper。
+- 离线 bundle 安装不需要网络或 Go，但目标机仍需具备 Bash、`flock` 和基础校验/归档工具。
+- Go 1.26.5 或更高版本**仅在源码编译时需要**（默认走预编译二进制，目标机无需 Go）。若需源码编译且系统没有可用 Go，安装脚本会自动准备。
 
 ## 快速开始
 
-**推荐用方式一（离线整合包）安装**：下载一个自包含 `tar.gz`，解压后运行包内的 `install.sh` 即可，**全程不联网、不需要 Go**，最适合屏蔽 GitHub 的网络环境。能直连 GitHub 的机器也可以用方式二一行联机安装。
+不要把 mutable `main` 分支脚本通过管道直接交给 root shell，也不要把节点或订阅 URL 放进命令参数。
+下面的 Release bootstrap 示例要求验证机已有 `curl`、`jq` 和 `sha256sum`。
 
-### 方式一：下载整合包，解压即装（推荐 / 默认）
+> 迁移说明：`v0.7.1` 是旧的 mutable Release，新的 SHA256 + immutable 模型从 `v0.8.0` 起生效。新安装器会有意拒绝 `immutable=false` 的 `v0.7.1`；请使用明确的 `v0.8.0` 或更高版本，不要让 `latest` 意外解析到旧版本。
 
-用 Release 里的**自包含整合包**安装——**解压后直接运行包内的 `install.sh`**，全程不联网、不需要 Go。整合包是一个带顶层目录的 `tar.gz`，内含 `install.sh` + 管理程序 + Xray + `geoip.dat`/`geosite.dat` + `NOTICE`。
+### 方式一：固定 Release 离线安装
 
-1. 在任意能上网的机器上，从 Release 下载对应架构的 `proxyscene_bundle_linux_<arch>.tar.gz`（想验签的话连同 `.minisig` 一起下）。
-2. 用任意带外渠道（scp、网盘、U 盘等）把它拷到目标机。
-3. 解压并运行包内脚本：
-
-```bash
-tar xzf proxyscene_bundle_linux_amd64.tar.gz
-cd proxyscene_bundle_linux_amd64
-sudo ./install.sh                 # 解压即装
-sudo ./install.sh 'vless://...'   # 同时导入节点
-```
-
-`install.sh` 检测到同目录的 `proxyscene`/`xray` 二进制，就走离线本地安装。
-
-#### 想要密码学保证？解压前先验签
-
-自包含整合包**无法验证它自身**（脚本和二进制都在包内），所以"解压即装"本质是信任这个 tar 的来源。如果你要确定性的完整性保证，请在**解压前**用随包的 `.minisig` + 公钥（见下文「发布签名公钥」）验证整个 tar：
+在联网机器上把 `<release-tag>` 替换为明确版本，并按目标架构选择 bundle。所有待交给 root 的字节都由 root 直接下载到 root-only staging 目录，再在同一目录校验，避免普通用户在校验与特权读取之间替换文件：
 
 ```bash
-minisign -Vm proxyscene_bundle_linux_amd64.tar.gz \
-  -x proxyscene_bundle_linux_amd64.tar.gz.minisig \
-  -P RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb
-# 验签通过后再 tar xzf 解压、运行 install.sh
+VERSION='<release-tag>'
+ARCH=amd64
+[[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+  || { echo 'VERSION 必须是 vMAJOR.MINOR.PATCH' >&2; exit 2; }
+case "$ARCH" in amd64|arm64|386|armv7) ;; *) exit 2 ;; esac
+BASE="https://github.com/longlannet/proxyscene/releases/download/${VERSION}"
+STAGE="/root/proxyscene-bootstrap-${VERSION}-${ARCH}"
+sudo install -d -o root -g root -m 0700 "$STAGE"
+sudo curl -q -fsSL --proto '=https' --proto-redir '=https' -o "$STAGE/release.json" \
+  "https://api.github.com/repos/longlannet/proxyscene/releases/tags/${VERSION}"
+sudo curl -q -fL --proto '=https' --proto-redir '=https' \
+  -o "$STAGE/checksums.txt" "${BASE}/checksums.txt"
+sudo curl -q -fL --proto '=https' --proto-redir '=https' \
+  -o "$STAGE/proxyscene_bundle_linux_${ARCH}.tar.gz" \
+  "${BASE}/proxyscene_bundle_linux_${ARCH}.tar.gz"
+sudo bash -c '
+  set -euo pipefail
+  cd -- "$1"
+  jq -e --arg tag "$2" \
+    '\''type == "object" and .tag_name == $tag and .immutable == true'\'' release.json
+  awk -v file="$3" \
+    '\''$2 == file {count++; line=$0} END {if (count != 1) exit 1; print line}'\'' \
+    checksums.txt | sha256sum -c -
+' bash "$STAGE" "$VERSION" "proxyscene_bundle_linux_${ARCH}.tar.gz"
 ```
 
-### 方式二：一行联机安装（能直连 GitHub 时）
-
-> 前提：仓库已发布对应架构的 Release。一行命令通过管道运行时拿不到源码，**无法回退到源码编译**，发布 Release 之前请用方式三从源码安装。
+校验成功后再把整个 root-only staging 目录传到目标机，或在同一台机器继续。下面在该目录中解压，并**显式**进入离线模式：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.sh | sudo bash
+sudo install -d -o root -g root -m 0700 "$STAGE/extracted"
+sudo tar --no-same-owner --no-same-permissions \
+  -xzf "$STAGE/proxyscene_bundle_linux_${ARCH}.tar.gz" \
+  -C "$STAGE/extracted"
+BUNDLE_DIR="$STAGE/extracted/proxyscene_bundle_linux_${ARCH}"
+sudo bash -c 'cd -- "$1" && exec ./install.sh --offline' bash "$BUNDLE_DIR"
 ```
 
-安装时导入一个节点链接：
+bundle 内含 `install.sh`、管理程序、固定版本 Xray、项目及第三方许可证、Xray 对应
+源码说明和 `bundle-manifest.sha256`。安装器会在复制前复核 manifest；同目录存在二进制不会让普通联机安装自动切换到离线模式。完整的 Xray 及其链接模块对应源码另作为同一 Release 的 `xray_source_v26.3.27.tar.gz` 资产发布，并由同一 `checksums.txt` 约束。
+
+### 方式二：固定 Release 联机安装
+
+从同一个明确 tag 下载安装器和 checksum。下载、校验、审阅和执行都使用 root-only staging 中的同一个文件：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.sh | sudo bash -s -- 'vless://...'
+VERSION='<release-tag>'
+[[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+  || { echo 'VERSION 必须是 vMAJOR.MINOR.PATCH' >&2; exit 2; }
+BASE="https://github.com/longlannet/proxyscene/releases/download/${VERSION}"
+STAGE="/root/proxyscene-bootstrap-${VERSION}"
+sudo install -d -o root -g root -m 0700 "$STAGE"
+sudo curl -q -fsSL --proto '=https' --proto-redir '=https' -o "$STAGE/release.json" \
+  "https://api.github.com/repos/longlannet/proxyscene/releases/tags/${VERSION}"
+sudo curl -q -fL --proto '=https' --proto-redir '=https' \
+  -o "$STAGE/checksums.txt" "${BASE}/checksums.txt"
+sudo curl -q -fL --proto '=https' --proto-redir '=https' \
+  -o "$STAGE/install.sh" "${BASE}/install.sh"
+sudo bash -c '
+  set -euo pipefail
+  cd -- "$1"
+  jq -e --arg tag "$2" \
+    '\''type == "object" and .tag_name == $tag and .immutable == true'\'' release.json
+  awk '\''$2 == "install.sh" {count++; line=$0} END {if (count != 1) exit 1; print line}'\'' \
+    checksums.txt | sha256sum -c -
+' bash "$STAGE" "$VERSION"
+sudo cat -- "$STAGE/install.sh"
+sudo env PROXYSCENE_VERSION="$VERSION" bash "$STAGE/install.sh"
 ```
 
-脚本内置了发布公钥，**默认强制验证 `checksums.txt.minisig` 签名**，并始终校验二进制 SHA256：缺 minisign（脚本会尽力自动安装）**或签名文件下载失败都会中止安装**，需显式 `PROXYSCENE_ALLOW_UNSIGNED=1` 才降级为仅 SHA256（不推荐——不可信镜像可同源篡改 SHA256 与二进制）。显式传入公钥还可固定版本：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/longlannet/proxyscene/main/install.sh \
-  | sudo PROXYSCENE_VERSION=v0.6.1 \
-         PROXYSCENE_MINISIGN_PUBKEY=RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb \
-         bash
-```
-
-> 安全提示：`curl | sudo bash` 适合全新自管 VPS。生产环境建议先下载审阅脚本，或固定 `PROXYSCENE_VERSION=vX.Y.Z`；使用镜像 `PROXYSCENE_BASE_URL` 时只用你信任的 HTTPS 源。
-
-#### 发布签名公钥
-
-本项目 Release 的 `checksums.txt` 与各离线整合包均由以下 minisign 公钥签名：
-
-```text
-RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb
-```
-
-也可手动校验已下载的产物：
-
-```bash
-minisign -Vm checksums.txt -x checksums.txt.minisig \
-  -P RWSwCDZeUKUXxnGQfkQwePkJyg1uKh7LcKXgia4Lto4MeC6lKStdotYb
-sha256sum -c checksums.txt
-```
+从 `v0.8.0` 起，安装器内部也可使用 `latest`；它会先通过 GitHub API 把 `latest` 解析为明确 tag，随后只从该 tag 下载。上面的 bootstrap 仍要求显式版本，便于人工确认目标。自定义管理程序镜像必须设置明确 `PROXYSCENE_VERSION`，并让 `PROXYSCENE_BASE_URL` 直接指向该 tag 的资产目录；镜像只提供管理程序归档，`checksums.txt` 始终来自 `PROXYSCENE_REPO` 对应固定 tag 的 GitHub Release，因此镜像文件必须与该 Release 完全一致。
 
 ### 方式三：从源码安装
 
-进入仓库目录后执行（缺 Go 会自动准备；如想强制源码编译，设 `PROXYSCENE_BUILD_FROM_SOURCE=1`）：
+进入可信源码 checkout 后强制源码编译：
 
 ```bash
-sudo bash ./install.sh
-sudo bash ./install.sh 'vless://...'        # 同时导入节点
 sudo PROXYSCENE_BUILD_FROM_SOURCE=1 bash ./install.sh
 ```
 
-安装完成后，管理程序会安装为：
+安装器默认不导入节点。安装完成后再通过交互输入，避免秘密进入 shell 历史和进程参数：
+
+```bash
+sudo proxyscene install
+```
+
+SHA256 能发现损坏或资产不一致，但不是独立发布者签名：若 GitHub 仓库控制面在 immutable 发布前被攻陷，攻击者可能同时替换文件和 checksum。官方仓库只需在 Settings 启用 immutable releases；发布工作流会在发布后从 API 验证 immutable 状态、Latest、全部资产 digest 和下载字节。高威胁环境还应通过独立可信渠道取得已知 checksum。
+
+默认安装完成后，管理程序会安装为：
 
 ```text
 /usr/local/bin/proxyscene
 ```
 
-因此后续可以在任意目录运行：
+因此后续可以在任意目录运行；如果安装时设置了 `PROXYSCENE_SWITCH_BIN`，则使用对应的自定义绝对路径：
 
 ```bash
 sudo proxyscene
@@ -170,13 +206,13 @@ sudo proxyscene
 导入订阅链接：
 
 ```bash
-sudo proxyscene node import 'https://example.com/subscription'
+sudo proxyscene node import --stdin
 ```
 
 添加单个节点：
 
 ```bash
-sudo proxyscene node add 'vless://...' '我的节点'
+sudo proxyscene node add --stdin '我的节点'
 ```
 
 查看节点：
@@ -213,34 +249,37 @@ sudo proxyscene status
 
 ## 安装脚本说明
 
-`install.sh` 支持三种用法（见上文「快速开始」）：离线整合包安装（默认推荐）、联机一行安装（下载预编译二进制）、源码目录安装。下面以联机安装为例说明各步骤；离线安装会跳过其中的下载与编译。
+`install.sh` 支持三种用法（见上文「快速开始」）：显式离线 bundle、固定 Release 联机安装、可信源码目录编译。下面以联机安装为例说明各步骤；离线安装会跳过下载与编译。
 
 脚本会执行以下步骤：
 
-1. 检查 root 权限。
-2. 安装基础依赖：curl、ca-certificates、tar、unzip。
-3. 安装 Xray 到核心目录。
-4. 安装管理程序 `proxyscene` 到 `/usr/local/bin/`：
-   - 默认下载对应架构的预编译二进制（`proxyscene_linux_<arch>.tar.gz`），用 `checksums.txt` 校验 SHA256；脚本内置发布公钥并默认验签，缺 minisign 或签名文件都会中止（`PROXYSCENE_ALLOW_UNSIGNED=1` 可显式降级为仅 SHA256）。目标机无需 Go。
-   - 下载失败，或设置 `PROXYSCENE_BUILD_FROM_SOURCE=1` 时，检查/准备 Go 并从本仓库源码编译 `cmd/proxyscene`（仅在源码目录可行）。
-5. 调用 `proxyscene install` 初始化状态目录和 systemd 服务。
+1. 在任何文件创建前固定 `umask 077`，检查 root、布尔/路径/URL 参数，并取得 `/run/proxyscene-install.lock`；进入文件事务前再取得 `/run/proxyscene-host-ownership.lock`。已有 CoreDir 时安装器继续取得 `.state.lock`，并把三把已持有的 flock FD 交给新管理程序校验、复用；fresh CoreDir 不会被安装器提前放入锁文件，而是交接 install/host 两把外层锁，由 manager 在验证新目录 marker 后创建并取得 state lock。整个过程保持 `install -> host -> state` 顺序，直到初始化完成才逆序释放，因此旧版（只认识 state lock）和新版命令都不能插入文件替换与初始化之间。
+2. 安装缺少的基础依赖：curl、ca-certificates、tar、unzip、coreutils、jq。
+3. 从固定版本下载 Xray，用仓库内按架构固定的 SHA256 校验，再暂存到核心目录。
+4. 安装管理程序 `proxyscene` 到 `PROXYSCENE_SWITCH_BIN`（默认 `/usr/local/bin/proxyscene`）：
+   - 默认先通过 GitHub REST 元数据确认 tag 精确匹配且 `immutable=true`，再下载对应架构的预编译归档（`proxyscene_linux_<arch>.tar.gz`）。归档可来自自定义镜像，但 SHA256 必须取自同一明确 tag 的 GitHub Release `checksums.txt`。目标机无需 Go。
+   - 联机 Release 下载、元数据或 checksum 校验失败时立即终止，不会隐式改变信任来源。源码编译只在显式设置 `PROXYSCENE_BUILD_FROM_SOURCE=1` 时启用，并且只允许从当前 `install.sh` 所在、含 `go.mod` 的可信 checkout 编译。
+5. 调用 `proxyscene install --skip-node` 初始化状态目录和 systemd 服务。
 
-> 离线安装（见上文「方式一」）：在解压后的整合包目录里运行包内的 `install.sh`，脚本检测到同目录的二进制即跳过第 2-4 步的下载与编译，直接安装包内的管理程序与 Xray，再做第 5 步初始化。
+> 离线安装（见上文「方式一」）只在显式给出 `--offline` 时启用。安装器会先校验完整内部 manifest 和所有 ELF 架构，再进行文件替换；同目录存在二进制不会触发自动离线模式。
 > 运行 `proxyscene version` 可查看已安装的版本与 commit（预编译二进制会在构建时注入 git tag 与 commit）。
+
+安装器对本次管理程序、Xray、许可证、源码说明和版本标记文件的替换保留逐文件备份；下载、校验或文件替换失败时会尝试恢复。文件全部就绪后，安装器先提交这些依赖，再调用管理程序初始化：若初始化在写入用户、systemd unit、状态或配置后失败，已验证文件会保留，避免 unit 指向被回滚或不存在的二进制，并提示修复原因后执行 `sudo proxyscene install --skip-node` 重试。软件包管理器和管理程序内部副作用不属于文件事务。下载、备份、模块缓存、构建缓存和 GOPATH 位于 root-only 的 `/run/proxyscene-install-tmp/transaction.*`，提交或回滚时删除；因为 `/run` 通常挂载为 `noexec`，源码编译临时下载的可执行 Go 工具链会放在已验证 CoreDir 内的隐藏临时目录，并在提交或回滚时删除。安装器不会替换 `/usr/local/go`，固定的空事务根目录会保留供后续安装复用。
 
 ### 安装脚本是否交互式
 
 默认不交互。
 
 - `sudo bash ./install.sh`：非交互安装，不导入节点。
-- `sudo bash ./install.sh '节点链接'`：非交互安装，并导入这个节点。
 - `sudo proxyscene install`：交互式初始化，会提示输入一个节点链接，可以留空跳过。
 - `sudo proxyscene install --skip-node`：非交互初始化，不录入节点。
+
+安装器拒绝所有位置参数，不支持在安装命令中直接携带节点 URL。
 
 订阅链接不在 `install` 中录入，订阅应通过节点管理导入：
 
 ```bash
-sudo proxyscene node import '订阅链接'
+sudo proxyscene node import --stdin
 ```
 
 ## 常用命令
@@ -268,7 +307,6 @@ sudo proxyscene
 ```bash
 sudo proxyscene install
 sudo proxyscene install --skip-node
-sudo proxyscene install '节点链接'
 ```
 
 ### 状态查看
@@ -313,13 +351,13 @@ sudo proxyscene node list
 添加节点：
 
 ```bash
-sudo proxyscene node add '节点链接' '备注名'
+sudo proxyscene node add --stdin '备注名'
 ```
 
 导入订阅：
 
 ```bash
-sudo proxyscene node import '订阅链接'
+sudo proxyscene node import --stdin
 ```
 
 节点测速：
@@ -384,6 +422,11 @@ sudo proxyscene global off
 - `/etc/profile.d/proxyscene-global-proxy.sh`
 - `/etc/apt/apt.conf.d/99proxyscene-global-proxy`
 
+首次写入前，程序会把这两个专用路径的原始存在状态、内容、权限和本次托管内容记录到
+`/opt/proxyscene/global-proxy-journal.json`。关闭或卸载只恢复仍与 journal 中托管内容逐字节匹配的文件；
+原文件会按原内容和权限恢复，原本不存在的文件才会删除。没有 journal 时不会按路径或内容猜测并删除文件；
+托管期间被管理员修改的普通文件会作为管理员的新原值保留，并在恢复其它受管文件后释放 ownership。
+
 默认监听地址：
 
 ```text
@@ -413,7 +456,9 @@ sudo proxyscene dev off
 - npm `proxy`
 - npm `https-proxy`
 
-程序会备份原始配置，并记录本程序写入过的开发代理地址；如果开启期间调整了开发代理端口，关闭时也会识别并清理这些已记录的 managed 值，尽量避免误删用户手工配置。
+程序会备份原始配置，并记录本程序写入过的开发代理地址；如果开启期间调整了开发代理端口，关闭时也会识别并清理这些已记录的 managed 值，尽量避免误删用户手工配置。npm 对无路径代理 URL 自动补出的单个尾 `/` 会按同一受管值处理，其他差异仍视为管理员修改。
+
+为保证 Git 配置能精确恢复，目标用户只能存在一个常规文件形式的 global 配置（`~/.gitconfig` 或 `~/.config/git/config`），且其中不能使用 `include`/`includeIf`；双 global 文件、符号链接/特殊文件或 include 拓扑会在任何写入前失败关闭。开启期间已经完成的同键新增值会在关闭时保留，但不要在 `dev on`/`dev off` 命令执行的瞬间由另一个进程同时修改这两个 Git 代理键；Git 的单条写入有文件锁，外部进程之间没有跨命令事务。
 
 默认监听地址：
 
@@ -421,12 +466,14 @@ sudo proxyscene dev off
 HTTP: 127.0.0.1:7891
 ```
 
-目标用户选择规则：
+首次开启开发代理时的目标用户选择规则：
 
 1. 优先使用环境变量 `PROXYSCENE_DEV_TARGET_USER`。
 2. 其次使用 `sudo` 调用时的原始用户。
 3. 再使用当前进程用户。
 4. 最后回退到 `root`。
+
+解析出的实际用户会随运行配置写入状态文件，后续关闭和开机恢复会继续使用该用户；不需要重复传入环境变量。显式传入新的有效值并成功执行管理命令后，会迁移到新用户并更新持久化配置。
 
 示例：
 
@@ -444,11 +491,38 @@ sudo proxyscene tg on
 sudo proxyscene tg off
 ```
 
-开启后会写入：
+Hermes 和 OpenClaw 使用不同的接管机制：
 
-- `/etc/openclaw-hermes-tg-proxy.env`
-- `/etc/systemd/system/<service>.service.d/10-openclaw-hermes-telegram-proxy.conf`
-- `<用户家目录>/.config/systemd/user/<service>.service.d/10-openclaw-hermes-telegram-proxy.conf`
+- Hermes 只消费 Telegram 专用的 `TELEGRAM_PROXY`。系统级和用户级目标都把该变量直接写进各自的
+  `90-proxyscene-telegram-proxy.conf` systemd drop-in，不使用跨服务共享的环境文件。
+  每个目标在写入前先进入 `/opt/proxyscene/telegram-proxy-journal.json` 及其备份；journal 按
+  prepared/active/restoring 阶段记录精确托管内容，reload/restart 成功后才提交或释放 ownership。
+  程序不会注入 `HTTP_PROXY`、`ALL_PROXY` 等会改变服务全部出网的通用变量。Hermes `v0.19.0`
+  会让匹配 Telegram API 或运行时 DoH 回退 IP 的 `NO_PROXY`/`no_proxy` 覆盖 `TELEGRAM_PROXY`；因此程序会在
+  写入前检查 unit、systemd manager 最终环境和 `ExecStart`，发现 `api.telegram.org`、`*` 或可能匹配回退地址的
+  公网 IPv4/CIDR 绕过项时拒绝接管。无法证明内容的有效 `EnvironmentFile`，以及可改变代码加载的
+  `PYTHONHOME`、`PYTHONPATH`、`LD_PRELOAD`、`LD_LIBRARY_PATH`、`LD_AUDIT` 也会失败关闭。
+  程序还会把 `HERMES_HOME`、`active_profile` 和 gateway 的 `PROJECT_ROOT` 绑定到服务用户的持久身份，并检查
+  profile `.env`/`.op.env`、项目 `.env` 与 `/etc/hermes/.env`；其中声明 `TELEGRAM_PROXY`、`NO_PROXY`、
+  `no_proxy`、`TELEGRAM_FALLBACK_IPS`、`HERMES_HOME`、`HERMES_MANAGED_DIR` 或
+  `HERMES_S6_SUPERVISED_CHILD` 或上述代码加载变量时拒绝自动接管。dotenv 按 Hermes 实际支持的 UTF-8/带 BOM
+  UTF-16 解析；UTF-32、无 BOM NUL 编码、非法 UTF-8/latin1 fallback 以及可被 Hermes 修复器从同一行拆出的
+  粘连路由变量一律失败关闭。
+  用户 profile 与 `/etc/hermes/config.yaml` 的顶层标量会被 Hermes 桥接为进程环境；其中声明上述任一
+  路由变量时同样拒绝。托管配置必须是 root-owned、不可由组/其他用户写入的普通文件，且路径不能经过符号链接。
+  `config.yaml` 中启用的外部 secret source 也必须可证明不会在启动后注入这些路由变量，否则同样拒绝。
+- 用户级 OpenClaw gateway 不消费 `TELEGRAM_PROXY`。程序直接托管
+  `<用户家目录>/.openclaw/openclaw.json` 的 `channels.telegram.proxy`，不为它写 env drop-in。
+  修改前会在 `/opt/proxyscene/openclaw-proxy-journal.json` 及其备份中持久化原值、原容器结构和共享目标；
+  journal 按 prepared/active/restoring 阶段记录所有权，只有配置写入及相关服务重启都成功后才提交或删除记录。
+  自动接管仅限有效 unit 明确使用目标用户 `HOME`，且每条最终 `ExecStart` 都是绝对 `node`/`nodejs` 直接调用
+  绝对 `.../openclaw/dist/index.js gateway` 的情况；shell、`env`、`chroot` 等 wrapper 不会被接管。任何非默认配置选择器、
+  `--profile`/`--dev`、有效 `EnvironmentFile`、默认 `.env`/`gateway.env` 中的路径选择器、配置里的
+  `$include`/运行时 env 选择器，以及 `NODE_OPTIONS`、`NODE_PATH` 或动态链接器注入变量，都会使程序失败关闭。若任一 Telegram 账号定义了账号级 `proxy`，也会拒绝接管，
+  因为 OpenClaw 的账号合并语义会让它覆盖顶层 `channels.telegram.proxy`。canonical 配置缺失但任一
+  `~/.openclaw/clawdbot.json` 或 `~/.clawdbot/*.json` legacy 候选生效时也会拒绝；journal 不跨路径托管。
+- 系统级 OpenClaw 无法可靠映射到配置所属用户，因此只告警并跳过配置接管，需由管理员手动设置
+  `channels.telegram.proxy`。
 
 默认监听地址：
 
@@ -463,30 +537,43 @@ SOCKS : 127.0.0.1:7893
 hermes-gateway user:root:hermes-gateway
 ```
 
-同时，程序会自动发现系统级和用户级 OpenClaw/Hermes 相关服务：
+同时，程序会按 systemd 的有效单元语义自动发现系统级和每个本地用户的用户级网关：
 
-- 系统级目录：`/etc/systemd/system`、`/lib/systemd/system`、`/usr/lib/systemd/system`。
-- 用户级目录：所有本地用户的 `.config/systemd/user`、`.local/share/systemd/user`。
-- 匹配关键词：`openclaw`、`hermes`。
-- 自动发现会跳过符号链接，限制读取单个 unit 文件的内容大小，并优先按服务名以及有限的 systemd 字段匹配，降低误匹配和读取异常风险。
+- 按 systemd 搜索优先级选择同名单元，尊重高优先级覆盖、mask、alias、runtime/generator 单元和 drop-in；解析
+  `Environment`、`UnsetEnvironment` 与 `ExecStart=` reset 后的最终结果，而不是按文件名或文本子串猜测。
+- 运行时校验拒绝有效 systemd specifier、`ExecStart` 的 `$` 展开、启动前后钩子、`PAMName`、`DynamicUser`，以及会让服务看到
+  不同文件树的 `RootDirectory`/`RootImage`、bind/image/extension/tmpfs/inaccessible namespace 和 `ProtectHome` 设置。
+- OpenClaw 必须最终同时包含 `OPENCLAW_SERVICE_MARKER=openclaw` 和
+  `OPENCLAW_SERVICE_KIND=gateway`；因此 node、guard 等角色不会误命中。
+- Hermes 必须由 argv[0] 直接执行 `hermes_cli`/`hermes-agent gateway run`，或由明确的 Python 解释器直接执行
+  `-m hermes_cli[.main] gateway run`；`env`、`chroot` 或其它 wrapper 不会被误认。
+  精确的 `hermes-gateway.service` 另由默认目标锚定，不依赖名称泛匹配。
+- 系统级 user-unit 目录中的单元因无法确定作用用户，只提示并跳过；需要时用
+  `user:用户名:服务名` 显式指定。单个 unit 和合并后的有效内容都有大小上限。
 
 目标服务支持两种写法：
 
-- 系统级 systemd 服务：`openclaw`、`hermes`、`hermes-gateway`。
-- 用户级 systemd 服务：`user:用户名:服务名`，例如 `user:root:hermes-gateway`。
+- 系统级 systemd 服务：`hermes-gateway` 或实际消费 `TELEGRAM_PROXY` 的自定义服务名。
+- 用户级 systemd 服务：`user:用户名:服务名`，例如 `user:alice:hermes-gateway-coder`。
 
-最终注入目标会由“默认目标 + 自动发现目标 + `PROXYSCENE_TG_SERVICES` 手动目标”合并去重得到。实际注入过的目标会记录在状态文件中，关闭或卸载时会按记录清理，避免自动发现规则变化导致残留。
+最终目标由“配置的锚定目标 + 自动发现目标”合并去重得到。设置 `PROXYSCENE_TG_SERVICES` 会替换默认锚定列表，
+但不会关闭精确自动发现。新接管的 Hermes 和 OpenClaw 目标分别记录在独立的持久化 ownership journal 中；
+`state.json` 的 `telegram_targets` 只保留用于旧版本 drop-in 的保守迁移。关闭、卸载或崩溃后重试不依赖当前发现结果。
 
-可以通过 `PROXYSCENE_TG_SERVICES` 追加或覆盖特定目标：
+可以通过 `PROXYSCENE_TG_SERVICES` 替换默认锚定目标：
 
 ```bash
-sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscene tg on
-sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscene tg off
+sudo PROXYSCENE_TG_SERVICES='user:alice:hermes-gateway-coder' proxyscene tg on
+sudo PROXYSCENE_TG_SERVICES='user:alice:hermes-gateway-coder' proxyscene tg off
 ```
 
-关闭 Telegram 服务代理时，程序会删除对应环境文件和 systemd drop-in，并对目标服务执行 try-restart，让已运行进程尽快卸载代理环境。
+关闭 Telegram 服务代理时，程序只删除内容仍与 Hermes journal 匹配的 direct drop-in；对 OpenClaw 则恢复 journal 中记录的精确原值
+（包括 absent、null 或字符串）和原容器结构。相关服务 `try-restart` 成功后才释放 ownership；若配置在托管期间被用户
+改动，会保留用户的新值；ownership 只在相关服务成功重载该值后释放。清理以 journal 和严格的旧版迁移证据为准，不要求关闭时
+重复开启时的 `PROXYSCENE_TG_SERVICES`。
 
-如果开启时自定义了 `PROXYSCENE_TG_SERVICES`，关闭或卸载时建议使用同样的变量，确保清理相同服务的 systemd drop-in。
+每次 `tg on` 和 `boot-restore` 都会依据 Hermes journal 协调目标。prepared/restoring 阶段会重放未完成的
+`daemon-reload` 与 `try-restart`；active 且字节未变化时不做无意义重启。若 reload/restart 失败，journal 保留待重试状态。
 
 ## 配置环境变量
 
@@ -494,26 +581,21 @@ sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscen
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PROXYSCENE_VERSION` | `latest` | 要下载的预编译管理程序版本，例如 `v0.6.1`。 |
-| `PROXYSCENE_REPO` | `longlannet/proxyscene` | 预编译二进制所在的 GitHub 仓库 `owner/name`。 |
-| `PROXYSCENE_BASE_URL` | 空 | 自定义预编译下载基址（必须 `https`），优先级高于 `PROXYSCENE_VERSION`/仓库默认地址。 |
-| `PROXYSCENE_MINISIGN_PUBKEY` | 内置发布公钥 | 默认用内置公钥验签，且**默认 fail-closed**：缺 minisign（会尽力自动安装）、签名文件下载失败或验签失败都会中止，仅 `PROXYSCENE_ALLOW_UNSIGNED=1` 可显式降级为仅 SHA256。显式设置本变量后连 `PROXYSCENE_ALLOW_UNSIGNED` 也不再放行。 |
-| `PROXYSCENE_BUILD_FROM_SOURCE` | `0` | 设为 `1` 时跳过预编译下载，强制本地源码编译（需要 Go）。 |
-| `--offline`（命令行选项） | — | 强制走离线本地安装，要求在解压后的整合包目录内运行（同目录有 `proxyscene`/`xray`）；通常无需显式指定，脚本会自动检测。 |
-| `GO_VERSION` | `1.22.12` | 源码编译时准备的 Go 版本（仅回退编译时用到）。 |
-| `GO_TARBALL_SHA256` | 空 | Go 安装包 SHA256。留空时安装脚本会从 go.dev 官方 `.sha256` 文件获取并校验。 |
-| `GO_INSTALL_DIR` | `/usr/local` | Go 安装父目录。 |
-| `SKIP_GO_INSTALL` | `0` | 设为 `1` 时不安装 Go，要求系统已有 `go` 命令。 |
-| `FORCE_GO_INSTALL` | `0` | 设为 `1` 时强制重新准备指定 Go 版本。 |
+| `PROXYSCENE_VERSION` | 源码副本为 `latest`；Release 资产固定为自身 tag | 目标 immutable Release。显式版本必须是安全的 `v...` tag。 |
+| `PROXYSCENE_REPO` | `longlannet/proxyscene` | 提供 Release 元数据和 `checksums.txt` 的 GitHub 仓库 `owner/name`。 |
+| `PROXYSCENE_BASE_URL` | 空 | 自定义管理程序归档基址（必须是明确 tag 的 HTTPS 目录）。它不会改变 checksum 来源；归档必须与 GitHub Release 完全一致。 |
+| `PROXYSCENE_BUILD_FROM_SOURCE` | `0` | 设为 `1` 时完全跳过 Release 路径，只从当前可信源码 checkout 编译；不会自动启用。 |
+| `--offline`（命令行选项） | - | 显式启用离线 bundle；不会因同目录出现二进制而自动启用。要求 root 拥有且组/其他用户不可写的解压路径和完整 manifest。 |
+| `GO_VERSION` | `1.26.5` | 显式源码编译所需 Go 版本下限。改为其他版本时必须同时显式设置 `GO_TARBALL_SHA256`，否则 fail closed。 |
+| `GO_TARBALL_SHA256` | 空 | Go 安装包 SHA256。默认 Go 1.26.5 留空时使用仓库内审阅的 linux/386、amd64、arm64、armv6l 固定 SHA256 和精确大小；Go 官方不提供可依赖的逐归档 `.sha256` URL。 |
+| `SKIP_GO_INSTALL` | `0` | 设为 `1` 时只使用 PATH 中已有且版本合格的 Go。 |
+| `FORCE_GO_INSTALL` | `0` | 设为 `1` 时强制在 CoreDir 的 root-only 隐藏临时目录准备指定 Go；提交或回滚时删除，不会替换系统 Go。 |
 | `PROXYSCENE_MANAGER_DIR` | `/opt/proxyscene` | 管理器核心目录；必须位于 `/opt`、`/var/lib` 或 `/var/opt` 下的专用目录，不能指向系统目录或用户家目录。 |
-| `PROXYSCENE_SWITCH_BIN` | `/usr/local/bin/proxyscene` | 管理程序安装路径。 |
-| `XRAY_DOWNLOAD_SOURCE` | `official` | Xray 预设下载源；可选 `official`（官方 GitHub Release）或 `xxv`（`xxv.cc` 镜像）。 |
-| `XRAY_GITHUB_RELEASE_BASE` | `https://github.com/XTLS/Xray-core/releases/download/v26.3.27` | 官方 Xray 发布下载基础地址（默认固定版本以保证可复现）。 |
-| `XRAY_XXV_ZIP_URL` | `https://xxv.cc/7c9fxLN4nm4BFU8fjD.zip` | `xxv.cc` Xray zip 镜像地址。 |
-| `XRAY_XXV_ZIP_SHA256` | 内置 | `xxv` 镜像 zip 的 SHA256；脚本已内置固定值，默认即校验（镜像与官方 amd64 zip 字节一致）。 |
-| `XRAY_ZIP_URL` | 空 | 自定义 Xray zip 下载地址；非空时优先级高于 `XRAY_DOWNLOAD_SOURCE`。使用自定义地址时必须设置 `XRAY_ZIP_SHA256`（否则 fail-closed 拒绝安装）。 |
-| `XRAY_ZIP_SHA256` | 空 | Xray zip 的 SHA256；非空时安装脚本会校验。官方源自动拉取 `.dgst` 校验、`xxv` 源用内置 `XRAY_XXV_ZIP_SHA256`，二者均无需设置；仅自定义 `XRAY_ZIP_URL` 必须显式设置。 |
-| `SKIP_XRAY_INSTALL` | `0` | 设为 `1` 时跳过 Xray 安装，要求核心目录已有可执行 `xray`。 |
+| `PROXYSCENE_SWITCH_BIN` | `/usr/local/bin/proxyscene` | 管理程序绝对安装路径；父目录必须可信，basename 必须是 `proxyscene`。 |
+| `XRAY_RELEASE_BASE` | 固定 Xray v26.3.27 GitHub Release | 当前固定版本的 HTTPS 归档基址。自定义基址仍必须提供与仓库内置架构 SHA256 一致的字节。 |
+| `XRAY_ZIP_URL` | 空 | 自定义当前架构 Xray zip HTTPS URL；必须同时设置 `XRAY_ZIP_SHA256`。 |
+| `XRAY_ZIP_SHA256` | 空 | 自定义 Xray zip 的明确 SHA256；格式或内容不匹配即终止。 |
+| `SKIP_XRAY_INSTALL` | `0` | 设为 `1` 时仅保留现有 root 所有、组/其他用户不可写、非符号链接且架构匹配的 ELF。 |
 | `SKIP_MANAGER_INIT` | `0` | 设为 `1` 时只安装依赖和程序，不调用管理器初始化。 |
 
 示例：
@@ -522,11 +604,15 @@ sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscen
 sudo SKIP_GO_INSTALL=1 bash ./install.sh
 sudo PROXYSCENE_MANAGER_DIR=/opt/proxyscene bash ./install.sh
 sudo SKIP_MANAGER_INIT=1 bash ./install.sh
-sudo XRAY_DOWNLOAD_SOURCE=official bash ./install.sh
-sudo XRAY_DOWNLOAD_SOURCE=xxv bash ./install.sh
+sudo PROXYSCENE_VERSION=v1.0.0 \
+  PROXYSCENE_BASE_URL=https://mirror.example/proxyscene/v1.0.0 \
+  bash ./install.sh
+sudo XRAY_RELEASE_BASE=https://mirror.example/xray/v26.3.27 bash ./install.sh
 ```
 
-安装脚本会校验 Go 安装包 SHA256，并会拒绝把核心目录设置为 `/etc`、`/usr`、`/home`、`/root`、`/tmp` 等敏感系统路径。对于已经存在的核心目录，安装脚本不会再无条件修改目录权限；只有新建核心目录时才设置为 `0700`。Xray 默认从官方 GitHub Release 的**固定版本**下载（可复现），并自动拉取同目录的官方 `.dgst` 校验 SHA256；`xxv.cc` 镜像（`XRAY_DOWNLOAD_SOURCE=xxv`）用脚本内置的固定 SHA256 校验，默认即可验证。只有使用自定义 `XRAY_ZIP_URL` 时官方校验不可用，**必须**显式设置 `XRAY_ZIP_SHA256`，否则脚本 fail-closed 拒绝安装（除非 `ALLOW_UNVERIFIED_XRAY=1`）。
+安装脚本会拒绝把核心目录设置为 `/etc`、`/usr`、`/home`、`/root`、`/tmp` 等敏感系统路径。入口和每个锁创建函数都会重申 `umask 077`，新目录还使用显式 `mkdir -m 0700`，因此即使调用者原先使用宽松 umask，也不会出现可由普通用户抢先写入的新目录或锁文件窗口。已有非空目录必须带可识别的 `.managed-by-proxyscene` 标记，且所有已有路径祖先必须属于 root、不可由组或其他用户写入、不能是符号链接。安装器把 `installation-ownership.json` 与已验证的管理程序放在同一文件事务中提交或回滚，即使显式 `SKIP_MANAGER_INIT=1` 也会绑定核心目录、管理程序路径和两个 systemd unit locator；后续状态读写、安装和卸载必须与该记录一致。若固定的 `/etc/proxyscene-host-ownership.json` 已存在，安装器会在任何目标文件替换前要求它是 root 所有、`0600`、非符号链接、只有一个严格 JSON 值，并与这四个 locator 精确匹配；损坏或冲突一律 fail closed。
+
+已存在的管理程序只在 ownership 可证明时才可替换：新版安装和自定义路径要求精确匹配四个 locator 的 `installation-ownership.json`；为兼容旧版，历史默认路径 `/usr/local/bin/proxyscene` 还可由核心目录 marker 加上精确匹配该 CoreDir/二进制的旧主 unit 与恢复 unit 共同证明。marker 单独存在不能认领默认二进制，也不能认领任意自定义路径。两个 unit 名称必须位于 `proxyscene`、`proxyscene-*` 或 `proxyscene@*` 命名空间，已有 unit 还必须含 proxyscene ownership marker。Xray 默认从官方固定版本下载，并直接使用仓库审阅过的四架构 SHA256，不信任下载归档旁边的 checksum。源码编译的下载、备份和缓存位于固定 `/run` 事务目录；可执行 Go 工具链单独位于 CoreDir 隐藏临时目录，以兼容 `noexec` 的 `/run`，两者结束时都会删除。
 
 ### 运行期变量
 
@@ -545,17 +631,20 @@ sudo XRAY_DOWNLOAD_SOURCE=xxv bash ./install.sh
 | `PROXYSCENE_GLOBAL_SOCKS_PORT` | `7894` | 全局 SOCKS 代理端口。 |
 | `PROXYSCENE_DEV_TARGET_USER` | 空 | 开发代理要修改 git/npm 配置的目标用户。 |
 | `PROXYSCENE_TG_SERVICES` | `hermes-gateway user:root:hermes-gateway` | Telegram 代理的手动 systemd 目标服务列表（默认锚定系统级 hermes 网关和 root 用户级 hermes 网关，目标不存在时跳过）；程序还会自动发现 OpenClaw/Hermes 的系统级和用户级网关，用户级服务使用 `user:用户名:服务名`。 |
+| `PROXYSCENE_MANAGE_OPENCLAW_CONFIG` | `1` | 设为 `0` 时不接管用户级 OpenClaw 的 `channels.telegram.proxy`；Hermes 注入不受影响。 |
 | `PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION` | `0` | 默认拒绝明文 HTTP 订阅；确需导入 HTTP 订阅时设为 `1`，程序会打印风险警告。 |
 | `PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION` | `0` | 默认拒绝订阅链接解析到环回/私网/链路本地/CGNAT 等非公网地址（含重定向跳转），以防 SSRF；订阅托管在内网时设为 `1`。 |
 | `PROXYSCENE_ALLOW_PUBLIC_BIND` | `0` | 代理监听地址默认只允许环回。本地 HTTP/SOCKS 入站无认证，绑定 `0.0.0.0` 或公网 IP 会形成开放代理；确需对外监听时设为 `1`。 |
 | `PROXYSCENE_TEST_URL` | `https://www.google.com/generate_204` | `proxyscene test` 通过全局代理测试连通性时请求的地址；必须是 http(s) URL，可改为在你的网络环境下更可达的目标。 |
+
+监听地址、端口、Xray 服务用户、开发目标用户、Telegram 目标、OpenClaw 接管开关和公开监听开关会在成功的管理操作中写入 `state.json`。后续普通命令会先读取这些值，再应用本次显式提供且有效的环境覆盖；`boot-restore` 和卸载只使用已提交的持久化值。定位目录/二进制/unit 名称仍由 restore unit 保存，订阅安全开关和测试 URL 不持久化。
 
 示例：
 
 ```bash
 sudo PROXYSCENE_GLOBAL_HTTP_PORT=7898 proxyscene global on
 sudo PROXYSCENE_DEV_TARGET_USER=alice proxyscene dev on
-sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscene tg on
+sudo PROXYSCENE_TG_SERVICES='user:alice:hermes-gateway-coder' proxyscene tg on
 ```
 
 ## 数据目录
@@ -571,10 +660,34 @@ sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscen
 | 路径 | 说明 |
 | --- | --- |
 | `/opt/proxyscene/xray` | Xray 可执行文件。 |
+| `/opt/proxyscene/xray-version.txt` | 官方固定源记录版本；自定义归档记录 `custom-sha256:<归档摘要>`；保留现有二进制记录 `existing-sha256:<二进制摘要>`。 |
+| `/opt/proxyscene/LICENSE-Xray` | Xray-core 的 MPL-2.0 许可证。 |
+| `/opt/proxyscene/SOURCE-Xray` | 固定 Xray ELF 的版本、提交和同一 Release 对应源码归档说明。 |
+| `/opt/proxyscene/THIRD_PARTY_LICENSES-Xray` | 固定 Xray ELF 实际链接模块的版本、module sum、许可证和 NOTICE。 |
 | `/opt/proxyscene/config.json` | 生成的 Xray 配置。 |
-| `/opt/proxyscene/state.json` | 节点、场景、订阅、测速状态和电报代理实际注入目标。 |
+| `/opt/proxyscene/state.json` | 节点、场景、订阅、测速状态、运行配置和旧版 Telegram 目标迁移证据。 |
 | `/opt/proxyscene/.state.lock` | 状态文件锁。 |
+| `/opt/proxyscene/installation-ownership.json` | 绑定核心目录、管理程序和两个 systemd unit locator 的安装 ownership。 |
 | `/opt/proxyscene/dev-proxy-backup.json` | 开发代理 git/npm 配置备份。 |
+| `/opt/proxyscene/global-proxy-journal.json` | 两个全局代理系统文件的原值、属主、权限及 managed 内容；另有 `.bak` 和 `.lock`。 |
+| `/opt/proxyscene/telegram-proxy-journal.json` | Hermes direct drop-in 的 root-only ownership journal；另有 `.bak` 和 `.lock`。 |
+| `/opt/proxyscene/openclaw-proxy-journal.json` | OpenClaw 配置接管的 root-only ownership journal；另有 `.bak` 和 `.lock`。 |
+| `/etc/proxyscene-host-ownership.json` | 绑定当前唯一可操作主机共享代理资源的 CoreDir、二进制和 unit locator；完整卸载后删除。 |
+| `/run/proxyscene-install.lock` | 安装器和新版状态事务的最外层互斥锁。 |
+| `/run/proxyscene-install-tmp/` | root-only 固定事务根；每次的 `transaction.*` 在提交或回滚时删除，空根目录保留复用。 |
+| `/run/proxyscene-host-ownership.lock` | 主机共享资源 ownership 的互斥锁；安装器通过已持有 FD 与新管理程序无窗口交接。 |
+
+### 升级与用户身份漂移
+
+现行 Dev backup、Hermes journal 和 OpenClaw journal 的用户记录不只保存用户名，还绑定当时的 uid、主 gid 和 home。
+如果账户被删除后以同名重建，或主 gid/home 发生变化，相关开启、关闭、恢复或卸载命令会 fail closed：保留 ownership
+记录，不读写新 home，也不 reload/restart 同名新账户的 user service。不要为了绕过报错直接删除 journal 或 `.bak`；
+这些文件是恢复原配置和证明文件归属的依据，并且可能包含代理凭据。
+
+首选恢复原 uid/gid/home 后重试。若原身份无法恢复，应先停用相关服务，逐项审计旧 home 的 git/npm 配置、Hermes
+drop-in、OpenClaw 配置以及对应 journal/backup，保留 root-only 证据副本，再人工隔离已确认属于旧身份的记录；当前没有
+按用户名自动接管新账户的迁移命令。从 v0.7.1 升级时，如果 Dev 场景仍开启，优先用旧版先关闭再升级。旧 Dev backup
+和旧 user Telegram target 没有稳定 uid/gid/home 身份，升级后会要求人工核验，不能按同名账户自动恢复或清理。
 
 ## systemd 服务
 
@@ -584,6 +697,8 @@ sudo PROXYSCENE_TG_SERVICES='openclaw hermes user:root:hermes-gateway' proxyscen
 | --- | --- |
 | `proxyscene.service` | Xray 主服务。 |
 | `proxyscene-restore.service` | 开机恢复服务，读取保存的场景状态并恢复。 |
+
+开机恢复 Telegram 场景时，Hermes/OpenClaw 只在 ownership journal 尚待协调或托管内容实际变化时重载相关服务。
 
 常用检查命令：
 
@@ -614,33 +729,29 @@ sudo proxyscene uninstall
 5. 执行 `systemctl daemon-reload`。
 6. 汇总并报告关键失败步骤，避免静默假成功。
 
-卸载命令会保留数据目录：
+卸载命令会保留数据目录（下面是 `PROXYSCENE_MANAGER_DIR` 默认值）：
 
 ```text
 /opt/proxyscene
 ```
 
-也会保留管理程序本身：
+也会保留管理程序本身（下面是 `PROXYSCENE_SWITCH_BIN` 默认值）：
 
 ```text
 /usr/local/bin/proxyscene
 ```
 
-这样做是为了避免误删节点、订阅、状态和已安装的 Xray。如果确认要彻底清理，可以在卸载后手动删除：
+这样做是为了避免误删节点、订阅、状态和已安装的 Xray。如果确认要彻底清理，可以在卸载后手动删除实际的 `PROXYSCENE_SWITCH_BIN` 和 `PROXYSCENE_MANAGER_DIR`；默认安装的命令为：
 
 ```bash
 sudo rm -f /usr/local/bin/proxyscene
 sudo rm -rf /opt/proxyscene
-sudo rm -f /etc/profile.d/proxyscene-global-proxy.sh
-sudo rm -f /etc/apt/apt.conf.d/99proxyscene-global-proxy
-sudo rm -f /etc/openclaw-hermes-tg-proxy.env
 ```
 
-如果曾经使用自定义 `PROXYSCENE_TG_SERVICES` 开启 Telegram 服务代理，建议卸载时也带上相同变量：
-
-```bash
-sudo PROXYSCENE_TG_SERVICES='openclaw hermes hermes-gateway user:root:hermes-gateway' proxyscene uninstall
-```
+卸载会同时读取 Global、Hermes、OpenClaw ownership journal 和旧版状态迁移证据清理已接管目标；不需要重新提供开启时的
+`PROXYSCENE_TG_SERVICES`。外部固定路径可能包含已恢复的管理员原文件或无法证明归属的旧文件，不应在“彻底清理”时按路径盲删。
+若卸载报告 ownership 恢复或服务重启失败，不要先删除核心目录中的 journal，修复原因后重试。
+所有会修改主机状态的命令还会校验固定的主机 ownership 记录，防止两个不同 CoreDir 同时对 `/etc` 和同一用户配置做嵌套接管；只有共享资源和 systemd unit 都成功清理后，卸载才会释放它。
 
 ## 手动构建
 
@@ -652,7 +763,23 @@ go mod tidy
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./dist/proxyscene ./cmd/proxyscene
 ```
 
-手动构建只会生成指定输出文件，不会安装依赖、不会安装 Xray、不会写入 systemd 服务。仓库默认忽略根目录构建产物 `proxyscene` 和临时构建文件。
+手动构建只会生成指定输出文件，不会安装依赖、不会安装 Xray、不会写入 systemd 服务。未注入发布元数据的源码构建会报告版本 `dev`；正式 Release 由构建流程注入版本和 commit。仓库默认忽略根目录构建产物 `proxyscene` 和临时构建文件。
+
+## 发布 Release
+
+发布不需要私钥或签名 Secret。首次发布前，仓库管理员必须先在 GitHub Settings 启用 **immutable releases**，并在发起工作流前用具备 Administration 读取权限的账号确认设置仍为 `enabled=true`。GitHub Actions 的 `GITHUB_TOKEN` 没有 Administration 权限，不能可靠读取该仓库设置；工作流会在发布后强制验证 Release 的 `immutable=true`。安装器也会拒绝可变 Release，防止发布后资产和同一份 checksum 被一起替换。
+
+之后从 Actions 页面选择 `Release`、分支选择 `main`，输入 `vMAJOR.MINOR.PATCH`；也可以执行：
+
+```bash
+gh workflow run Release --ref main -f version=v0.8.0
+```
+
+不要预先创建或推送 tag。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 v0.7.1 到新版本的 Debian systemd 安装/升级 canary。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
+
+如果创建 draft、上传资产或发布期间中断，不要直接盲目重跑完整 workflow。先在 GitHub 核对同名 tag、draft/Release 和资产是否存在；确认残留内容及目标 commit 后，人工删除未发布的残留 draft/tag，或仅重跑尚未执行的只读验证。工作流不会自动删除发布对象。
+
+`checksums.txt` 覆盖 `install.sh`、所有管理程序归档、离线 bundle 和固定 Xray 对应源码归档。SHA256 能发现下载损坏和资产不一致，但不是独立发布者签名：若 GitHub 仓库或控制面在 immutable 发布前已被攻陷，攻击者可以同时替换资产和 checksum。高威胁环境应通过独立可信渠道取得已知 checksum。
 
 ## 故障排查
 
@@ -661,14 +788,14 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./dist/proxyscene ./cmd/pro
 先导入 HTTPS 订阅或添加节点：
 
 ```bash
-sudo proxyscene node import 'https://example.com/subscription'
+sudo proxyscene node import --stdin
 sudo proxyscene node list
 ```
 
 默认会拒绝明文 HTTP 订阅。如果必须导入 HTTP 订阅，可以显式开启兼容开关：
 
 ```bash
-sudo PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1 proxyscene node import 'http://example.com/subscription'
+sudo PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1 proxyscene node import --stdin
 ```
 
 ### 开启场景失败
@@ -691,23 +818,34 @@ sudo PROXYSCENE_DEV_TARGET_USER=alice proxyscene dev on
 
 ### 修改端口后不生效
 
-运行期环境变量需要在执行命令时传入。例如：
+用环境变量执行一次会修改状态的管理命令。例如：
 
 ```bash
 sudo PROXYSCENE_GLOBAL_HTTP_PORT=7898 proxyscene global on
 ```
 
-如果需要长期固定自定义端口，建议在自己的运维脚本中统一传入相同环境变量。
+命令成功后端口会写入 `state.json`，普通后续命令和开机恢复都会继续使用该值，不需要重复传入。若命令失败并完成回滚，旧运行配置仍然有效。
 
 ## 当前限制
 
 - 当前全局代理主要通过环境变量和 apt 配置实现，不是完整透明代理。
 - 当前节点解析覆盖常见基础链接，复杂客户端私有参数可能需要后续扩展。
 - 节点测速是节点地址 TCP 连通性测试，不等同于完整代理链路测速。
-- Telegram 服务代理面向 systemd 服务注入环境变量，支持系统级服务和用户级服务，不会自动修改应用自身配置文件。
-- 用户级 systemd 服务的总线未运行时，程序会保留 drop-in 配置并打印警告，服务启动后可重新执行开启命令或手动重启服务。
-- Telegram 服务代理会自动发现 OpenClaw/Hermes 相关系统级和用户级服务；如果服务名和 unit 内容都不包含 `openclaw` 或 `hermes`，需要用 `PROXYSCENE_TG_SERVICES` 手动指定。
-- 开发代理会修改目标用户的 git/npm 配置；关闭时会按备份和本程序写入值进行保守恢复，并支持识别开启期间记录过的多个 managed 代理地址。
+- Hermes 通过 systemd 注入 `TELEGRAM_PROXY`；用户级 OpenClaw 则会修改 `openclaw.json` 的
+  `channels.telegram.proxy`，因此配置文件的键序和缩进可能规范化，但其他 JSON 值会保留。
+- Telegram 接管以“能证明实际运行时会消费所改配置”为前提。Hermes 的 Telegram `NO_PROXY` 绕过、任何有效
+  `EnvironmentFile`、无法绑定的 home/profile/project 或会覆盖路由的应用 `.env`，以及 OpenClaw 的非默认配置
+  路径/profile/dev/include/env 选择器或账号级 `proxy` 都会中止命令；需先由管理员消除冲突，程序不会猜测或只接管部分账号。
+- Hermes 的受管 drop-in 还固定 `PYTHONSAFEPATH=1`，防止 `python -m` 把 `WorkingDirectory` 中的同名模块置于
+  已绑定 venv 之前；重启后会同时核对该值和 `TELEGRAM_PROXY`。unit、manager、dotenv 或 secret source 中冲突的
+  `PYTHONSAFEPATH` 会 fail closed。
+- 用户级 systemd 总线未运行或重启失败时，drop-in/OpenClaw journal 会保留，命令会报告部分失败；总线恢复后应重新执行
+  开启/关闭命令，让 prepared/restoring 操作完成。
+- `boot-restore` 会依据 Hermes/OpenClaw ownership journal 重放未完成的 prepared/restoring 操作；active 且托管内容未变化时不会无意义地 reload/restart 服务。
+- 自动发现只接受最终有效的 OpenClaw gateway marker 或 Hermes gateway `ExecStart`。非标准/不可识别的 Hermes 服务需用
+  `PROXYSCENE_TG_SERVICES` 显式指定；全局 user-unit 需显式绑定用户。发现过程会解析 canonical/alias、mask、模板实例和
+  target-name 对应 drop-in 的有效配置；无法映射到具体用户或无法识别最终启动命令的单元仍需人工指定。
+- 开发代理会修改目标用户的 git/npm 配置；关闭时会按备份和本程序写入值进行保守恢复，并支持识别开启期间记录过的多个 managed 代理地址。为避免跨文件或 include 顺序造成不可逆覆盖，双 Git global 文件、非常规配置文件及 `include`/`includeIf` 会失败关闭。
 
 ## 开发验证
 
@@ -715,9 +853,15 @@ sudo PROXYSCENE_GLOBAL_HTTP_PORT=7898 proxyscene global on
 cd /opt/proxyscene/proxyscene
 gofmt -w ./cmd ./internal
 go test ./...
+go test -race ./...
 go vet ./...
-bash -n ./install.sh
+go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+bash -n ./install.sh ./scripts/*.sh
+shellcheck ./install.sh ./scripts/*.sh
+bash ./scripts/install-test.sh
 ```
+
+`scripts/verify-release-artifacts.sh` 读取 `DIST`、`VERSION`、`COMMIT` 和 `SOURCE_DATE_EPOCH`，可校验指定架构或默认四架构的完整 Release 产物。每个 Release 还包含架构无关的 `xray_source_v26.3.27.tar.gz`：它保存精确 Xray commit 及 ELF 中全部 34 个模块的 Go proxy source zip、go.mod、info、module sum 和独立 SHA256；verifier 会把该清单与 bundle 内实际 Xray ELF 逐项比较。`scripts/systemd-integration-test.sh` 会启动 systemd PID 1 的一次性 Debian 容器并执行真实安装/升级/卸载，只能显式设置 `PROXYSCENE_CONTAINER_TEST=1` 后传入当前 amd64 bundle 和 v0.7.1 amd64 bundle；普通 CI 只检查它的语法和 ShellCheck，不在 runner 或宿主机执行安装，正式 Release 的只读 build job 则把它作为发布前强制门禁。测试按精确容器名和本轮唯一 label 清理容器；固定 Debian 镜像引用只有在运行前不存在、可证明是本轮新拉取时才尝试删除。
 
 ## 安全与敏感信息
 
@@ -725,11 +869,15 @@ bash -n ./install.sh
 
 - 真实 VLESS、VMess、Trojan、Shadowsocks 节点链接。
 - 订阅链接。
-- 运行期生成的 `state.json`、`config.json`、`dev-proxy-backup.json`。
+- 运行期生成的 `state.json`、`config.json`、`dev-proxy-backup.json`、所有 `*-proxy-journal.json` 及其备份。
 - Telegram Bot Token、访问令牌、私钥或其他服务凭据。
 
 运行期状态和构建产物已经在 `.gitignore` 中默认忽略。安全问题报告方式见 `SECURITY.md`。
 
 ## 许可证
 
-本项目使用 MIT License，详见 `LICENSE`。
+本项目使用 MIT License，详见 `LICENSE`。manager 依赖的许可证与上游 NOTICE 见
+`THIRD_PARTY_LICENSES`；离线 bundle 中 Xray-core 自身的 MPL-2.0 文本为
+`LICENSE-Xray`，其实际链接 Go 模块的固定版本、module sum 与许可证见
+`THIRD_PARTY_LICENSES-Xray`。构建会从 Xray ELF 重新生成该文件并逐字节核对；依赖漂移时
+发布会失败。本程序的生成配置不使用 `geoip.dat` / `geosite.dat`，因此不安装或再分发它们。

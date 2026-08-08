@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
@@ -29,17 +31,24 @@ jobs:
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
+      - name: Static analysis
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: Shell syntax
         run: |
-          bash -n install.sh
-          bash -n scripts/build-bundle.sh
+          bash -n install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
       - name: ShellCheck
         run: |
-          if ! command -v shellcheck >/dev/null 2>&1; then
+          if ! command -v shellcheck >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install -y shellcheck
+            sudo apt-get install -y shellcheck jq
           fi
-          shellcheck install.sh scripts/build-bundle.sh
+          shellcheck install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
+      - name: Installer pure-function tests
+        run: bash scripts/install-test.sh
+      - name: Workflow validation
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
 
   build-dry-run:
     name: Release build (dry run)
@@ -47,32 +56,46 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           cache: false
-      - name: Install unzip
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip
+          sudo apt-get install -y binutils jq unzip
       - name: Build amd64 bundle (dry run)
-        # 仅构建 amd64，端到端验证发布脚本（含 Xray 下载与 .dgst 校验、打包、checksums）。
+        # 独立构建两次 amd64，端到端验证固定 Xray SHA256、可复现打包与 checksums。
         env:
           VERSION: 0.0.0-dryrun
-        run: scripts/build-bundle.sh amd64
-      - name: Verify artifacts
+          COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
-          test -f dist/proxyscene_linux_amd64.tar.gz
-          test -f dist/proxyscene_bundle_linux_amd64.tar.gz
-          test -f dist/checksums.txt
-          # 校验离线整合包的目录布局齐全。
-          contents="$(tar tzf dist/proxyscene_bundle_linux_amd64.tar.gz)"
-          for f in proxyscene install.sh xray geoip.dat geosite.dat NOTICE LICENSE; do
-            echo "$contents" | grep -qx "proxyscene_bundle_linux_amd64/$f" \
-              || { echo "整合包缺少：$f"; exit 1; }
-          done
-          # checksums.txt 应能在 dist 内通过校验。
-          ( cd dist && sha256sum -c checksums.txt )
+          first="$(mktemp -d "${RUNNER_TEMP}/proxyscene-ci-first.XXXXXX")"
+          second="$(mktemp -d "${RUNNER_TEMP}/proxyscene-ci-second.XXXXXX")"
+          cleanup() {
+            rm -rf -- "$first" "$second"
+          }
+          trap cleanup EXIT
+          DIST="$first" scripts/build-bundle.sh amd64
+          DIST="$second" scripts/build-bundle.sh amd64
+          diff -qr -- "$first" "$second"
+          mv -- "$first" dist
+          rm -rf -- "$second"
+          trap - EXIT
+      - name: Verify artifacts
+        env:
+          VERSION: 0.0.0-dryrun
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          scripts/verify-release-artifacts.sh amd64
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          tar xzf dist/proxyscene_bundle_linux_amd64.tar.gz -C "$verify_dir"
+          PROXYSCENE_TEST_XRAY="$verify_dir/proxyscene_bundle_linux_amd64/xray" \
+            go test ./internal/manager -run '^TestGeneratedTransportConfigsPassPinnedXray$'
           echo "dry-run 产物校验通过"

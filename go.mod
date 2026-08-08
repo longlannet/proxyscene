@@ -1,3 +1,9 @@
 module proxyscene
 
-go 1.22
+go 1.26.5
+
+require (
+	github.com/titanous/json5 v1.0.0
+	golang.org/x/sys v0.47.0
+	gopkg.in/yaml.v3 v3.0.1
+)

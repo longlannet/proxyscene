@@ -1,7 +1,9 @@
 package manager
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -9,10 +11,12 @@ type App struct {
 	cfg Config
 }
 
+type installStoreCommit func(*Store, func(*Store) error, storeRuntimeSyncMode) error
+
 func NewApp(cfg Config) *App { return &App{cfg: cfg} }
 
 func (a *App) Run(args []string) error {
-	if err := a.cfg.Validate(); err != nil {
+	if err := a.cfg.ValidateLocators(); err != nil {
 		return err
 	}
 	if len(args) == 0 {
@@ -50,15 +54,15 @@ func (a *App) Run(args []string) error {
 
 func (a *App) help() {
 	fmt.Println("用法：")
-	fmt.Println("  proxyscene install '节点链接'       初始化/更新管理服务，可同时导入节点")
+	fmt.Println("  proxyscene install                  初始化/更新管理服务，并交互录入节点")
 	fmt.Println("  proxyscene install --skip-node      初始化/更新管理服务，不交互录入节点")
 	fmt.Println("  proxyscene                         打开交互菜单")
 	fmt.Println("  proxyscene global|dev|tg           切换场景开关")
 	fmt.Println("  proxyscene global on|off           显式开启/关闭全局代理")
 	fmt.Println("  proxyscene node                    打开节点管理菜单")
 	fmt.Println("  proxyscene node list               查看节点")
-	fmt.Println("  proxyscene node add '节点链接' '备注'")
-	fmt.Println("  proxyscene node import '订阅链接'")
+	fmt.Println("  proxyscene node add --stdin [备注]  从标准输入读取节点链接")
+	fmt.Println("  proxyscene node import --stdin      从标准输入读取订阅链接")
 	fmt.Println("  proxyscene node rename '节点ID' '新备注'")
 	fmt.Println("  proxyscene node remove '节点ID'      删除节点（别名：delete）")
 	fmt.Println("  proxyscene node test               对所有节点做 TCP 连通性测速")
@@ -143,14 +147,10 @@ func parseInstallArgs(args []string) (raw string, promptNode bool, err error) {
 		case "--skip-node", "--no-node":
 			promptNode = false
 		default:
-			// 拒绝未知的 - 开头选项，避免把拼错的 flag 当成节点链接静默处理。
 			if strings.HasPrefix(arg, "-") {
 				return "", false, fmt.Errorf("未知选项：%s（可用：--skip-node）", arg)
 			}
-			if raw != "" {
-				return "", false, fmt.Errorf("初始化命令只接受一个节点链接参数")
-			}
-			raw = arg
+			return "", false, fmt.Errorf("初始化命令不接受节点链接位置参数（避免凭据出现在进程 argv）；请交互录入，或使用 proxyscene node add --stdin")
 		}
 	}
 	return raw, promptNode, nil
@@ -163,57 +163,62 @@ func (a *App) install(raw string, promptNode bool) error {
 	if raw == "" && promptNode {
 		raw, _ = ask("请输入节点链接（VLESS / VMess / Trojan / Shadowsocks，可留空跳过）: ")
 	}
-	if err := a.ensureCoreDirs(); err != nil {
+	return a.installPrepared(raw)
+}
+
+func (a *App) installPrepared(raw string) error {
+	installerHandoff, err := installerLockHandoffRequested()
+	if err != nil {
 		return err
 	}
-	if err := a.ensureXrayInstalled(); err != nil {
-		return err
-	}
-	return a.withStoreLock(func() error {
-		st, err := a.loadStore()
-		if err != nil {
+	return a.withInstallLock(func() error {
+		if err := a.ensureCoreDirs(); err != nil {
 			return err
 		}
-		if strings.TrimSpace(raw) != "" {
-			if _, err := a.addNode(st, raw, "", "default"); err != nil {
+		return a.withHostAndStoreLocksAfterInstallLock(func() error {
+			if installerHandoff {
+				if err := a.validateInstallationOwnership(); err != nil {
+					return err
+				}
+			} else if err := a.ensureInstallationOwnership(); err != nil {
 				return err
 			}
-			if err := a.saveStore(st); err != nil {
+			st, err := a.loadStore()
+			if err != nil {
 				return err
 			}
-		}
-		if hasEnabledScene(st) {
-			if len(st.Nodes) == 0 {
-				return fmt.Errorf("已有场景处于开启状态，但没有可用节点")
-			}
-			if err := a.writeCheckedXrayConfig(st); err != nil {
+			if err := a.installWithStore(st, raw, a.ensureXrayInstalled, a.installXrayService, a.installRestoreService, a.commitStoreMutation); err != nil {
 				return err
 			}
-		}
-		if err := a.installXrayService(); err != nil {
-			return err
-		}
-		if err := a.installRestoreService(); err != nil {
-			return err
-		}
-		if hasEnabledScene(st) {
-			// applySavedScenes 为尽力而为：单个场景失败不应阻止其余场景的核心服务启动
-			// 与状态持久化，否则一个场景出错会连带导致 Xray 根本不启动。
-			if err := a.applySavedScenes(st); err != nil {
-				fmt.Println("警告：部分场景应用失败，将继续启动核心服务：", err)
-			}
-			if err := a.saveStore(st); err != nil {
-				return err
-			}
-			if err := a.startXrayService(); err != nil {
-				return err
-			}
-		} else {
-			_ = a.stopXrayService()
-		}
-		fmt.Println("管理服务初始化/更新完成")
-		return nil
+			fmt.Println("管理服务初始化/更新完成")
+			return nil
+		})
 	})
+}
+
+func (a *App) installWithStore(st *Store, raw string, ensureXray, installMainUnit, installRestoreUnit func() error, commit installStoreCommit) error {
+	if err := ensureXray(); err != nil {
+		return err
+	}
+	// 先安装 unit，再执行可能停止/重启 Xray 的状态事务。干净系统首次带节点
+	// 初始化时，候选同步因此不会对尚不存在的 unit 执行 stop/show。
+	if err := installMainUnit(); err != nil {
+		return err
+	}
+	if err := installRestoreUnit(); err != nil {
+		return err
+	}
+	mode := storeRuntimeSyncXray
+	if hasEnabledScene(st) || a.runtimeConfigDiffers(st) {
+		mode = storeRuntimeSyncAll
+	}
+	return commit(st, func(candidate *Store) error {
+		if strings.TrimSpace(raw) == "" {
+			return nil
+		}
+		_, err := a.addNode(candidate, raw, "", "default")
+		return err
+	}, mode)
 }
 
 func (a *App) sceneCommand(args []string) error {
@@ -271,69 +276,158 @@ func (a *App) bootRestore() error {
 		return err
 	}
 	return a.withStoreLock(func() error {
-		st, err := a.loadStore()
+		st, err := a.loadStoreForBoot()
 		if err != nil {
 			return err
 		}
-		if !hasEnabledScene(st) {
-			// 尽力而为：即使某个场景的清理失败，也要保存状态并按需停止核心服务。
-			if err := a.applySavedScenes(st); err != nil {
-				fmt.Println("警告：部分场景清理失败：", err)
-			}
-			if err := a.saveStore(st); err != nil {
-				return err
-			}
-			return a.stopXrayIfIdle(st)
-		}
-		if err := a.writeCheckedXrayConfig(st); err != nil {
-			return err
-		}
-		// 尽力而为：单个场景应用失败不应阻止核心服务在开机时启动。
-		if err := a.applySavedScenes(st); err != nil {
-			fmt.Println("警告：部分场景应用失败，将继续启动核心服务：", err)
-		}
-		if err := a.saveStore(st); err != nil {
-			return err
-		}
-		return a.startXrayService()
+		return a.bootRestoreWithStore(st, a.commitStoreMutation)
 	})
+}
+
+func (a *App) bootRestoreWithStore(st *Store, commit installStoreCommit) error {
+	if err := commit(st, func(*Store) error { return nil }, storeRuntimeSyncAll); err != nil {
+		return fmt.Errorf("恢复场景未完全成功：%w", err)
+	}
+	return nil
 }
 
 func (a *App) uninstall() error {
 	if err := requireRoot(); err != nil {
 		return err
 	}
-	var errs []error
-	if err := a.setScene(SceneTelegram, false); err != nil {
-		errs = append(errs, fmt.Errorf("关闭电报服务代理失败：%w", err))
-	}
-	if err := a.setScene(SceneDev, false); err != nil {
-		errs = append(errs, fmt.Errorf("关闭开发代理失败：%w", err))
-	}
-	if err := a.setScene(SceneGlobal, false); err != nil {
-		errs = append(errs, fmt.Errorf("关闭全局代理失败：%w", err))
-	}
-	if err := runQuietLabel("停止并禁用 Xray 主服务", "systemctl", "disable", "--now", "--", a.cfg.SystemdService); err != nil {
-		errs = append(errs, err)
-	}
-	if err := runQuietLabel("停止并禁用开机恢复服务", "systemctl", "disable", "--now", "--", a.cfg.RestoreService); err != nil {
-		errs = append(errs, err)
-	}
-	if err := removeIfExists("/etc/systemd/system/" + a.cfg.SystemdService); err != nil {
-		errs = append(errs, fmt.Errorf("删除 Xray 主服务 unit 失败：%w", err))
-	}
-	if err := removeIfExists("/etc/systemd/system/" + a.cfg.RestoreService); err != nil {
-		errs = append(errs, fmt.Errorf("删除开机恢复服务 unit 失败：%w", err))
-	}
-	if err := runQuietLabel("重新加载 systemd 配置", "systemctl", "daemon-reload"); err != nil {
-		errs = append(errs, err)
-	}
-	if len(errs) > 0 {
-		for _, err := range errs {
-			fmt.Println("警告：", err)
+	return a.withStoreLock(func() error {
+		// 卸载必须按最后一次已提交的运行配置清理所有权；忽略本次进程中可能污染
+		// 端口、用户或 Telegram 目标的 runtime 环境变量，仅保留 locator 环境。
+		st, err := a.loadStoreForBoot()
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("卸载过程中有 %d 个步骤失败，请查看上方警告", len(errs))
+		return a.uninstallWithStore(st)
+	})
+}
+
+// uninstallWithStore 在调用方持有 Store 锁期间完成整个卸载事务，避免各场景分别
+// 加锁留下可被并发开启命令插入的窗口。
+func (a *App) uninstallWithStore(st *Store) error {
+	if err := disableScenesForUninstall(st, a.setSceneWithStore); err != nil {
+		fmt.Println("警告：", err)
+		return fmt.Errorf("场景清理失败，已保留 systemd unit 和核心服务：%w", err)
+	}
+	if err := removeSystemdUnitsForUninstall(a.cfg, disableAndRemoveSystemdUnit, func() error {
+		return runQuietLabel("重新加载 systemd 配置", "systemctl", "daemon-reload")
+	}); err != nil {
+		fmt.Println("警告：", err)
+		return fmt.Errorf("卸载 systemd unit 未完全成功：%w", err)
+	}
+	if err := a.releaseHostOwnership(); err != nil {
+		return fmt.Errorf("卸载已清理共享资源，但释放主机 ownership 失败：%w", err)
 	}
 	fmt.Println("已卸载 systemd 服务，数据目录保留：", a.cfg.CoreDir)
 	return nil
+}
+
+type uninstallSceneSetter func(*Store, Scene, bool) error
+
+func disableScenesForUninstall(st *Store, setScene uninstallSceneSetter) error {
+	for _, scene := range []Scene{SceneTelegram, SceneDev, SceneGlobal} {
+		if err := setScene(st, scene, false); err != nil {
+			return fmt.Errorf("关闭%s失败：%w", sceneName(scene), err)
+		}
+	}
+	return nil
+}
+
+type systemdUnitRemover func(service, unitPath, label string) error
+
+func removeSystemdUnitsForUninstall(cfg Config, remove systemdUnitRemover, reload func() error) error {
+	// 先拆开机恢复 unit：只要它仍启用，下一次启动就可能重新创建并启动 Xray 主 unit。
+	if err := remove(
+		cfg.RestoreService,
+		"/etc/systemd/system/"+cfg.RestoreService,
+		"开机恢复服务",
+	); err != nil {
+		return err
+	}
+	mainErr := remove(
+		cfg.SystemdService,
+		"/etc/systemd/system/"+cfg.SystemdService,
+		"Xray 主服务",
+	)
+	// restore unit 已经从磁盘删除，即使主 unit 拆除失败也要刷新 systemd 的缓存。
+	return errors.Join(mainErr, reload())
+}
+
+func disableAndRemoveSystemdUnit(service, unitPath, label string) error {
+	if err := safeProxysceneServiceName(service); err != nil {
+		return err
+	}
+	_, statErr := os.Lstat(unitPath)
+	if errors.Is(statErr, os.ErrNotExist) {
+		loadState, activeState, err := querySystemdUnitState(service, label)
+		if err != nil {
+			return err
+		}
+		if loadState != "not-found" || (activeState != "inactive" && activeState != "failed") {
+			// 上一次卸载可能已 unlink unit、却在 outer daemon-reload 前崩溃。此时
+			// systemd 仍持有 loaded 缓存；主动停止/禁用并 reload 后再验证，保证重试可收敛。
+			if err := systemctlRun("停止并禁用残留"+label, "disable", "--now", "--", service); err != nil {
+				return fmt.Errorf("%s unit 文件已缺失且仍被 systemd 跟踪，清理失败：%w", label, err)
+			}
+			if err := systemctlRun("重新加载 systemd 配置", "daemon-reload"); err != nil {
+				return err
+			}
+			loadState, activeState, err = querySystemdUnitState(service, label)
+			if err != nil {
+				return err
+			}
+			if loadState != "not-found" || (activeState != "inactive" && activeState != "failed") {
+				return fmt.Errorf("清理%s残留后 systemd LoadState=%q ActiveState=%q", label, loadState, activeState)
+			}
+		}
+		return nil
+	}
+	if statErr != nil {
+		return fmt.Errorf("检查%s unit 失败：%w", label, statErr)
+	}
+	if err := validateManagedUnitForRemoval(unitPath); err != nil {
+		return err
+	}
+	if err := systemctlRun("停止并禁用"+label, "disable", "--now", "--", service); err != nil {
+		return fmt.Errorf("%w；为避免遗留已加载但磁盘不可追踪的配置，已保留 unit 文件 %s", err, unitPath)
+	}
+	if err := removeIfExists(unitPath); err != nil {
+		return fmt.Errorf("删除%s unit 失败：%w", label, err)
+	}
+	return nil
+}
+
+func querySystemdUnitState(service, label string) (string, string, error) {
+	state, err := systemctlOutput("确认"+label+"未加载", "show", "--property=LoadState", "--property=ActiveState", "--", service)
+	if err != nil {
+		return "", "", fmt.Errorf("%s unit 文件已缺失，但无法确认 systemd 加载状态：%w", label, err)
+	}
+	loadState, activeState, err := parseSystemdUnitState(state)
+	if err != nil {
+		return "", "", fmt.Errorf("%s unit 文件已缺失，但 systemd 状态无法确认：%w", label, err)
+	}
+	return loadState, activeState, nil
+}
+
+func parseSystemdUnitState(output string) (loadState, activeState string, err error) {
+	for _, line := range strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "LoadState":
+			loadState = strings.TrimSpace(value)
+		case "ActiveState":
+			activeState = strings.TrimSpace(value)
+		}
+	}
+	if loadState == "" || activeState == "" {
+		return "", "", fmt.Errorf("缺少 LoadState 或 ActiveState")
+	}
+	return loadState, activeState, nil
 }

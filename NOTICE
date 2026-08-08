@@ -6,18 +6,33 @@
 - 原始仓库：https://github.com/longlannet/proxyscene
 - 许可证：MIT License
 
-本项目的离线整合包（`proxyscene_bundle_linux_*.tar.gz`）中除了本项目的管理程序
-`proxyscene`，还**再分发**了以下第三方组件，其版权与许可证归各自项目所有：
+管理程序 `proxyscene` 静态链接以下第三方 Go 模块，其版权与许可证归各自项目所有；
+完整许可证文本随发行包保存在 `THIRD_PARTY_LICENSES`：
 
-- **Xray-core**（可执行文件 `xray` 及 `geoip.dat`、`geosite.dat`）
+- **github.com/titanous/json5 v1.0.0**：BSD 3-Clause / MIT
+- **golang.org/x/sys v0.47.0**：BSD 3-Clause
+- **gopkg.in/yaml.v3 v3.0.1**：MIT / Apache License 2.0
+
+`gopkg.in/yaml.v3` 的上游 NOTICE 声明：Copyright 2011-2016 Canonical Ltd.；
+其 Apache License 2.0 许可与完整 NOTICE 文本保存在 `THIRD_PARTY_LICENSES`。
+
+本项目的离线整合包（`proxyscene_bundle_linux_*.tar.gz`）还**再分发**以下第三方组件：
+
+- **Xray-core v26.3.27**（可执行文件 `xray`，源码提交
+  `d2758a023cd7f4174a5a5fa4ff66e487d4342ba0`）
   - 项目地址：https://github.com/XTLS/Xray-core
   - 许可证：Mozilla Public License 2.0 (MPL-2.0)
-  - `geoip.dat` / `geosite.dat` 数据文件来自 https://github.com/v2fly/domain-list-community
-    与 https://github.com/Loyalsoldier/v2ray-rules-dat 等上游，遵循其各自许可证。
+  - Xray 自身许可证随整合包保存为 `LICENSE-Xray`；实际 ELF 中 34 个已链接 Go
+    模块的固定版本、module sum、许可证与 NOTICE 保存在 `THIRD_PARTY_LICENSES-Xray`。
+  - 同一不可变 Release 的 `xray_source_v26.3.27.tar.gz` 保存 Xray 精确源码及上述
+    34 个模块的 Go proxy source zip、go.mod 和版本元数据；获取方法见 `SOURCE-Xray`。
+
+本项目生成的路由配置不使用 `geoip.dat` 或 `geosite.dat`，因此不再从 Xray Release
+归档提取、安装或再分发这两个第三方规则数据文件。
 
 再分发本整合包时，必须保留本声明，并遵守上述各组件的许可证要求。MPL-2.0 为文件级
 copyleft：未修改 Xray-core 源码、仅以原样再分发其二进制时，需保留其版权与许可证声明；
-如需 Xray-core 源码，请见其原始仓库。
+精确对应源码随同一不可变 Release 的 `xray_source_v26.3.27.tar.gz` 提供，上游仓库地址见上。
 
 ## English
 
@@ -25,18 +40,37 @@ copyleft：未修改 Xray-core 源码、仅以原样再分发其二进制时，�
 - Original repository: https://github.com/longlannet/proxyscene
 - License: MIT License
 
-In addition to this project's own manager binary `proxyscene`, the offline bundle
-(`proxyscene_bundle_linux_*.tar.gz`) **redistributes** the following third-party
-components, which remain under their own copyrights and licenses:
+The `proxyscene` manager statically links the following third-party Go modules.
+Their complete license texts are distributed as `THIRD_PARTY_LICENSES`:
 
-- **Xray-core** (the `xray` binary and `geoip.dat`, `geosite.dat`)
+- **github.com/titanous/json5 v1.0.0**: BSD 3-Clause / MIT
+- **golang.org/x/sys v0.47.0**: BSD 3-Clause
+- **gopkg.in/yaml.v3 v3.0.1**: MIT / Apache License 2.0
+
+The upstream NOTICE for `gopkg.in/yaml.v3` states: Copyright 2011-2016
+Canonical Ltd. Its Apache License 2.0 terms and complete NOTICE text are retained in
+`THIRD_PARTY_LICENSES`.
+
+The offline bundle (`proxyscene_bundle_linux_*.tar.gz`) also **redistributes** the
+following third-party component under its own copyright and license:
+
+- **Xray-core v26.3.27** (the `xray` executable, source commit
+  `d2758a023cd7f4174a5a5fa4ff66e487d4342ba0`)
   - Project: https://github.com/XTLS/Xray-core
   - License: Mozilla Public License 2.0 (MPL-2.0)
-  - The `geoip.dat` / `geosite.dat` data files originate from upstream projects such
-    as https://github.com/v2fly/domain-list-community and
-    https://github.com/Loyalsoldier/v2ray-rules-dat under their respective licenses.
+  - Its project license is retained as `LICENSE-Xray`. Exact versions, Go module sums,
+    licenses, and notices for the 34 modules linked into the ELF are retained in
+    `THIRD_PARTY_LICENSES-Xray`.
+  - `xray_source_v26.3.27.tar.gz` in the same immutable Release contains the exact Xray
+    source and the Go proxy source zip, go.mod, and version metadata for all 34 modules.
+    Retrieval details are retained in `SOURCE-Xray`.
+
+The generated routing configuration does not use `geoip.dat` or `geosite.dat`, so
+proxyscene no longer extracts, installs, or redistributes those third-party rule data files
+from the Xray Release archive.
 
 When redistributing this bundle you must keep this notice and comply with the licenses
 of the bundled components. MPL-2.0 is a file-level copyleft license; redistributing the
-unmodified Xray-core binary requires preserving its copyright and license notices. Source
-for Xray-core is available at its original repository.
+unmodified Xray-core binary requires preserving its copyright and license notices. Exact
+corresponding source is provided as `xray_source_v26.3.27.tar.gz` in the same immutable
+Release; the upstream repository is identified above.

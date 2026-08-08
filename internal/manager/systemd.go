@@ -1,11 +1,22 @@
 package manager
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 )
+
+const managedSystemdUnitHeader = "# Managed by proxyscene\n"
+
+var systemctlRun = func(label string, args ...string) error {
+	return runQuietLabel(label, "systemctl", args...)
+}
+
+var systemctlOutput = func(label string, args ...string) (string, error) {
+	return outputQuietLabel(label, "systemctl", args...)
+}
 
 func (a *App) installXrayService() error {
 	if err := a.prepareXrayServiceRuntime(); err != nil {
@@ -17,7 +28,7 @@ func (a *App) installXrayService() error {
 	if a.cfg.needsPrivilegedPortCap() {
 		capLines = "CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE"
 	}
-	unit := fmt.Sprintf(`[Unit]
+	unit := fmt.Sprintf(managedSystemdUnitHeader+`[Unit]
 Description=Xray 代理主服务
 After=network-online.target nss-lookup.target
 Wants=network-online.target
@@ -50,10 +61,15 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 [Install]
 WantedBy=multi-user.target
 `, a.cfg.XrayServiceUser, systemdPath(a.cfg.CoreDir), systemdQuote(a.cfg.XrayBin()), systemdQuote(a.cfg.XrayConfig()), systemdPath(a.cfg.CoreDir), capLines)
-	if err := writeFileAtomic("/etc/systemd/system/"+a.cfg.SystemdService, []byte(unit), 0o644); err != nil {
+	unitPath := "/etc/systemd/system/" + a.cfg.SystemdService
+	legacyExec := "ExecStart=" + systemdQuote(a.cfg.XrayBin()) + " run -config " + systemdQuote(a.cfg.XrayConfig())
+	if err := validateUnitReplacementOwnership(unitPath, legacyExec); err != nil {
 		return err
 	}
-	return runQuietLabel("重新加载 systemd 配置", "systemctl", "daemon-reload")
+	if err := writeFileAtomic(unitPath, []byte(unit), 0o644); err != nil {
+		return err
+	}
+	return systemctlRun("重新加载 systemd 配置", "daemon-reload")
 }
 
 func (a *App) prepareXrayServiceRuntime() error {
@@ -82,8 +98,6 @@ func (a *App) prepareXrayServiceRuntime() error {
 	}{
 		{path: a.cfg.XrayBin(), mode: 0o750, required: true},
 		{path: a.cfg.XrayConfig(), mode: 0o640},
-		{path: filepath.Join(a.cfg.CoreDir, "geoip.dat"), mode: 0o640},
-		{path: filepath.Join(a.cfg.CoreDir, "geosite.dat"), mode: 0o640},
 	}
 	for _, file := range files {
 		if err := chownRootGroupMode(file.path, identity.GID, file.mode, file.required); err != nil {
@@ -128,7 +142,7 @@ func chownRootGroupMode(path string, gid int, mode os.FileMode, required bool) e
 		return err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("Xray 服务文件不能是符号链接：%s", path)
+		return fmt.Errorf("该 Xray 服务文件不能是符号链接：%s", path)
 	}
 	if err := os.Chown(path, 0, gid); err != nil {
 		return err
@@ -137,38 +151,123 @@ func chownRootGroupMode(path string, gid int, mode os.FileMode, required bool) e
 }
 
 func (a *App) installRestoreService() error {
-	unit := fmt.Sprintf(`[Unit]
+	if err := validatePrivilegedExecutable(a.cfg.InstallBin, "PROXYSCENE_SWITCH_BIN"); err != nil {
+		return err
+	}
+	envLines := restoreServiceEnvironmentLines(a.cfg)
+	unit := fmt.Sprintf(managedSystemdUnitHeader+`[Unit]
 Description=恢复已启用的 Xray 代理场景
 After=network-online.target %s
 Wants=network-online.target
 
 [Service]
 Type=oneshot
+%s
 ExecStart=%s boot-restore
 RemainAfterExit=no
 
 [Install]
 WantedBy=multi-user.target
-`, a.cfg.SystemdService, systemdQuote(a.cfg.InstallBin))
-	if err := writeFileAtomic("/etc/systemd/system/"+a.cfg.RestoreService, []byte(unit), 0o644); err != nil {
+`, a.cfg.SystemdService, envLines, systemdQuote(a.cfg.InstallBin))
+	unitPath := "/etc/systemd/system/" + a.cfg.RestoreService
+	legacyExec := "ExecStart=" + systemdQuote(a.cfg.InstallBin) + " boot-restore"
+	if err := validateUnitReplacementOwnership(unitPath, legacyExec); err != nil {
 		return err
 	}
-	if err := runQuietLabel("重新加载 systemd 配置", "systemctl", "daemon-reload"); err != nil {
+	if err := writeFileAtomic(unitPath, []byte(unit), 0o644); err != nil {
 		return err
 	}
-	return runQuietLabel("启用开机恢复服务", "systemctl", "enable", "--", a.cfg.RestoreService)
+	if err := systemctlRun("重新加载 systemd 配置", "daemon-reload"); err != nil {
+		return err
+	}
+	return systemctlRun("启用开机恢复服务", "enable", "--", a.cfg.RestoreService)
+}
+
+func validateUnitReplacementOwnership(path, legacyExec string) error {
+	data, err := readRegularFileNoFollow(path, 1<<20)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("读取现有 systemd unit 失败：%s：%w", path, err)
+	}
+	if bytes.HasPrefix(data, []byte(managedSystemdUnitHeader)) {
+		return nil
+	}
+	if bytes.Contains(data, []byte("\n"+legacyExec+"\n")) {
+		return nil
+	}
+	return fmt.Errorf("拒绝覆盖没有 proxyscene ownership marker 的 systemd unit：%s", path)
+}
+
+func validateManagedUnitForRemoval(path string) error {
+	data, err := readRegularFileNoFollow(path, 1<<20)
+	if err != nil {
+		return err
+	}
+	if !bytes.HasPrefix(data, []byte(managedSystemdUnitHeader)) {
+		return fmt.Errorf("拒绝删除没有 proxyscene ownership marker 的 systemd unit：%s", path)
+	}
+	return nil
+}
+
+func restoreServiceEnvironmentLines(cfg Config) string {
+	values := []struct {
+		key   string
+		value string
+	}{
+		{"PROXYSCENE_MANAGER_DIR", cfg.CoreDir},
+		{"PROXYSCENE_SWITCH_BIN", cfg.InstallBin},
+		{"PROXYSCENE_SYSTEMD_SERVICE_NAME", cfg.SystemdService},
+		{"PROXYSCENE_BOOT_RESTORE_SERVICE_NAME", cfg.RestoreService},
+	}
+	lines := make([]string, 0, len(values))
+	for _, value := range values {
+		lines = append(lines, "Environment="+systemdQuote(value.key+"="+value.value))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (a *App) startXrayService() error {
 	if err := a.installXrayService(); err != nil {
 		return err
 	}
-	if err := runQuietLabel("启用 Xray 主服务", "systemctl", "enable", "--", a.cfg.SystemdService); err != nil {
+	if err := systemctlRun("启用 Xray 主服务", "enable", "--", a.cfg.SystemdService); err != nil {
 		return err
 	}
-	return runQuietLabel("重启 Xray 主服务", "systemctl", "restart", "--", a.cfg.SystemdService)
+	return a.restartXrayService()
 }
+
+func (a *App) restartXrayService() error {
+	// systemd 的启动频率计数也包含成功的显式 restart。升级、场景切换和
+	// boot-restore 可能在短窗口内连续协调同一 unit；在应用已通过 Xray
+	// 校验的配置前重置该 unit 的失败/启动计数，避免合法的管理操作被限流。
+	if err := systemctlRun("重置 Xray 主服务失败状态", "reset-failed", "--", a.cfg.SystemdService); err != nil {
+		return err
+	}
+	if err := systemctlRun("重启 Xray 主服务", "restart", "--", a.cfg.SystemdService); err != nil {
+		return err
+	}
+	state, err := systemctlOutput("确认 Xray 主服务已启动", "show", "--property=ActiveState", "--value", "--", a.cfg.SystemdService)
+	if err != nil {
+		return err
+	}
+	if state = strings.TrimSpace(state); state != "active" {
+		return fmt.Errorf("检测到 Xray 主服务重启后处于 %q 状态，而不是 active", state)
+	}
+	return nil
+}
+
 func (a *App) stopXrayService() error {
-	_ = runQuiet("systemctl", "stop", "--", a.cfg.SystemdService)
-	return runQuietLabel("禁用 Xray 主服务", "systemctl", "disable", "--", a.cfg.SystemdService)
+	stopErr := systemctlRun("停止 Xray 主服务", "stop", "--", a.cfg.SystemdService)
+	disableErr := systemctlRun("禁用 Xray 主服务", "disable", "--", a.cfg.SystemdService)
+	state, stateErr := systemctlOutput("确认 Xray 主服务已停止", "show", "--property=ActiveState", "--value", "--", a.cfg.SystemdService)
+	if stateErr == nil {
+		switch strings.TrimSpace(state) {
+		case "inactive", "failed":
+		default:
+			stateErr = fmt.Errorf("检测到 Xray 主服务停止后仍处于 %q 状态", strings.TrimSpace(state))
+		}
+	}
+	return errors.Join(stopErr, disableErr, stateErr)
 }

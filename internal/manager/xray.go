@@ -1,56 +1,179 @@
 package manager
 
 import (
+	"bytes"
+	"debug/elf"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
+	"syscall"
 	"time"
 )
 
 func (a *App) ensureCoreDirs() error {
+	info, err := os.Lstat(a.cfg.CoreDir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := ensureDir(a.cfg.CoreDir, 0o700); err != nil {
+			return err
+		}
+		return writeFileAtomic(a.cfg.MarkerPath(), []byte(managerMarkerText), 0o600)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("proxyscene 管理目录必须是非符号链接目录：%s", a.cfg.CoreDir)
+	}
 	if err := ensureDir(a.cfg.CoreDir, 0o700); err != nil {
 		return err
 	}
-	// 与其余写入保持一致：用原子、O_NOFOLLOW 的写法，避免跟随符号链接。
-	return writeFileAtomic(a.cfg.MarkerPath(), []byte("由 proxyscene 管理\n"), 0o600)
+	marker, markerErr := readRegularFileNoFollow(a.cfg.MarkerPath(), 256)
+	if markerErr == nil {
+		if !bytes.Equal(marker, []byte(managerMarkerText)) && !bytes.Equal(marker, []byte(installerMarkerText)) {
+			return fmt.Errorf("管理目录 ownership marker 内容无效：%s", a.cfg.MarkerPath())
+		}
+		return nil
+	}
+	if !errors.Is(markerErr, os.ErrNotExist) {
+		return fmt.Errorf("读取管理目录 ownership marker 失败：%w", markerErr)
+	}
+	entries, err := os.ReadDir(a.cfg.CoreDir)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf("拒绝接管未标记的非空目录：%s", a.cfg.CoreDir)
+	}
+	return writeFileAtomic(a.cfg.MarkerPath(), []byte(managerMarkerText), 0o600)
 }
 
 func (a *App) ensureXrayInstalled() error {
-	st, err := os.Stat(a.cfg.XrayBin())
+	path := a.cfg.XrayBin()
+	st, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("未找到 Xray 可执行文件：%s，请先运行安装脚本安装 Xray", a.cfg.XrayBin())
+			return fmt.Errorf("未找到 Xray 可执行文件：%s，请先运行安装脚本安装 Xray", path)
 		}
 		return err
 	}
-	if st.IsDir() {
-		return fmt.Errorf("Xray 路径不是文件：%s", a.cfg.XrayBin())
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("该 Xray 路径必须是普通文件且不能是符号链接：%s", path)
 	}
 	if st.Mode()&0o111 == 0 {
-		return fmt.Errorf("Xray 文件不可执行：%s", a.cfg.XrayBin())
+		return fmt.Errorf("该 Xray 文件不可执行：%s", path)
+	}
+	if st.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
+		return fmt.Errorf("该 Xray 文件不能带 setuid/setgid 位：%s", path)
+	}
+	if st.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("该 Xray 文件不能允许组或其他用户写入：%s", path)
+	}
+	stat, ok := st.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != 0 {
+		return fmt.Errorf("该 Xray 文件必须属于 root：%s", path)
+	}
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("安全打开 Xray 文件失败：%w", err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	openedStat, ok := opened.Sys().(*syscall.Stat_t)
+	if !ok || openedStat.Dev != stat.Dev || openedStat.Ino != stat.Ino {
+		return fmt.Errorf("检测到 Xray 文件在校验期间发生变化：%s", path)
+	}
+	if !opened.Mode().IsRegular() || opened.Mode().Perm()&0o022 != 0 || opened.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 || openedStat.Uid != 0 {
+		return fmt.Errorf("检测到 Xray 文件属性在校验期间变得不安全：%s", path)
+	}
+	elfFile, err := elf.NewFile(file)
+	if err != nil {
+		return fmt.Errorf("该 Xray 文件不是有效 ELF 可执行文件：%s", path)
+	}
+	defer elfFile.Close()
+	if elfFile.Type != elf.ET_EXEC && elfFile.Type != elf.ET_DYN {
+		return fmt.Errorf("该 Xray ELF 不是可执行类型：%s", path)
+	}
+	if !elfMachineMatchesRuntime(elfFile.Machine) {
+		return fmt.Errorf("该 Xray ELF 架构与当前系统不匹配：%s", path)
 	}
 	return nil
+}
+
+func elfMachineMatchesRuntime(machine elf.Machine) bool {
+	switch runtime.GOARCH {
+	case "amd64":
+		return machine == elf.EM_X86_64
+	case "arm64":
+		return machine == elf.EM_AARCH64
+	case "386":
+		return machine == elf.EM_386
+	case "arm":
+		return machine == elf.EM_ARM
+	default:
+		return false
+	}
 }
 
 // writeCheckedXrayConfig 先把配置写入临时文件并用 `xray -test` 校验，校验通过后才
 // 原子替换 config.json。这样坏配置（例如某个节点产生 Xray 不接受的 outbound）不会
 // 覆盖上一份可用配置，也使 README 的"配置写入前会进行配置测试"成立。
-func (a *App) writeCheckedXrayConfig(st *Store) error {
+func (a *App) writeCheckedXrayConfig(st *Store) (retErr error) {
 	tmp := a.cfg.XrayConfig() + ".new"
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		retErr = errors.Join(retErr, removeXrayTempConfig(tmp, a.cfg.CoreDir))
+	}()
 	if err := a.writeXrayConfigTo(st, tmp); err != nil {
 		return err
 	}
 	if err := a.checkXrayConfigAt(tmp); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, a.cfg.XrayConfig()); err != nil {
 		return err
 	}
+	committed = true
 	// 与 writeFileAtomic 的持久化语义一致：rename 后 fsync 父目录，崩溃后不丢这次改名。
+	return fsyncDir(a.cfg.CoreDir)
+}
+
+func removeXrayTempConfig(path, dir string) error {
+	err := os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("删除未通过校验的 Xray 临时配置失败：%w", err)
+	}
+	if err := fsyncDir(dir); err != nil {
+		return fmt.Errorf("持久化 Xray 临时配置清理失败：%w", err)
+	}
+	return nil
+}
+
+// clearXrayConfig removes the last active configuration when no scene remains.
+// A future enable always regenerates it from state, so retaining it only keeps
+// deleted node credentials on disk.
+func (a *App) clearXrayConfig() error {
+	err := os.Remove(a.cfg.XrayConfig())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	return fsyncDir(a.cfg.CoreDir)
 }
 

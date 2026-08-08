@@ -18,12 +18,19 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // externalCmdTimeout 限制读取型外部命令（git/npm 配置读取、getent 用户解析）的执行时间。
 // 这些命令在持有状态锁期间运行，若卡死（NSS 后端慢、npm 经异常代理联网）会连带阻塞
 // 所有并发的 proxyscene 命令，因此给一个宽松但有界的上限。
 const externalCmdTimeout = 30 * time.Second
+
+var (
+	userCommandEffectiveUID = os.Geteuid
+	userCommandEffectiveGID = os.Getegid
+)
 
 func envString(key, fallback string) string {
 	if v := os.Getenv(key); strings.TrimSpace(v) != "" {
@@ -47,19 +54,6 @@ func envBool(key string, fallback bool) bool {
 	// 避免操作员以为某个开关生效了而实际没有。
 	fmt.Printf("警告：环境变量 %s 的值无法识别（%q），使用默认值 %v\n", key, os.Getenv(key), fallback)
 	return fallback
-}
-
-func envInt(key string, fallback int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		fmt.Printf("警告：环境变量 %s 的值无效（%q），使用默认值 %d\n", key, v, fallback)
-		return fallback
-	}
-	return n
 }
 
 func splitFields(s string) []string {
@@ -104,6 +98,9 @@ func ensureDir(path string, perm os.FileMode) error {
 	if !info.IsDir() {
 		return fmt.Errorf("路径不是目录：%s", path)
 	}
+	if err := validatePrivilegedDirInfo(path, info); err != nil {
+		return err
+	}
 	if !existed {
 		return os.Chmod(path, perm)
 	}
@@ -111,88 +108,121 @@ func ensureDir(path string, perm os.FileMode) error {
 }
 
 func ensurePublicDir(path string) error {
+	if err := validateNoSymlinkComponents(path, false); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return err
+	}
+	if err := validateNoSymlinkComponents(path, false); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("路径不是目录：%s", path)
+	}
+	return validatePrivilegedDirInfo(path, info)
+}
+
+// validateNoSymlinkComponents walks every existing component of path. It is used for
+// privileged paths before they are pinned by a directory fd; a missing suffix is fine
+// when callers are about to create it.
+func validateNoSymlinkComponents(path string, requireRootOwned bool) error {
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		return fmt.Errorf("特权路径必须是绝对路径：%s", path)
+	}
+	current := string(os.PathSeparator)
+	for _, part := range strings.Split(strings.TrimPrefix(clean, string(os.PathSeparator)), string(os.PathSeparator)) {
+		if part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("特权路径不能经过符号链接：%s", current)
+		}
+		if !info.IsDir() && current != clean {
+			return fmt.Errorf("特权路径祖先不是目录：%s", current)
+		}
+		if requireRootOwned && info.IsDir() {
+			if err := validatePrivilegedDirInfo(current, info); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validatePrivilegedDirInfo(path string, info os.FileInfo) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("无法校验特权目录属主：%s", path)
+	}
+	if st.Uid != 0 {
+		return fmt.Errorf("特权目录必须属于 root：%s（uid=%d）", path, st.Uid)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("特权目录不能允许组或其他用户写入：%s（权限=%#o）", path, info.Mode().Perm())
+	}
+	return nil
+}
+
+func validatePrivilegedDirFD(path string, fd int) error {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		return fmt.Errorf("路径不是目录：%s", path)
+	}
+	if os.Geteuid() == 0 {
+		if st.Uid != 0 {
+			return fmt.Errorf("特权目录必须属于 root：%s（uid=%d）", path, st.Uid)
+		}
+		if os.FileMode(st.Mode).Perm()&0o022 != 0 {
+			return fmt.Errorf("特权目录不能允许组或其他用户写入：%s（权限=%#o）", path, os.FileMode(st.Mode).Perm())
+		}
 	}
 	return nil
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeFileAtomicOwned(path, data, perm, -1, -1)
+}
+
+// writeFileAtomicOwned is writeFileAtomic with an explicit inode owner. The
+// ownership and mode are applied to the temporary inode before its fsync and
+// rename, so readers never observe a partially committed metadata state.
+func writeFileAtomicOwned(path string, data []byte, perm os.FileMode, uid, gid int) error {
+	if uid < -1 || gid < -1 {
+		return fmt.Errorf("文件属主参数无效：uid=%d gid=%d", uid, gid)
+	}
 	dir := filepath.Dir(path)
 	if err := ensurePublicDir(dir); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp.*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	// 先 fsync 文件数据再 rename，rename 后再 fsync 父目录：os.Rename 对并发读者是
-	// 原子的但并不保证持久化，崩溃/掉电后可能出现 0 字节或残缺文件。state.json 等的
-	// 崩溃恢复依赖此持久性保证。
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, perm); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	return fsyncDir(dir)
-}
-
-// fsyncDir 对目录执行 fsync，使其中文件的创建/改名在崩溃后可见（rename 的持久化屏障）。
-func fsyncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
-// writeUserFileAtomic 以 root 身份在目标用户家目录内原子写入一个属于该用户的文件。
-//
-// 由于 root 写入用户可控目录，存在符号链接 TOCTOU 风险（用户可能把中途某级目录
-// 换成符号链接，把写入重定向到任意路径）。这里通过 openat + O_NOFOLLOW 逐级打开/
-// 创建目录链，所有创建、改属主、临时文件写入和 rename 都相对已校验的目录 fd 完成，
-// 任何一级是符号链接都会被拒绝，从根本上消除路径再次解析带来的竞争窗口。
-func writeUserFileAtomic(userName, path string, data []byte, perm os.FileMode) error {
-	identity, err := lookupLocalUserIdentity(userName)
-	if err != nil {
-		return err
-	}
-	if err := ensureUserHomeUsable(identity.Home, userName); err != nil {
-		return err
-	}
-	cleanHome := filepath.Clean(identity.Home)
-	cleanPath := filepath.Clean(path)
-	if cleanPath == cleanHome || !strings.HasPrefix(cleanPath, cleanHome+string(os.PathSeparator)) {
-		return fmt.Errorf("用户级配置路径必须位于用户 %s 的家目录内：%s", userName, path)
-	}
-	dir := filepath.Dir(cleanPath)
-	rel, err := filepath.Rel(cleanHome, dir)
-	if err != nil || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return fmt.Errorf("用户级配置目录必须位于用户家目录内：%s", dir)
-	}
-
-	dirFD, err := openUserDirChain(cleanHome, rel, identity.UID, identity.GID)
+	dirFD, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
 	defer syscall.Close(dirFD)
-
-	base := filepath.Base(cleanPath)
+	if err := validatePrivilegedDirFD(dir, dirFD); err != nil {
+		return err
+	}
+	base := filepath.Base(path)
 	tmpName, tmpFD, err := createTempFileAt(dirFD, base, perm)
 	if err != nil {
 		return err
@@ -208,7 +238,69 @@ func writeUserFileAtomic(userName, path string, data []byte, perm os.FileMode) e
 		_ = f.Close()
 		return err
 	}
-	if err := syscall.Fchown(int(f.Fd()), identity.UID, identity.GID); err != nil {
+	if uid >= 0 || gid >= 0 {
+		if err := syscall.Fchown(int(f.Fd()), uid, gid); err != nil {
+			_ = f.Close()
+			return err
+		}
+	}
+	// 先 fsync 文件数据再 rename，rename 后再 fsync 父目录：os.Rename 对并发读者是
+	// 原子的但并不保证持久化，崩溃/掉电后可能出现 0 字节或残缺文件。state.json 等的
+	// 崩溃恢复依赖此持久性保证。
+	// 属主和权限也是待提交 inode 的一部分，必须在 fsync 前设置。fchown 可能清除
+	// setuid/setgid 位，因此固定在 fchown 后重新 fchmod。
+	if err := syscall.Fchmod(int(f.Fd()), uint32(perm.Perm())); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := syscall.Renameat(dirFD, tmpName, dirFD, base); err != nil {
+		return err
+	}
+	if err := syscall.Fsync(dirFD); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// fsyncDir 对目录执行 fsync，使其中文件的创建/改名在崩溃后可见（rename 的持久化屏障）。
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+func writeUserFileAtomicAtNoReplace(dirFD int, base string, data []byte, perm os.FileMode, uid, gid int) error {
+	return writeUserFileAtomicAtMode(dirFD, base, data, perm, uid, gid, true)
+}
+
+func writeUserFileAtomicAtMode(dirFD int, base string, data []byte, perm os.FileMode, uid, gid int, noReplace bool) error {
+	tmpName, tmpFD, err := createTempFileAt(dirFD, base, perm)
+	if err != nil {
+		return err
+	}
+	committed := false
+	f := os.NewFile(uintptr(tmpFD), tmpName)
+	defer func() {
+		if !committed {
+			_ = syscall.Unlinkat(dirFD, tmpName)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := syscall.Fchown(int(f.Fd()), uid, gid); err != nil {
 		_ = f.Close()
 		return err
 	}
@@ -224,10 +316,17 @@ func writeUserFileAtomic(userName, path string, data []byte, perm os.FileMode) e
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := syscall.Renameat(dirFD, tmpName, dirFD, base); err != nil {
+	if noReplace {
+		err = unix.Renameat2(dirFD, tmpName, dirFD, base, unix.RENAME_NOREPLACE)
+	} else {
+		err = syscall.Renameat(dirFD, tmpName, dirFD, base)
+	}
+	if err != nil {
 		return err
 	}
-	_ = syscall.Fsync(dirFD)
+	if err := syscall.Fsync(dirFD); err != nil {
+		return fmt.Errorf("同步用户级配置目录失败：%w", err)
+	}
 	committed = true
 	return nil
 }
@@ -258,6 +357,10 @@ func openUserDirChain(home, rel string, uid, gid int) (int, error) {
 	homeFD, err := syscall.Open(home, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, fmt.Errorf("打开用户家目录失败：%s：%w", home, err)
+	}
+	if err := validateUserHomeFD(home, homeFD, uid, gid); err != nil {
+		_ = syscall.Close(homeFD)
+		return -1, err
 	}
 	if rel == "." {
 		return homeFD, nil
@@ -354,31 +457,272 @@ func readUserFileNoFollow(userName, path string, max int64) ([]byte, error) {
 	if err != nil || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return nil, fmt.Errorf("用户级配置目录必须位于用户家目录内：%s", dir)
 	}
-	dirFD, err := openExistingUserDirChain(cleanHome, rel)
+	dirFD, err := openExistingUserDirChain(cleanHome, rel, identity.UID, identity.GID)
 	if err != nil {
 		return nil, err
 	}
 	defer syscall.Close(dirFD)
 	base := filepath.Base(cleanPath)
-	fd, err := syscall.Openat(dirFD, base, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	b, err := readRegularFileAtNoFollow(dirFD, base, max)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, os.ErrNotExist
+	}
+	if err != nil {
+		return nil, fmt.Errorf("打开用户级配置失败（仅允许普通文件且拒绝符号链接）：%s：%w", path, err)
+	}
+	return b, nil
+}
+
+func readRegularFileAtNoFollow(dirFD int, base string, max int64) ([]byte, error) {
+	flags := syscall.O_RDONLY | syscall.O_NONBLOCK | syscall.O_NOFOLLOW | syscall.O_CLOEXEC
+	fd, err := syscall.Openat(dirFD, base, flags, 0)
 	if err != nil {
 		if err == syscall.ENOENT {
 			return nil, os.ErrNotExist
 		}
-		return nil, fmt.Errorf("打开用户级配置失败（拒绝符号链接）：%s：%w", path, err)
+		return nil, err
 	}
 	f := os.NewFile(uintptr(fd), base)
 	defer f.Close()
-	return io.ReadAll(io.LimitReader(f, max))
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return nil, err
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return nil, fmt.Errorf("不是普通文件")
+	}
+	if max >= 0 && st.Size > max {
+		return nil, fmt.Errorf("文件超过大小限制 %d 字节", max)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("文件超过大小限制 %d 字节", max)
+	}
+	return b, nil
+}
+
+func readRegularFileNoFollow(path string, max int64) ([]byte, error) {
+	dir := filepath.Dir(path)
+	dirFD, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		if err == syscall.ENOENT {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	defer syscall.Close(dirFD)
+	return readRegularFileAtNoFollow(dirFD, filepath.Base(path), max)
+}
+
+var errUserFileChanged = errors.New("用户配置在读取后已被修改")
+
+const (
+	userFileQuarantineName            = ".proxyscene-quarantine"
+	maxRemoveUserFileCASClaimAttempts = 3
+)
+
+var userFileCASAfterQuarantine = func(string) {}
+
+// writeUserFileAtomicCAS first moves the current name to a reserved quarantine
+// with RENAME_NOREPLACE. Only the claimed inode is compared and discarded, and
+// the replacement is installed with RENAME_NOREPLACE as well. A concurrent user
+// writer therefore wins the final name instead of being overwritten.
+func writeUserFileAtomicCAS(userName, path string, expected, data []byte, perm os.FileMode) error {
+	identity, err := lookupLocalUserIdentity(userName)
+	if err != nil {
+		return err
+	}
+	return writeUserFileAtomicCASWithIdentity(userName, identity, path, expected, data, perm)
+}
+
+func writeUserFileAtomicCASPersisted(userName string, expectedIdentity *persistedUserIdentity, lookup localUserIdentityLookup, path string, expected, data []byte, perm os.FileMode) error {
+	identity, err := verifyPersistedUserIdentity(userName, expectedIdentity, lookup)
+	if err != nil {
+		return err
+	}
+	return writeUserFileAtomicCASWithIdentity(userName, identity, path, expected, data, perm)
+}
+
+func writeUserFileAtomicCASWithIdentity(userName string, identity localUserIdentity, path string, expected, data []byte, perm os.FileMode) error {
+	cleanPath, dirFD, err := openUserFileDirForIdentity(userName, identity, path, false)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(dirFD)
+	base := filepath.Base(cleanPath)
+	quarantinePath := filepath.Join(filepath.Dir(cleanPath), userFileQuarantineName)
+	claimErr := unix.Renameat2(dirFD, base, dirFD, userFileQuarantineName, unix.RENAME_NOREPLACE)
+	if claimErr != nil {
+		switch claimErr {
+		case unix.ENOENT, unix.EEXIST:
+			found, resume, replayErr := replayUserFileWriteQuarantine(dirFD, base, quarantinePath, expected, data)
+			if replayErr != nil {
+				return replayErr
+			}
+			if found {
+				if resume {
+					break
+				}
+				return nil
+			}
+			if errors.Is(claimErr, unix.ENOENT) {
+				return errUserFileChanged
+			}
+			return fmt.Errorf("用户配置隔离文件在重放前消失，拒绝自动覆盖：%s", quarantinePath)
+		default:
+			return fmt.Errorf("隔离用户配置失败：%s：%w", cleanPath, claimErr)
+		}
+	} else {
+		userFileCASAfterQuarantine(cleanPath)
+	}
+
+	matched, err := readExpectedUserFileQuarantine(dirFD, quarantinePath, expected)
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return fmt.Errorf("用户配置隔离文件在提交前消失，拒绝自动覆盖：%s", quarantinePath)
+	}
+	if err := writeUserFileAtomicAtNoReplace(dirFD, base, data, perm, identity.UID, identity.GID); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			if cleanupErr := removeUserFileQuarantine(dirFD, quarantinePath); cleanupErr != nil {
+				return errors.Join(errUserFileChanged, cleanupErr)
+			}
+			return errUserFileChanged
+		}
+		return errors.Join(fmt.Errorf("提交用户配置替换失败：%w", err), restoreUserFileQuarantine(dirFD, cleanPath))
+	}
+	if err := removeUserFileQuarantine(dirFD, quarantinePath); err != nil {
+		return err
+	}
+	return nil
+}
+
+// replayUserFileWriteQuarantine reconciles a fixed-name quarantine left by a
+// previous process. The quarantine is usable only when its bytes still equal
+// the caller's expected value. In that case an absent final name resumes the
+// write, an already-desired final name completes cleanup, and any other final
+// name wins as a concurrent user update.
+func replayUserFileWriteQuarantine(dirFD int, base, quarantinePath string, expected, data []byte) (found, resume bool, err error) {
+	found, err = readExpectedUserFileQuarantine(dirFD, quarantinePath, expected)
+	if err != nil || !found {
+		return found, false, err
+	}
+	current, readErr := readRegularFileAtNoFollow(dirFD, base, int64(len(data))+1)
+	if errors.Is(readErr, os.ErrNotExist) {
+		return true, true, nil
+	}
+	if readErr == nil && bytes.Equal(current, data) {
+		return true, false, removeUserFileQuarantine(dirFD, quarantinePath)
+	}
+	cleanupErr := removeUserFileQuarantine(dirFD, quarantinePath)
+	if readErr != nil {
+		return true, false, errors.Join(errUserFileChanged, fmt.Errorf("并发用户配置无法按普通文件读取，已保留最终名称：%w", readErr), cleanupErr)
+	}
+	return true, false, errors.Join(errUserFileChanged, cleanupErr)
+}
+
+func readExpectedUserFileQuarantine(dirFD int, quarantinePath string, expected []byte) (bool, error) {
+	current, err := readRegularFileAtNoFollow(dirFD, userFileQuarantineName, int64(len(expected))+1)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return true, errors.Join(errUserFileChanged, fmt.Errorf("无法安全读取用户配置隔离文件，已保留并拒绝自动操作：%s：%w", quarantinePath, err))
+	}
+	if !bytes.Equal(current, expected) {
+		return true, errors.Join(errUserFileChanged, fmt.Errorf("用户配置隔离文件内容与预期不匹配，已保留并拒绝自动操作：%s", quarantinePath))
+	}
+	return true, nil
+}
+
+func writeUserFileAtomicCreatePersisted(userName string, expectedIdentity *persistedUserIdentity, lookup localUserIdentityLookup, path string, data []byte, perm os.FileMode) error {
+	identity, err := verifyPersistedUserIdentity(userName, expectedIdentity, lookup)
+	if err != nil {
+		return err
+	}
+	return writeUserFileAtomicCreateWithIdentity(userName, identity, path, data, perm)
+}
+
+func writeUserFileAtomicCreateWithIdentity(userName string, identity localUserIdentity, path string, data []byte, perm os.FileMode) error {
+	cleanPath, dirFD, err := openUserFileDirForIdentity(userName, identity, path, true)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(dirFD)
+	if err := writeUserFileAtomicAtNoReplace(dirFD, filepath.Base(cleanPath), data, perm, identity.UID, identity.GID); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			return errUserFileChanged
+		}
+		return err
+	}
+	return nil
+}
+
+func openUserFileDirForIdentity(userName string, identity localUserIdentity, path string, create bool) (string, int, error) {
+	if err := ensureUserHomeUsable(identity.Home, userName); err != nil {
+		return "", -1, err
+	}
+	cleanHome := filepath.Clean(identity.Home)
+	cleanPath := filepath.Clean(path)
+	if cleanPath == cleanHome || !strings.HasPrefix(cleanPath, cleanHome+string(os.PathSeparator)) {
+		return "", -1, fmt.Errorf("用户级配置路径必须位于用户 %s 的家目录内：%s", userName, path)
+	}
+	dirRel, err := filepath.Rel(cleanHome, filepath.Dir(cleanPath))
+	if err != nil || dirRel == ".." || filepath.IsAbs(dirRel) || strings.HasPrefix(dirRel, ".."+string(os.PathSeparator)) {
+		return "", -1, fmt.Errorf("用户级配置目录必须位于用户家目录内：%s", filepath.Dir(cleanPath))
+	}
+	var dirFD int
+	if create {
+		dirFD, err = openUserDirChain(cleanHome, dirRel, identity.UID, identity.GID)
+	} else {
+		dirFD, err = openExistingUserDirChain(cleanHome, dirRel, identity.UID, identity.GID)
+	}
+	if err != nil {
+		return "", -1, err
+	}
+	return cleanPath, dirFD, nil
+}
+
+func restoreUserFileQuarantine(dirFD int, cleanPath string) error {
+	quarantinePath := filepath.Join(filepath.Dir(cleanPath), userFileQuarantineName)
+	err := unix.Renameat2(dirFD, userFileQuarantineName, dirFD, filepath.Base(cleanPath), unix.RENAME_NOREPLACE)
+	if errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("用户配置已并发创建，无法无覆盖恢复；隔离文件已保留：%s", quarantinePath)
+	}
+	if err != nil {
+		return fmt.Errorf("恢复隔离用户配置失败，隔离文件已保留：%s：%w", quarantinePath, err)
+	}
+	if err := syscall.Fsync(dirFD); err != nil {
+		return fmt.Errorf("同步隔离用户配置恢复失败：%s：%w", filepath.Dir(cleanPath), err)
+	}
+	return nil
+}
+
+func removeUserFileQuarantine(dirFD int, quarantinePath string) error {
+	if err := syscall.Unlinkat(dirFD, userFileQuarantineName); err != nil {
+		return fmt.Errorf("删除已确认的用户配置隔离文件失败，文件已保留：%s：%w", quarantinePath, err)
+	}
+	if err := syscall.Fsync(dirFD); err != nil {
+		return fmt.Errorf("同步用户配置隔离文件删除失败：%s：%w", filepath.Dir(quarantinePath), err)
+	}
+	return nil
 }
 
 // openExistingUserDirChain 从 home 起沿 rel 逐级 openat 打开已存在的目录（不创建），
 // 全程 O_NOFOLLOW|O_DIRECTORY 拒绝符号链接；任一级缺失返回 os.ErrNotExist。
-func openExistingUserDirChain(home, rel string) (int, error) {
+func openExistingUserDirChain(home, rel string, uid, gid int) (int, error) {
 	flags := syscall.O_RDONLY | syscall.O_NOFOLLOW | syscall.O_DIRECTORY | syscall.O_CLOEXEC
 	homeFD, err := syscall.Open(home, flags, 0)
 	if err != nil {
 		return -1, fmt.Errorf("打开用户家目录失败：%s：%w", home, err)
+	}
+	if err := validateUserHomeFD(home, homeFD, uid, gid); err != nil {
+		_ = syscall.Close(homeFD)
+		return -1, err
 	}
 	if rel == "." {
 		return homeFD, nil
@@ -401,6 +745,27 @@ func openExistingUserDirChain(home, rel string) (int, error) {
 	return current, nil
 }
 
+func validateUserHomeFD(home string, fd, uid, gid int) error {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("校验用户家目录失败：%s：%w", home, err)
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+		return fmt.Errorf("用户家目录不是目录：%s", home)
+	}
+	if int(st.Uid) != uid || int(st.Gid) != gid {
+		return fmt.Errorf(
+			"用户家目录打开后属主与记录身份不一致，拒绝操作：%s（记录 uid=%d gid=%d；目录 uid=%d gid=%d）",
+			home,
+			uid,
+			gid,
+			st.Uid,
+			st.Gid,
+		)
+	}
+	return nil
+}
+
 // externalCommandTimeout 给一般外部命令（systemctl、git/npm 写、useradd 等）一个宽松上限。
 // 取 5 分钟：远高于 systemd 默认的 stop+start 超时（各 90s），只用于兜住真正卡死的调用，
 // 避免它们在持有状态锁时无限阻塞所有并发的 proxyscene 命令。
@@ -412,26 +777,220 @@ func runQuiet(name string, args ...string) error {
 	return exec.CommandContext(ctx, name, args...).Run()
 }
 
-// writeFileAtomicIfChanged 仅在目标内容与 data 不同时才原子写入，返回是否实际写入。
-// 用于避免在内容未变时无谓地改文件 mtime / 触发依赖该文件的服务重启。
-func writeFileAtomicIfChanged(path string, data []byte, perm os.FileMode) (bool, error) {
-	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
-		return false, nil
-	}
-	return true, writeFileAtomic(path, data, perm)
+func unlinkatWithFlags(dirFD int, name string, flags int) error {
+	return unix.Unlinkat(dirFD, name, flags)
 }
 
-// writeUserFileAtomicIfChanged 是 writeFileAtomicIfChanged 的用户家目录变体（读用 O_NOFOLLOW）。
-func writeUserFileAtomicIfChanged(userName, path string, data []byte, perm os.FileMode) (bool, error) {
-	if existing, err := readUserFileNoFollow(userName, path, maxOpenClawConfigBytes); err == nil && bytes.Equal(existing, data) {
+// removeUserFileAndEmptyParentNoFollow removes a managed file below a user's
+// home without ever resolving a user-controlled absolute path as root. Both the
+// file unlink and optional empty parent removal are relative to pinned fds.
+func removeUserFileAndEmptyParentNoFollow(userName, path string) (bool, error) {
+	identity, err := lookupLocalUserIdentity(userName)
+	if err != nil {
+		return false, err
+	}
+	if err := ensureUserHomeUsable(identity.Home, userName); err != nil {
+		return false, err
+	}
+	cleanHome := filepath.Clean(identity.Home)
+	cleanPath := filepath.Clean(path)
+	if cleanPath == cleanHome || !strings.HasPrefix(cleanPath, cleanHome+string(os.PathSeparator)) {
+		return false, fmt.Errorf("用户级配置路径必须位于用户 %s 的家目录内：%s", userName, path)
+	}
+	dirRel, err := filepath.Rel(cleanHome, filepath.Dir(cleanPath))
+	if err != nil || dirRel == ".." || filepath.IsAbs(dirRel) || strings.HasPrefix(dirRel, ".."+string(os.PathSeparator)) {
+		return false, fmt.Errorf("用户级配置目录必须位于用户家目录内：%s", filepath.Dir(cleanPath))
+	}
+	parentRel := filepath.Dir(dirRel)
+	dirName := filepath.Base(dirRel)
+	if dirRel == "." {
+		parentRel = "."
+		dirName = "."
+	}
+	parentFD, err := openExistingUserDirChain(cleanHome, parentRel, identity.UID, identity.GID)
+	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}
-	return true, writeUserFileAtomic(userName, path, data, perm)
+	if err != nil {
+		return false, err
+	}
+	defer syscall.Close(parentFD)
+	dirFD := parentFD
+	if dirName != "." {
+		dirFD, err = syscall.Openat(parentFD, dirName, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+		if err == syscall.ENOENT {
+			if syncErr := syscall.Fsync(parentFD); syncErr != nil {
+				return false, fmt.Errorf("同步已删除的用户级配置目录父目录失败：%s：%w", filepath.Dir(filepath.Dir(path)), syncErr)
+			}
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("打开用户级配置目录失败（拒绝符号链接）：%s：%w", dirName, err)
+		}
+		defer syscall.Close(dirFD)
+	}
+	removed := false
+	if err := syscall.Unlinkat(dirFD, filepath.Base(cleanPath)); err != nil {
+		if err != syscall.ENOENT {
+			return false, fmt.Errorf("删除用户级配置失败：%s：%w", path, err)
+		}
+	} else {
+		removed = true
+	}
+	// The barrier also runs on an ENOENT retry: the previous process may have
+	// unlinked the file but failed before proving that deletion durable.
+	if err := syscall.Fsync(dirFD); err != nil {
+		return removed, fmt.Errorf("同步用户级配置删除失败：%s：%w", filepath.Dir(path), err)
+	}
+	if dirName != "." {
+		if err := unlinkatWithFlags(parentFD, dirName, unix.AT_REMOVEDIR); err != nil {
+			switch err {
+			case syscall.ENOTEMPTY, syscall.EEXIST:
+				return removed, nil
+			case syscall.ENOENT:
+				// A replayed/concurrent rmdir still requires the parent barrier below.
+			default:
+				return removed, fmt.Errorf("删除空用户级配置目录失败：%s：%w", filepath.Dir(path), err)
+			}
+		}
+		if err := syscall.Fsync(parentFD); err != nil {
+			return removed, fmt.Errorf("同步用户级配置目录删除失败：%s：%w", filepath.Dir(filepath.Dir(path)), err)
+		}
+	}
+	return removed, nil
 }
 
-// removeFileReport 删除文件，返回该文件此前是否存在（用于判断是否需要重启依赖它的服务）。
-func removeFileReport(path string) bool {
-	return os.Remove(path) == nil
+// removeUserFileAndEmptyParentCAS removes only the inode whose bytes match
+// expected. The final name is first claimed with RENAME_NOREPLACE, so a file
+// created concurrently at that name is preserved.
+func removeUserFileAndEmptyParentCAS(userName, path string, expected []byte) (bool, error) {
+	identity, err := lookupLocalUserIdentity(userName)
+	if err != nil {
+		return false, err
+	}
+	return removeUserFileCASWithIdentity(userName, identity, path, expected)
+}
+
+func removeUserFileCASPersisted(userName string, expectedIdentity *persistedUserIdentity, lookup localUserIdentityLookup, path string, expected []byte) (bool, error) {
+	identity, err := verifyPersistedUserIdentity(userName, expectedIdentity, lookup)
+	if err != nil {
+		return false, err
+	}
+	return removeUserFileCASWithIdentity(userName, identity, path, expected)
+}
+
+func removeUserFileCASWithIdentity(userName string, identity localUserIdentity, path string, expected []byte) (bool, error) {
+	cleanPath, dirFD, err := openUserFileDirForIdentity(userName, identity, path, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer syscall.Close(dirFD)
+	base := filepath.Base(cleanPath)
+	quarantinePath := filepath.Join(filepath.Dir(cleanPath), userFileQuarantineName)
+	for attempt := 0; attempt < maxRemoveUserFileCASClaimAttempts; attempt++ {
+		claimErr := unix.Renameat2(dirFD, base, dirFD, userFileQuarantineName, unix.RENAME_NOREPLACE)
+		if claimErr == nil {
+			userFileCASAfterQuarantine(cleanPath)
+			matched, err := readExpectedUserFileQuarantine(dirFD, quarantinePath, expected)
+			if err != nil {
+				return false, err
+			}
+			if !matched {
+				return false, fmt.Errorf("用户配置隔离文件在删除前消失，拒绝自动提交：%s", quarantinePath)
+			}
+			if err := removeUserFileQuarantine(dirFD, quarantinePath); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+
+		switch claimErr {
+		case unix.ENOENT:
+			found, replayErr := readExpectedUserFileQuarantine(dirFD, quarantinePath, expected)
+			if replayErr != nil {
+				return false, replayErr
+			}
+			if found {
+				if cleanupErr := removeUserFileQuarantine(dirFD, quarantinePath); cleanupErr != nil {
+					return false, cleanupErr
+				}
+				return true, nil
+			}
+			if syncErr := syscall.Fsync(dirFD); syncErr != nil {
+				return false, fmt.Errorf("同步已删除的用户配置失败：%s：%w", filepath.Dir(cleanPath), syncErr)
+			}
+			return false, nil
+		case unix.EEXIST:
+			found, replayErr := readExpectedUserFileQuarantine(dirFD, quarantinePath, expected)
+			if replayErr != nil {
+				return false, replayErr
+			}
+			if !found {
+				return false, fmt.Errorf("用户配置隔离文件在重放前消失，拒绝自动删除：%s", quarantinePath)
+			}
+
+			current, readErr := readRegularFileAtNoFollow(dirFD, base, int64(len(expected))+1)
+			if errors.Is(readErr, os.ErrNotExist) {
+				if cleanupErr := removeUserFileQuarantine(dirFD, quarantinePath); cleanupErr != nil {
+					return false, cleanupErr
+				}
+				return true, nil
+			}
+			if readErr != nil {
+				return false, errors.Join(errUserFileChanged, fmt.Errorf("并发用户配置无法按普通文件安全读取，隔离文件已保留：%s：%w", quarantinePath, readErr))
+			}
+			if !bytes.Equal(current, expected) {
+				return false, errors.Join(errUserFileChanged, fmt.Errorf("并发用户配置内容与预期不匹配，隔离文件已保留：%s", quarantinePath))
+			}
+			if attempt+1 >= maxRemoveUserFileCASClaimAttempts {
+				return false, errors.Join(errUserFileChanged, fmt.Errorf("用户配置删除重放超过重试上限，隔离文件已保留：%s", quarantinePath))
+			}
+			if cleanupErr := removeUserFileQuarantine(dirFD, quarantinePath); cleanupErr != nil {
+				return false, cleanupErr
+			}
+			// The final name contains another expected inode. Reclaim it through
+			// the same no-replace path instead of treating the stale quarantine
+			// as proof that deletion already completed.
+			continue
+		default:
+			return false, fmt.Errorf("隔离待删除用户配置失败：%s：%w", cleanPath, claimErr)
+		}
+	}
+	return false, errors.Join(errUserFileChanged, fmt.Errorf("用户配置删除重放超过重试上限，隔离文件已保留：%s", quarantinePath))
+}
+
+func confirmUserFileAbsentPersisted(userName string, expectedIdentity *persistedUserIdentity, lookup localUserIdentityLookup, path string) error {
+	identity, err := verifyPersistedUserIdentity(userName, expectedIdentity, lookup)
+	if err != nil {
+		return err
+	}
+	return confirmUserFileAbsentWithIdentity(userName, identity, path)
+}
+
+func confirmUserFileAbsentWithIdentity(userName string, identity localUserIdentity, path string) error {
+	cleanPath, dirFD, err := openUserFileDirForIdentity(userName, identity, path, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(dirFD)
+	var st unix.Stat_t
+	err = unix.Fstatat(dirFD, filepath.Base(cleanPath), &st, unix.AT_SYMLINK_NOFOLLOW)
+	if err == nil {
+		return errUserFileChanged
+	}
+	if !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	if err := syscall.Fsync(dirFD); err != nil {
+		return fmt.Errorf("同步已删除的用户配置失败：%s：%w", filepath.Dir(cleanPath), err)
+	}
+	return nil
 }
 
 func runQuietLabel(label, name string, args ...string) error {
@@ -454,6 +1013,20 @@ func runQuietEnvLabel(label string, env []string, name string, args ...string) e
 	return nil
 }
 
+func outputQuietLabel(label, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), externalCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	b, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return string(b), fmt.Errorf("%s超时（%s）", label, externalCommandTimeout)
+		}
+		return string(b), commandFailed(label, err)
+	}
+	return string(b), nil
+}
+
 func commandFailed(label string, err error) error {
 	if label == "" {
 		label = "执行外部命令"
@@ -468,42 +1041,136 @@ func commandFailed(label string, err error) error {
 	return fmt.Errorf("%s失败：%v", label, err)
 }
 
-func runAsUser(user, name string, args ...string) error {
-	if user == "" || user == "root" {
-		return runQuietLabel("执行命令 "+name, name, args...)
-	}
-	if _, err := exec.LookPath("runuser"); err == nil {
-		runArgs := append([]string{"-u", user, "--", name}, args...)
-		return runQuietLabel("以用户 "+user+" 执行命令 "+name, "runuser", runArgs...)
-	}
-	if _, err := exec.LookPath("sudo"); err == nil {
-		// -n：非交互，需要密码时直接失败而不是挂起等待输入。
-		runArgs := append([]string{"-n", "-H", "-u", user, name}, args...)
-		return runQuietLabel("以用户 "+user+" 执行命令 "+name, "sudo", runArgs...)
-	}
-	return fmt.Errorf("需要 runuser 或 sudo 才能以用户 %s 执行命令", user)
-}
-
 func outputAsUser(user, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), externalCmdTimeout)
 	defer cancel()
-	var cmd *exec.Cmd
-	if user == "" || user == "root" {
-		cmd = exec.CommandContext(ctx, name, args...)
-	} else if _, err := exec.LookPath("runuser"); err == nil {
-		runArgs := append([]string{"-u", user, "--", name}, args...)
-		cmd = exec.CommandContext(ctx, "runuser", runArgs...)
-	} else if _, err := exec.LookPath("sudo"); err == nil {
-		runArgs := append([]string{"-n", "-H", "-u", user, name}, args...)
-		cmd = exec.CommandContext(ctx, "sudo", runArgs...)
-	} else {
-		return "", fmt.Errorf("需要 runuser 或 sudo 才能以用户 %s 执行命令", user)
+	cmd, _, err := commandAsUser(ctx, user, name, args...)
+	if err != nil {
+		return "", err
 	}
 	b, err := cmd.Output()
 	if ctx.Err() == context.DeadlineExceeded {
 		return string(b), fmt.Errorf("以用户 %s 执行命令 %s 超时（%s）", user, name, externalCmdTimeout)
 	}
 	return string(b), err
+}
+
+func commandAsUser(ctx context.Context, user, name string, args ...string) (*exec.Cmd, string, error) {
+	if user == "" {
+		user = "root"
+	}
+	identity, err := lookupLocalUserIdentity(user)
+	if err != nil {
+		return nil, "", err
+	}
+	return commandForUserIdentity(ctx, user, identity, name, args...)
+}
+
+func runAsPersistedUser(user string, expected *persistedUserIdentity, lookup localUserIdentityLookup, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), externalCommandTimeout)
+	defer cancel()
+	cmd, label, err := commandAsPersistedUser(ctx, user, expected, lookup, name, args...)
+	if err != nil {
+		return err
+	}
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("%s超时（%s）", label, externalCommandTimeout)
+		}
+		return commandFailed(label, err)
+	}
+	return nil
+}
+
+func outputAsPersistedUser(user string, expected *persistedUserIdentity, lookup localUserIdentityLookup, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), externalCmdTimeout)
+	defer cancel()
+	cmd, _, err := commandAsPersistedUser(ctx, user, expected, lookup, name, args...)
+	if err != nil {
+		return "", err
+	}
+	b, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(b), fmt.Errorf("以记录身份执行用户 %s 的命令 %s 超时（%s）", user, name, externalCmdTimeout)
+	}
+	return string(b), err
+}
+
+func commandAsPersistedUser(ctx context.Context, user string, expected *persistedUserIdentity, lookup localUserIdentityLookup, name string, args ...string) (*exec.Cmd, string, error) {
+	if _, err := verifyPersistedUserIdentity(user, expected, lookup); err != nil {
+		return nil, "", err
+	}
+	// The command identity is built exclusively from the durable record. A same-name
+	// account replacement after the verification above cannot redirect exec to the
+	// replacement account because no later username lookup or runuser/sudo occurs.
+	identity := localUserIdentity{
+		Name:    user,
+		UID:     expected.UID,
+		GID:     expected.GID,
+		UIDText: strconv.Itoa(expected.UID),
+		GIDText: strconv.Itoa(expected.GID),
+		Home:    expected.Home,
+	}
+	return commandForUserIdentity(ctx, user, identity, name, args...)
+}
+
+func commandForUserIdentity(ctx context.Context, user string, identity localUserIdentity, name string, args ...string) (*exec.Cmd, string, error) {
+	if err := ensureUserHomeUsable(identity.Home, user); err != nil {
+		return nil, "", err
+	}
+	if identity.UID < 0 || identity.GID < 0 || uint64(identity.UID) > uint64(^uint32(0)) || uint64(identity.GID) > uint64(^uint32(0)) {
+		return nil, "", fmt.Errorf("用户 %s 的数值身份超出系统调用范围：uid=%d gid=%d", user, identity.UID, identity.GID)
+	}
+	env := userConfigCommandEnvironment(identity)
+	label := "以数值身份执行用户 " + user + " 的命令 " + name
+	cmd := exec.CommandContext(ctx, name, args...)
+	effectiveUID := userCommandEffectiveUID()
+	effectiveGID := userCommandEffectiveGID()
+	if effectiveUID == 0 {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{
+				Uid:    uint32(identity.UID),
+				Gid:    uint32(identity.GID),
+				Groups: []uint32{},
+			},
+		}
+	} else if effectiveUID != identity.UID || effectiveGID != identity.GID {
+		return nil, "", fmt.Errorf(
+			"当前进程不是 root，且有效身份 uid=%d gid=%d 与目标用户 %s 的记录 uid=%d gid=%d 不一致，拒绝通过用户名切换身份",
+			effectiveUID,
+			effectiveGID,
+			user,
+			identity.UID,
+			identity.GID,
+		)
+	}
+	cmd.Env = env
+	return cmd, label, nil
+}
+
+func userConfigCommandEnvironment(identity localUserIdentity) []string {
+	env := make([]string, 0, len(os.Environ())+4)
+	for _, item := range os.Environ() {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		upper := strings.ToUpper(key)
+		if upper == "HOME" || upper == "USER" || upper == "LOGNAME" ||
+			upper == "XDG_CONFIG_HOME" || upper == "XDG_RUNTIME_DIR" || upper == "DBUS_SESSION_BUS_ADDRESS" || strings.HasPrefix(upper, "GIT_CONFIG") ||
+			strings.HasPrefix(upper, "NPM_CONFIG_") || upper == "HTTP_PROXY" ||
+			upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY" {
+			continue
+		}
+		env = append(env, item)
+	}
+	env = append(env,
+		"HOME="+identity.Home,
+		"USER="+identity.Name,
+		"LOGNAME="+identity.Name,
+		"XDG_RUNTIME_DIR=/run/user/"+strconv.Itoa(identity.UID),
+	)
+	return env
 }
 
 // stdinReader 是进程级共享的标准输入读取器。共享单个 bufio.Reader 可避免每次
@@ -550,10 +1217,57 @@ func withFileLock(path string, fn func() error) error {
 		return err
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("锁路径必须是普通文件：%s", path)
+	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+// withFileLockOrInherited lets install.sh hand its already-held lock across
+// exec without opening an unlocked commit/init window. The inherited fd is
+// accepted only when it is the exact root-only regular lock inode and a
+// non-blocking flock confirms this open-file description owns the lock.
+func withFileLockOrInherited(path, envName string, fn func() error) error {
+	rawFD := strings.TrimSpace(os.Getenv(envName))
+	if rawFD == "" {
+		return withFileLock(path, fn)
+	}
+	fd64, err := strconv.ParseInt(rawFD, 10, 32)
+	if err != nil || fd64 < 3 {
+		return fmt.Errorf("继承锁文件描述符无效（%s=%q）", envName, rawFD)
+	}
+	fd := int(fd64)
+	if err := validateNoSymlinkComponents(path, true); err != nil {
+		return fmt.Errorf("继承锁路径不安全：%w", err)
+	}
+	var fdStat syscall.Stat_t
+	if err := syscall.Fstat(fd, &fdStat); err != nil {
+		return fmt.Errorf("继承锁文件描述符不可用（%s=%d）：%w", envName, fd, err)
+	}
+	var pathStat syscall.Stat_t
+	if err := syscall.Lstat(path, &pathStat); err != nil {
+		return fmt.Errorf("继承锁路径不可用：%s：%w", path, err)
+	}
+	if fdStat.Mode&syscall.S_IFMT != syscall.S_IFREG || pathStat.Mode&syscall.S_IFMT != syscall.S_IFREG ||
+		fdStat.Dev != pathStat.Dev || fdStat.Ino != pathStat.Ino {
+		return fmt.Errorf("继承锁文件描述符与锁路径不是同一普通文件：%s", path)
+	}
+	if os.Geteuid() == 0 {
+		if fdStat.Uid != 0 || os.FileMode(fdStat.Mode).Perm() != 0o600 {
+			return fmt.Errorf("继承锁必须属于 root 且权限为 0600：%s", path)
+		}
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fmt.Errorf("继承锁未由安装器持有：%s：%w", path, err)
+	}
 	return fn()
 }
 
@@ -570,6 +1284,36 @@ func safePath(path, field string, mustAbs bool) error {
 	clean := filepath.Clean(path)
 	if clean != path {
 		return fmt.Errorf("%s 必须使用规范化路径：%s", field, path)
+	}
+	return nil
+}
+
+func validatePrivilegedExecutable(path, field string) error {
+	if err := safePath(path, field, true); err != nil {
+		return err
+	}
+	if err := validateNoSymlinkComponents(path, true); err != nil {
+		return fmt.Errorf("%s 不安全：%w", field, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("%s 不可用：%w", field, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s 必须是普通文件：%s", field, path)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("无法校验 %s 属主：%s", field, path)
+	}
+	if st.Uid != 0 {
+		return fmt.Errorf("%s 必须属于 root：%s（uid=%d）", field, path, st.Uid)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s 不能允许组或其他用户写入：%s（权限=%#o）", field, path, info.Mode().Perm())
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%s 必须可执行：%s", field, path)
 	}
 	return nil
 }
@@ -604,6 +1348,9 @@ func safeCoreDir(path, field string) error {
 	if !allowed {
 		return fmt.Errorf("%s 必须位于 /opt、/var/lib 或 /var/opt 下的专用目录：%s", field, path)
 	}
+	if err := validateNoSymlinkComponents(clean, true); err != nil {
+		return fmt.Errorf("%s 不安全：%w", field, err)
+	}
 	if info, err := os.Lstat(clean); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%s 不能是符号链接：%s", field, path)
@@ -631,6 +1378,14 @@ func safeSystemdServiceName(name string) error {
 		return fmt.Errorf("systemd 服务名必须以 .service 结尾且只包含安全字符：%s", name)
 	}
 	return nil
+}
+
+func safeProxysceneServiceName(name string) error {
+	stem := strings.TrimSuffix(name, ".service")
+	if stem == "proxyscene" || strings.HasPrefix(stem, "proxyscene-") || strings.HasPrefix(stem, "proxyscene@") {
+		return nil
+	}
+	return fmt.Errorf("proxyscene systemd 服务名必须位于 proxyscene 命名空间：%s", name)
 }
 
 type systemdTargetName struct {
@@ -810,51 +1565,65 @@ func userHomeDir(userName string) (string, error) {
 	return home, err
 }
 
-func runUserSystemctlQuiet(userName string, args ...string) error {
-	uid, _, err := lookupLocalUser(userName)
+var (
+	userSystemctlStat       = os.Stat
+	userSystemctlExecutable = "systemctl"
+)
+
+func runUserSystemctlQuietPersisted(userName string, identity *persistedUserIdentity, lookup localUserIdentityLookup, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), externalCommandTimeout)
+	defer cancel()
+	cmd, label, err := commandUserSystemctlPersisted(ctx, userName, identity, lookup, args...)
 	if err != nil {
 		return err
 	}
-	runtimeDir := "/run/user/" + uid
-	busPath := runtimeDir + "/bus"
-	if _, err := os.Stat(busPath); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("用户 %s 的 systemd 用户总线未运行：%s", userName, busPath)
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("%s超时（%s）", label, externalCommandTimeout)
 		}
-		return err
+		return commandFailed(label, err)
 	}
-	env := []string{
-		"XDG_RUNTIME_DIR=" + runtimeDir,
-		"DBUS_SESSION_BUS_ADDRESS=unix:path=" + busPath,
-	}
-	systemctlArgs := append([]string{"--user"}, args...)
-	if userName == "root" || uid == "0" {
-		return runQuietEnvLabel("执行用户级 systemd 命令", env, "systemctl", systemctlArgs...)
-	}
-	if _, err := exec.LookPath("runuser"); err == nil {
-		runArgs := []string{"-u", userName, "--", "env"}
-		runArgs = append(runArgs, env...)
-		runArgs = append(runArgs, "systemctl")
-		runArgs = append(runArgs, systemctlArgs...)
-		return runQuietLabel("执行用户 "+userName+" 的 systemd 命令", "runuser", runArgs...)
-	}
-	if _, err := exec.LookPath("sudo"); err == nil {
-		sudoArgs := []string{"-n", "-H", "-u", userName, "env"}
-		sudoArgs = append(sudoArgs, env...)
-		sudoArgs = append(sudoArgs, "systemctl")
-		sudoArgs = append(sudoArgs, systemctlArgs...)
-		return runQuietLabel("执行用户 "+userName+" 的 systemd 命令", "sudo", sudoArgs...)
-	}
-	return fmt.Errorf("需要 runuser 或 sudo 才能执行用户 %s 的 systemd 命令", userName)
+	return nil
 }
 
-func runUserSystemctlWarn(userName, label string, args ...string) {
-	if label == "" {
-		label = "执行用户级 systemd 命令"
+func outputUserSystemctlQuietPersisted(userName string, identity *persistedUserIdentity, lookup localUserIdentityLookup, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), externalCommandTimeout)
+	defer cancel()
+	cmd, label, err := commandUserSystemctlPersisted(ctx, userName, identity, lookup, args...)
+	if err != nil {
+		return "", err
 	}
-	if err := runUserSystemctlQuiet(userName, args...); err != nil {
-		fmt.Printf("警告：%s 失败：%v\n", label, err)
+	b, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return string(b), fmt.Errorf("%s超时（%s）", label, externalCommandTimeout)
+		}
+		return string(b), commandFailed(label, err)
 	}
+	return string(b), nil
+}
+
+func commandUserSystemctlPersisted(ctx context.Context, userName string, identity *persistedUserIdentity, lookup localUserIdentityLookup, args ...string) (*exec.Cmd, string, error) {
+	if _, err := verifyPersistedUserIdentity(userName, identity, lookup); err != nil {
+		return nil, "", err
+	}
+	runtimeDir := "/run/user/" + strconv.Itoa(identity.UID)
+	busPath := runtimeDir + "/bus"
+	if _, err := userSystemctlStat(busPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", fmt.Errorf("用户 %s 的 systemd 用户总线未运行：%s", userName, busPath)
+		}
+		return nil, "", err
+	}
+	env := []string{"DBUS_SESSION_BUS_ADDRESS=unix:path=" + busPath}
+	systemctlArgs := append([]string{"--user"}, args...)
+	cmd, _, err := commandAsPersistedUser(ctx, userName, identity, lookup, userSystemctlExecutable, systemctlArgs...)
+	if err != nil {
+		return nil, "", err
+	}
+	cmd.Env = append(cmd.Env, env...)
+	label := "以记录身份执行用户 " + userName + " 的 systemd 命令"
+	return cmd, label, nil
 }
 
 // userBusAvailable 报告目标用户的 systemd 用户总线（/run/user/<uid>/bus）是否在运行。
@@ -899,7 +1668,7 @@ func validateTestURL(raw string) error {
 // net.ParseIP 不接受 zone（%eth0），因此合法值的字符集是十六进制、点、冒号——这同时保证
 // applyGlobal 的 %q 引用安全（见 scenes.go 的耦合注释）。IPv6 由 HTTPAddr 等经
 // net.JoinHostPort 自动加方括号。
-func validateProxyHost(host string) error {
+func validateProxyHost(host string, allowPublic bool) error {
 	if strings.TrimSpace(host) == "" {
 		return fmt.Errorf("代理监听地址不能为空")
 	}
@@ -909,7 +1678,7 @@ func validateProxyHost(host string) error {
 	}
 	// 本地 HTTP/SOCKS 入站没有认证；绑定到非环回地址会把它暴露成开放代理。
 	// 默认只允许环回，确需对外监听时须显式设置 PROXYSCENE_ALLOW_PUBLIC_BIND=1。
-	if !ip.IsLoopback() && !envBool("PROXYSCENE_ALLOW_PUBLIC_BIND", false) {
+	if !ip.IsLoopback() && !allowPublic {
 		return fmt.Errorf("代理监听地址 %s 非环回地址：无认证入站对外监听会形成开放代理；如确需，请设置 PROXYSCENE_ALLOW_PUBLIC_BIND=1", host)
 	}
 	return nil
