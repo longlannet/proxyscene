@@ -858,7 +858,7 @@ go vet ./...
 go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 bash -n ./install.sh ./scripts/*.sh
 shellcheck ./install.sh ./scripts/*.sh
-bash ./scripts/install-test.sh
+sudo -- bash ./scripts/install-test.sh
 ```
 
 `scripts/verify-release-artifacts.sh` 读取 `DIST`、`VERSION`、`COMMIT` 和 `SOURCE_DATE_EPOCH`，可校验指定架构或默认四架构的完整 Release 产物。每个 Release 还包含架构无关的 `xray_source_v26.3.27.tar.gz`：它保存精确 Xray commit 及 ELF 中全部 34 个模块的 Go proxy source zip、go.mod、info、module sum 和独立 SHA256；verifier 会把该清单与 bundle 内实际 Xray ELF 逐项比较。`scripts/systemd-integration-test.sh` 会启动 systemd PID 1 的一次性 Debian 容器并执行真实安装/升级/卸载，只能显式设置 `PROXYSCENE_CONTAINER_TEST=1` 后传入当前 amd64 bundle 和 v0.7.1 amd64 bundle；普通 CI 只检查它的语法和 ShellCheck，不在 runner 或宿主机执行安装，正式 Release 的只读 build job 则把它作为发布前强制门禁。测试按精确容器名和本轮唯一 label 清理容器；固定 Debian 镜像引用只有在运行前不存在、可证明是本轮新拉取时才尝试删除。

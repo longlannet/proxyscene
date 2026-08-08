@@ -3,6 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if (( EUID != 0 )); then
+  printf 'FAIL: installer ownership tests require root; run: sudo -- bash ./scripts/install-test.sh\n' >&2
+  exit 1
+fi
 export PROXYSCENE_INSTALL_TESTING=1
 umask 000
 # shellcheck disable=SC1091

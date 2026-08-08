@@ -93,7 +93,7 @@ jobs:
         run: |
           bash -n install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
           shellcheck install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
-          bash scripts/install-test.sh
+          sudo -- bash scripts/install-test.sh
       - name: Workflow validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
       - name: Require clean source before build
