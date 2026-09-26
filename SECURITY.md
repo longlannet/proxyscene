@@ -22,7 +22,7 @@ The release workflow on the default branch uses GitHub Release assets plus SHA25
 
 Before dispatching a release, administrators enable immutable releases in GitHub Settings and use an account with Administration read permission to confirm that the setting remains enabled. The workflow's `GITHUB_TOKEN` does not have Administration permission, so it cannot reliably read that repository setting. Release is initiated only with `workflow_dispatch` from `main`; operators provide a strict stable `vMAJOR.MINOR.PATCH` version and do not create or push the tag. The build job pins the selected current `main` commit and retains module verification, formatting, normal and race tests, static and vulnerability analysis, two byte-identical four-architecture builds, exact archive and checksum verification, and the disposable Debian 13 systemd install/upgrade canary. Only the publish job has `contents: write`. It confirms that `main` has not moved and that the target tag and Release do not exist, creates a draft, uploads the complete asset set, and only then publishes it as Latest.
 
-A following read-only job requires the API to report a non-draft, non-prerelease immutable Latest Release. It confirms that the created tag points to the tested commit, compares the exact asset set and GitHub-computed SHA256 digests with the local release set, downloads every asset for a byte-for-byte comparison, and verifies the downloaded `checksums.txt`. There is no protected Environment, tag ruleset, bypass configuration, or repository-variable acknowledgement requirement.
+A following read-only job requires the API to report a non-draft, non-prerelease immutable Latest Release. It confirms that the created tag points to the tested commit, compares the exact asset set and GitHub-computed SHA256 digests with the local release set, downloads every asset for a byte-for-byte comparison, and verifies the downloaded `checksums.txt`. There is no protected Environment, tag ruleset, bypass configuration, or repository-variable acknowledgement requirement for GitHub publication. Mirror automation is separately opt-in.
 
 If draft creation, asset upload, or publication is interrupted, do not blindly rerun the whole workflow. First inspect the same-name tag, draft/Release, target commit, and asset set. Remove an unpublished residual draft/tag manually only after that review, or rerun only a pending read-only verification job. The workflow never automatically deletes release objects.
 
@@ -36,6 +36,32 @@ REST metadata to contain the exact expected `tag_name` and `immutable: true`. Wh
 requested, the installer resolves it once and then uses only that fixed immutable tag. A custom
 `PROXYSCENE_BASE_URL` requires an explicit version tag, changes only the manager archive location,
 and never changes the canonical GitHub Release location used for `checksums.txt`.
+
+## Mirror Boundaries
+
+`https://dl.ll.cd/proxyscene/<tag>/` serves exactly the same 11 assets as the immutable GitHub
+Release. The mirror is a download location, not an independent trust root. The recommended mirror
+installation and upgrade path downloads the complete fixed-version bundle, while release metadata
+comes from `api.github.com` and `checksums.txt` comes from that exact tag's canonical GitHub Release.
+The archive must pass that checksum before extraction. A checksum served by the mirror cannot
+authenticate its own assets. If GitHub is inaccessible, mirror-only authentication is unavailable;
+use a bundle and canonical metadata/checksum previously verified on a trusted connected machine.
+
+The root publishes only `latest.json` for discovery, with `version`, `tag`, `base_url`, `commit`,
+`release_id`, and `published_at`. Clients still select and verify a fixed tag; this mutable pointer
+does not authorize installation. There is no root-level mutable `install.sh`. Any explicitly downloaded
+mirror installer would still require validation against the canonical GitHub checksum, and both
+`PROXYSCENE_VERSION` and `PROXYSCENE_BASE_URL` must be fixed before execution. Do not use a
+curl-to-shell entrypoint. The installer and CLI do not acquire a new self-update or mirror trust mode.
+
+The separate `mirror-release.yml` accepts an explicit published tag. Automatic invocation runs only
+after the official Release verification succeeds and only when
+`PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`. The dedicated non-root receiver accepts only fixed-tag
+`sync` and `promote` forced commands; it fetches and validates assets from GitHub itself, stages files
+outside the public tree, and atomically publishes a complete version directory. After CI anonymously
+compares all 11 public assets, promotion atomically updates `latest.json` and rejects downgrades.
+An SSH publication credential does not authorize arbitrary uploaded files or shell commands.
+See [mirror publishing](docs/mirror-publishing.md) for deployment and recovery.
 
 ## Installer Boundaries
 

@@ -97,7 +97,9 @@ proxyscene/
 
 > 迁移说明：`v0.7.1` 是旧的 mutable Release，新的 SHA256 + immutable 模型从 `v0.8.0` 起生效。新安装器会有意拒绝 `immutable=false` 的 `v0.7.1`；请使用明确的 `v0.8.0` 或更高版本，不要让 `latest` 意外解析到旧版本。
 
-### 方式一：固定 Release 离线安装
+### 方式一：固定版本镜像 bundle 安装或升级
+
+推荐从 `https://dl.ll.cd/proxyscene/<release-tag>/` 下载完整 bundle，安装和升级使用同一流程；目标版本须已完成镜像发布。镜像保存 GitHub Release 的全部 11 项资产，内容逐字节一致。Release 身份和 checksum 仍从 GitHub 获取，不信任镜像自报的 checksum。
 
 在联网机器上把 `<release-tag>` 替换为明确版本，并按目标架构选择 bundle。整个下载和校验过程在同一个严格退出的 root shell 中进行，任何一步失败都会终止本段命令。下载目录随机生成，权限为 root-only；记录成功后输出的 `STAGE` 路径。
 
@@ -111,15 +113,16 @@ VERSION=$1
 ARCH=$2
 [[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 case "$ARCH" in amd64|arm64|386|armv7) ;; *) exit 2 ;; esac
-BASE="https://github.com/longlannet/proxyscene/releases/download/${VERSION}"
+CANONICAL_BASE="https://github.com/longlannet/proxyscene/releases/download/${VERSION}"
+ASSET_BASE="https://dl.ll.cd/proxyscene/${VERSION}"
 STAGE=$(mktemp -d "/root/proxyscene-bootstrap-${VERSION}-${ARCH}.XXXXXXXX")
 curl -q -fsSL --proto '=https' --proto-redir '=https' -o "$STAGE/release.json" \
   "https://api.github.com/repos/longlannet/proxyscene/releases/tags/${VERSION}"
 curl -q -fL --proto '=https' --proto-redir '=https' \
-  -o "$STAGE/checksums.txt" "${BASE}/checksums.txt"
+  -o "$STAGE/checksums.txt" "${CANONICAL_BASE}/checksums.txt"
 curl -q -fL --proto '=https' --proto-redir '=https' \
   -o "$STAGE/proxyscene_bundle_linux_${ARCH}.tar.gz" \
-  "${BASE}/proxyscene_bundle_linux_${ARCH}.tar.gz"
+  "${ASSET_BASE}/proxyscene_bundle_linux_${ARCH}.tar.gz"
 cd -- "$STAGE"
 jq -se --arg tag "$VERSION" \
   'length == 1 and (.[0] | type == "object" and .tag_name == $tag and .immutable == true)' release.json
@@ -130,6 +133,8 @@ printf 'STAGE=%q\n' "$STAGE"
 BOOTSTRAP
 ```
 <!-- /bootstrap:offline-download -->
+
+镜像根目录仅提供 `latest.json` 作为版本发现入口；它包含 `version`、`tag`、`base_url`、`commit`、`release_id` 和 `published_at`，不能替代 GitHub 身份与 checksum 验证。确认版本后仍在上面的命令中填写明确 tag；根目录不提供可变的 `install.sh`。如果 GitHub API 或该 tag 的 canonical checksum 不可访问，本流程会终止，不能仅凭镜像完成认证。可在能访问 GitHub 的机器上完成下载验证，再安全传输整个 staging 目录用于离线安装。
 
 将整个 staging 目录传到目标机的 `/root` 下，保留 root 所有权、目录 `0700` 和文件 `0600` 权限，或在同一台机器继续。把下段的版本、架构和 `<staging-directory>` 替换为实际值。下段会重新核对 Release 身份和归档 SHA256，通过后才解压执行；不依赖上一次 shell 的校验结果。
 
@@ -203,7 +208,7 @@ BOOTSTRAP
 ```
 <!-- /bootstrap:online -->
 
-从 `v0.8.0` 起，安装器内部也可使用 `latest`；它会先通过 GitHub API 把 `latest` 解析为明确 tag，随后只从该 tag 下载。上面的 bootstrap 仍要求显式版本，便于人工确认目标。自定义管理程序镜像必须设置明确 `PROXYSCENE_VERSION`，并让 `PROXYSCENE_BASE_URL` 直接指向该 tag 的资产目录；镜像只提供管理程序归档，`checksums.txt` 始终来自 `PROXYSCENE_REPO` 对应固定 tag 的 GitHub Release，因此镜像文件必须与该 Release 完全一致。
+从 `v0.8.0` 起，安装器内部也可使用 `latest`；它会先通过 GitHub API 把 `latest` 解析为明确 tag，随后只从该 tag 下载。上面的 bootstrap 仍要求显式版本，便于人工确认目标。联机安装使用自定义管理程序镜像时，必须设置明确 `PROXYSCENE_VERSION`，并让 `PROXYSCENE_BASE_URL` 直接指向该 tag 的资产目录，例如 `https://dl.ll.cd/proxyscene/v0.9.0`（须已镜像该版本）。该变量只改变管理程序归档来源；`checksums.txt` 始终来自 `PROXYSCENE_REPO` 对应固定 tag 的 GitHub Release，Xray 仍走安装器原有下载路径。需要同时从镜像取得管理程序与 Xray 时，使用方式一的完整 bundle。
 
 ### 方式三：从源码安装
 
@@ -858,6 +863,8 @@ gh workflow run Release --ref main -f version=v0.9.0
 ```
 
 不要预先创建或推送 tag。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 v0.7.1、v0.8.0 到新版本的 Debian systemd 安装/升级 canary。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
+
+镜像发布由独立的 `mirror-release.yml` 处理：可手工输入已公开的固定 tag；配置仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true` 后，正式 Release 的只读验证成功才会自动调用。接收端验证并发布固定版本目录，CI 再匿名下载并比对全部 11 项资产，最后原子更新防降级的 `latest.json`。部署和故障恢复见 [镜像发布说明](docs/mirror-publishing.md)。镜像失败不改变已发布的 immutable GitHub Release。
 
 如果创建 draft、上传资产或发布期间中断，不要直接盲目重跑完整 workflow。先在 GitHub 核对同名 tag、draft/Release 和资产是否存在；确认残留内容及目标 commit 后，人工删除未发布的残留 draft/tag，或仅重跑尚未执行的只读验证。工作流不会自动删除发布对象。
 

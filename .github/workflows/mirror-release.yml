@@ -1,0 +1,147 @@
+name: Mirror release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published immutable release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proxyscene-release-mirror-stable
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Verify and mirror immutable release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release-mirror
+    env:
+      TAG: ${{ inputs.tag }}
+      MIRROR_HOST: ${{ vars.MIRROR_HOST }}
+      MIRROR_PORT: ${{ vars.MIRROR_PORT }}
+      MIRROR_USER: ${{ vars.MIRROR_USER }}
+      MIRROR_CONFIGURED: ${{ vars.PROXYSCENE_RELEASE_MIRROR_CONFIGURED }}
+      TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      LC_ALL: C
+      GH_HOST: github.com
+      GH_PROMPT_DISABLED: '1'
+    steps:
+      - name: Validate trusted source and deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == longlannet/proxyscene ]]
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_SHA" == "$TRUSTED_WORKFLOW_SHA" ]]
+          [[ "$MIRROR_CONFIGURED" == true ]]
+          python3 - <<'PYTHON'
+          import ipaddress
+          import os
+          import re
+
+          tag = os.environ["TAG"]
+          if len(tag) > 128 or not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
+              raise SystemExit("invalid stable release tag")
+          host = os.environ["MIRROR_HOST"]
+          if not host or len(host) > 253 or host.endswith("."):
+              raise SystemExit("invalid mirror host")
+          if re.fullmatch(r"[0-9.]+", host):
+              if ipaddress.ip_address(host).version != 4:
+                  raise SystemExit("mirror host must be IPv4 or a DNS name")
+          elif any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                   for label in host.split(".")):
+              raise SystemExit("invalid mirror hostname")
+          port = os.environ["MIRROR_PORT"]
+          if not re.fullmatch(r"[1-9][0-9]{0,4}", port) or int(port) > 65535:
+              raise SystemExit("invalid mirror port")
+          if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", os.environ["MIRROR_USER"]):
+              raise SystemExit("invalid mirror user")
+          PYTHON
+      - name: Checkout trusted workflow revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl openssh-client python3
+      - name: Prepare and verify canonical GitHub assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I scripts/mirror_release.py prepare --tag "$TAG" \
+            --directory "$RUNNER_TEMP/mirror-canonical" \
+            --record "$RUNNER_TEMP/mirror-release.json"
+      - name: Synchronize, verify public bytes, then promote Latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+          MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ -n "$MIRROR_SSH_KEY" && -n "$MIRROR_KNOWN_HOSTS" ]]
+          [[ "$MIRROR_SSH_KEY" != *$'\r'* && "$MIRROR_KNOWN_HOSTS" != *$'\r'* ]]
+          mirror_ssh_dir="$(mktemp -d "$RUNNER_TEMP/proxyscene-mirror-ssh.XXXXXXXX")"
+          cleanup() {
+            rm -f -- "$mirror_ssh_dir/key" "$mirror_ssh_dir/known_hosts"
+            rmdir -- "$mirror_ssh_dir"
+          }
+          trap cleanup EXIT
+          printf '%s\n' "$MIRROR_SSH_KEY" > "$mirror_ssh_dir/key"
+          printf '%s\n' "$MIRROR_KNOWN_HOSTS" > "$mirror_ssh_dir/known_hosts"
+          unset MIRROR_SSH_KEY MIRROR_KNOWN_HOSTS
+          ssh-keygen -y -f "$mirror_ssh_dir/key" </dev/null >/dev/null
+          mirror_known_host="$MIRROR_HOST"
+          [[ "$MIRROR_PORT" == 22 ]] || mirror_known_host="[$MIRROR_HOST]:$MIRROR_PORT"
+          ssh-keygen -F "$mirror_known_host" -f "$mirror_ssh_dir/known_hosts" >/dev/null
+          mirror_ssh=(
+            ssh -F /dev/null -i "$mirror_ssh_dir/key" -p "$MIRROR_PORT"
+            -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1
+            -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$mirror_ssh_dir/known_hosts"
+            -o GlobalKnownHostsFile=/dev/null -o ServerAliveInterval=15
+            -o ServerAliveCountMax=3 "$MIRROR_USER@$MIRROR_HOST"
+          )
+          timeout -k 10 600 "${mirror_ssh[@]}" "proxyscene-mirror sync $TAG" </dev/null
+          python3 -I scripts/mirror_release.py verify --tag "$TAG" \
+            --directory "$RUNNER_TEMP/mirror-canonical" \
+            --output "$RUNNER_TEMP/mirror-public"
+
+          # An older version can be archived without moving the stable pointer.
+          latest_tag="$(gh api repos/longlannet/proxyscene/releases/latest --jq .tag_name)"
+          if [[ "$latest_tag" == "$TAG" ]]; then
+            timeout -k 10 300 "${mirror_ssh[@]}" "proxyscene-mirror promote $TAG" </dev/null
+            python3 -I scripts/mirror_release.py verify --tag "$TAG" \
+              --directory "$RUNNER_TEMP/mirror-canonical" \
+              --output "$RUNNER_TEMP/mirror-stable" --stable
+            printf 'Published and verified mirror Latest: %s\n' "$TAG" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'Archived and verified %s; GitHub Latest is %s.\n' "$TAG" "$latest_tag" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Retain mirror verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mirror-verification
+          path: |
+            ${{ runner.temp }}/mirror-release.json
+            ${{ runner.temp }}/mirror-public.result.json
+            ${{ runner.temp }}/mirror-stable.result.json
+          if-no-files-found: ignore
+          retention-days: 14

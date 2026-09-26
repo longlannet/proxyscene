@@ -105,6 +105,8 @@ jobs:
           shellcheck install.sh scripts/*.sh
           sudo -- bash scripts/install-test.sh
           sudo -- bash scripts/bootstrap-test.sh
+      - name: Mirror publication tests
+        run: python3 -B -m unittest discover -s scripts -p '*mirror*test.py' -v
       - name: Workflow validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
       - name: Require clean source before build
@@ -273,6 +275,16 @@ jobs:
             --notes-file release-metadata/release-notes.md \
             --draft
           gh release edit "$VERSION" --draft=false --latest
+
+  mirror:
+    name: Mirror verified release
+    needs: verify
+    if: vars.PROXYSCENE_RELEASE_MIRROR_CONFIGURED == 'true'
+    uses: ./.github/workflows/mirror-release.yml
+    with:
+      tag: ${{ inputs.version }}
+    permissions:
+      contents: read
 
   verify:
     name: Verify published release
