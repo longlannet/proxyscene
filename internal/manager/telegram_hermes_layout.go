@@ -31,7 +31,7 @@ func validateHermesSystemProject(content, projectRoot string) error {
 func validateHermesSystemProjectWithDirectoryCheck(content, projectRoot string, checkDirectory func(string) error) error {
 	for _, path := range []string{projectRoot, filepath.Join(projectRoot, "venv"), filepath.Join(projectRoot, "venv", "bin")} {
 		if err := checkDirectory(path); err != nil {
-			return fmt.Errorf("Hermes 系统安装目录 %s 不存在或不受信任：%w", path, err)
+			return fmt.Errorf("检测到 Hermes 系统安装目录 %s 不存在或不受信任：%w", path, err)
 		}
 	}
 	execStarts, err := effectiveServiceExecStarts(content)
@@ -39,11 +39,11 @@ func validateHermesSystemProjectWithDirectoryCheck(content, projectRoot string, 
 		return err
 	}
 	if len(execStarts) != 1 {
-		return fmt.Errorf("Hermes 系统安装必须有一个直接 ExecStart")
+		return fmt.Errorf("系统安装必须有且只有一个直接 Hermes ExecStart")
 	}
 	boundRoot, err := hermesProjectRootFromArgv(execStarts[0])
 	if err != nil || boundRoot != projectRoot {
-		return fmt.Errorf("Hermes 系统安装与 ExecStart 不一致")
+		return fmt.Errorf("检测到 Hermes 系统安装与 ExecStart 不一致")
 	}
 	command, _ := systemdDirectExecCommand(execStarts[0][0])
 	executables := []string{command}
@@ -61,7 +61,7 @@ func validateHermesSystemProjectWithDirectoryCheck(content, projectRoot string, 
 	}
 	for _, executable := range executables {
 		if err := validateHermesSystemExecutable(executable, checkDirectory); err != nil {
-			return fmt.Errorf("Hermes 系统安装可执行文件 %s 不受信任：%w", executable, err)
+			return fmt.Errorf("检测到 Hermes 系统安装可执行文件 %s 不受信任：%w", executable, err)
 		}
 	}
 	return nil
@@ -88,7 +88,7 @@ func validateHermesUserProjectDirectory(user string, expected *persistedUserIden
 	}
 	_, dirFD, err := openUserFileDirForIdentity(user, identity, filepath.Join(projectRoot, ".env"), false)
 	if err != nil {
-		return fmt.Errorf("Hermes 用户安装目录 %s 不存在或不受信任：%w", projectRoot, err)
+		return fmt.Errorf("检测到 Hermes 用户安装目录 %s 不存在或不受信任：%w", projectRoot, err)
 	}
 	return syscall.Close(dirFD)
 }
