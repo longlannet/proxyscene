@@ -161,6 +161,19 @@ profiles do not reliably inherit process-level Telegram secrets. Named active pr
 multiplex activation are therefore rejected, including during recovery. Bypass checks cover Unicode
 whitespace, wildcard apexes, scheme-relative hosts, and IPv4 dotted netmasks/hostmasks. Dotenv key
 checks cover the Python/Node whitespace rules and reject ambiguous route declarations.
+Hermes installation and configuration directories are identified independently from the effective
+service executable and the bound user's `HERMES_HOME`. Supported layouts are the existing
+`<Hermes root>/hermes-agent` checkout and the official `/usr/local/lib/hermes-agent` system install.
+The latter may serve a non-root user, but its project and virtual-environment directories must exist,
+be root-owned and not be group/world writable, with no symlink directory components. Its optional
+project `.env` uses the same root-owned, bounded, no-follow reader as managed configuration and the
+same routing-key checks as user dotenv files. A missing project is an error, not an absent optional file.
+System-install executable leaf symlinks are resolved with a finite hop limit and trusted directory/file checks, so
+normal Python virtual environments remain supported. This retains the trust assumption of an
+administrator-maintained official installation; it is not a general proof of arbitrary Python `.pth`
+hooks or import finders. Runtime validation does not execute the target interpreter for discovery.
+The current layout is revalidated for each operation; the ownership journal continues to track only
+proxyscene's managed configuration and user identity.
 The managed Hermes drop-in also sets `PYTHONSAFEPATH=1`, and the post-restart check requires that
 exact final value. This prevents `python -m hermes_cli.main` from prepending `WorkingDirectory` to
 the module search path; conflicting unit, manager, dotenv, or secret-source declarations fail closed.

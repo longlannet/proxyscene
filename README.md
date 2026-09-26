@@ -541,7 +541,12 @@ Hermes 和 OpenClaw 使用不同的接管机制：
   写入前检查 unit、systemd manager 最终环境和 `ExecStart`，发现 `api.telegram.org`、`*` 或可能匹配回退地址的
   公网 IPv4/CIDR 绕过项时拒绝接管。无法证明内容的有效 `EnvironmentFile`，以及可改变代码加载的
   `PYTHONHOME`、`PYTHONPATH`、`LD_PRELOAD`、`LD_LIBRARY_PATH`、`LD_AUDIT` 也会失败关闭。
-  程序还会把 `HERMES_HOME`、`active_profile` 和 gateway 的 `PROJECT_ROOT` 绑定到服务用户的持久身份，并检查
+  程序从有效 `ExecStart` 的可执行路径自动识别程序目录，按服务用户身份和 `HERMES_HOME` 独立确定配置目录，
+  无需填写安装路径。支持 `<Hermes配置根>/hermes-agent` 用户安装，以及官方 `/usr/local/lib/hermes-agent` 系统安装；
+  系统程序可以由普通服务用户使用，配置仍保存在该用户家目录内。每次操作都重新验证当前布局。
+  系统安装目录及其 `venv/bin` 必须存在、由 root 拥有且不可由组/其他用户写入；程序目录和配置文件不能经过符号链接。
+  系统安装的 Python 可执行文件链接会在限定跳数内逐跳核验目标权限。项目 `.env` 可以不存在，程序目录缺失则拒绝接管。
+  程序继续把 `HERMES_HOME` 和 `active_profile` 绑定到服务用户的持久身份，并检查
   profile `.env`/`.op.env`、项目 `.env` 与 `/etc/hermes/.env`；其中声明 `TELEGRAM_PROXY`、`NO_PROXY`、
   `no_proxy`、`TELEGRAM_FALLBACK_IPS`、`HERMES_TELEGRAM_DISABLE_FALLBACK_IPS`、`HERMES_HOME`、`HERMES_MANAGED_DIR` 或
   `HERMES_S6_SUPERVISED_CHILD` 或上述代码加载变量时拒绝自动接管。dotenv 按 Hermes 实际支持的 UTF-8/带 BOM
