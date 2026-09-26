@@ -88,7 +88,7 @@ proxyscene/
 - `flock`（通常由 `util-linux` 提供）。安装器必须先取得全局锁，不能等开始改包以后再自动安装它。
 - 联机安装需要可访问 HTTPS，并需要可用的软件包管理器之一：apt、dnf、yum、apk、zypper。
 - 离线 bundle 安装不需要网络或 Go，但目标机仍需具备 Bash、`flock` 和基础校验/归档工具。
-- Go 1.26.5 或更高版本**仅在源码编译时需要**（默认走预编译二进制，目标机无需 Go）。若需源码编译且系统没有可用 Go，安装脚本会自动准备。
+- Go 1.27.1 或更高版本**仅在源码编译时需要**（默认走预编译二进制，目标机无需 Go）。若需源码编译且系统没有可用 Go，安装脚本会自动准备。
 
 ## 快速开始
 
@@ -99,77 +99,109 @@ proxyscene/
 
 ### 方式一：固定 Release 离线安装
 
-在联网机器上把 `<release-tag>` 替换为明确版本，并按目标架构选择 bundle。所有待交给 root 的字节都由 root 直接下载到 root-only staging 目录，再在同一目录校验，避免普通用户在校验与特权读取之间替换文件：
+在联网机器上把 `<release-tag>` 替换为明确版本，并按目标架构选择 bundle。整个下载和校验过程在同一个严格退出的 root shell 中进行，任何一步失败都会终止本段命令。下载目录随机生成，权限为 root-only；记录成功后输出的 `STAGE` 路径。
 
+<!-- bootstrap:offline-download -->
 ```bash
-VERSION='<release-tag>'
-ARCH=amd64
-[[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-  || { echo 'VERSION 必须是 vMAJOR.MINOR.PATCH' >&2; exit 2; }
+sudo bash -s -- '<release-tag>' amd64 <<'BOOTSTRAP'
+set -euo pipefail
+umask 077
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+VERSION=$1
+ARCH=$2
+[[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 case "$ARCH" in amd64|arm64|386|armv7) ;; *) exit 2 ;; esac
 BASE="https://github.com/longlannet/proxyscene/releases/download/${VERSION}"
-STAGE="/root/proxyscene-bootstrap-${VERSION}-${ARCH}"
-sudo install -d -o root -g root -m 0700 "$STAGE"
-sudo curl -q -fsSL --proto '=https' --proto-redir '=https' -o "$STAGE/release.json" \
+STAGE=$(mktemp -d "/root/proxyscene-bootstrap-${VERSION}-${ARCH}.XXXXXXXX")
+curl -q -fsSL --proto '=https' --proto-redir '=https' -o "$STAGE/release.json" \
   "https://api.github.com/repos/longlannet/proxyscene/releases/tags/${VERSION}"
-sudo curl -q -fL --proto '=https' --proto-redir '=https' \
+curl -q -fL --proto '=https' --proto-redir '=https' \
   -o "$STAGE/checksums.txt" "${BASE}/checksums.txt"
-sudo curl -q -fL --proto '=https' --proto-redir '=https' \
+curl -q -fL --proto '=https' --proto-redir '=https' \
   -o "$STAGE/proxyscene_bundle_linux_${ARCH}.tar.gz" \
   "${BASE}/proxyscene_bundle_linux_${ARCH}.tar.gz"
-sudo bash -c '
-  set -euo pipefail
-  cd -- "$1"
-  jq -e --arg tag "$2" \
-    '\''type == "object" and .tag_name == $tag and .immutable == true'\'' release.json
-  awk -v file="$3" \
-    '\''$2 == file {count++; line=$0} END {if (count != 1) exit 1; print line}'\'' \
-    checksums.txt | sha256sum -c -
-' bash "$STAGE" "$VERSION" "proxyscene_bundle_linux_${ARCH}.tar.gz"
+cd -- "$STAGE"
+jq -se --arg tag "$VERSION" \
+  'length == 1 and (.[0] | type == "object" and .tag_name == $tag and .immutable == true)' release.json
+awk -v file="proxyscene_bundle_linux_${ARCH}.tar.gz" \
+  '$2 == file {count++; line=$0} END {if (count != 1) exit 1; print line}' \
+  checksums.txt | sha256sum -c -
+printf 'STAGE=%q\n' "$STAGE"
+BOOTSTRAP
 ```
+<!-- /bootstrap:offline-download -->
 
-校验成功后再把整个 root-only staging 目录传到目标机，或在同一台机器继续。下面在该目录中解压，并**显式**进入离线模式：
+将整个 staging 目录传到目标机的 `/root` 下，保留 root 所有权、目录 `0700` 和文件 `0600` 权限，或在同一台机器继续。把下段的版本、架构和 `<staging-directory>` 替换为实际值。下段会重新核对 Release 身份和归档 SHA256，通过后才解压执行；不依赖上一次 shell 的校验结果。
 
+<!-- bootstrap:offline-install -->
 ```bash
-sudo install -d -o root -g root -m 0700 "$STAGE/extracted"
-sudo tar --no-same-owner --no-same-permissions \
-  -xzf "$STAGE/proxyscene_bundle_linux_${ARCH}.tar.gz" \
-  -C "$STAGE/extracted"
-BUNDLE_DIR="$STAGE/extracted/proxyscene_bundle_linux_${ARCH}"
-sudo bash -c 'cd -- "$1" && exec ./install.sh --offline' bash "$BUNDLE_DIR"
+sudo bash -s -- '<release-tag>' amd64 '<staging-directory>' <<'BOOTSTRAP'
+set -euo pipefail
+umask 077
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+VERSION=$1
+ARCH=$2
+STAGE=$3
+[[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+case "$ARCH" in amd64|arm64|386|armv7) ;; *) exit 2 ;; esac
+[[ "$STAGE" == "/root/proxyscene-bootstrap-${VERSION}-${ARCH}.${STAGE##*.}" ]]
+[[ "${STAGE##*.}" =~ ^[a-zA-Z0-9]{8}$ ]]
+[[ -d "$STAGE" && ! -L "$STAGE" && $(stat -c '%u:%g:%a' -- "$STAGE") == 0:0:700 ]]
+cd -- "$STAGE"
+BUNDLE="proxyscene_bundle_linux_${ARCH}.tar.gz"
+for file in release.json checksums.txt "$BUNDLE"; do
+  [[ -f "$file" && ! -L "$file" && $(stat -c '%u:%g:%a' -- "$file") == 0:0:600 ]]
+done
+jq -se --arg tag "$VERSION" \
+  'length == 1 and (.[0] | type == "object" and .tag_name == $tag and .immutable == true)' release.json
+awk -v file="$BUNDLE" \
+  '$2 == file {count++; line=$0} END {if (count != 1) exit 1; print line}' \
+  checksums.txt | sha256sum -c -
+EXTRACTED=$(mktemp -d "$STAGE/extracted.XXXXXXXX")
+tar --no-same-owner --no-same-permissions -xzf "$BUNDLE" -C "$EXTRACTED"
+cd -- "$EXTRACTED/proxyscene_bundle_linux_${ARCH}"
+exec ./install.sh --offline
+BOOTSTRAP
 ```
+<!-- /bootstrap:offline-install -->
 
 bundle 内含 `install.sh`、管理程序、固定版本 Xray、项目及第三方许可证、Xray 对应
-源码说明和 `bundle-manifest.sha256`。安装器会在复制前复核 manifest；同目录存在二进制不会让普通联机安装自动切换到离线模式。完整的 Xray 及其链接模块对应源码另作为同一 Release 的 `xray_source_v26.3.27.tar.gz` 资产发布，并由同一 `checksums.txt` 约束。
+源码说明和 `bundle-manifest.sha256`。安装器会在复制前复核 manifest；同目录存在二进制不会让普通联机安装自动切换到离线模式。完整的 Xray 及其链接模块对应源码另作为同一 Release 的 `xray_source_v26.9.9.tar.gz` 资产发布，并由同一 `checksums.txt` 约束。
+
+当前固定 Xray 为官方 `v26.9.9`（上游标记为预发布版），以获得更新的 Go 工具链和依赖；构建流程固定其提交、四架构归档 SHA256 和对应源码，并检查配置兼容性与已知漏洞。
+
+升级兼容性：此版本移除了 Shadowsocks `none/plain`，且 VLESS/Trojan 明文传输仅允许上游内建的私有/保留地址与本地域名。新导入和启用会明确拒绝不兼容节点；旧节点记录仍可读取、删除和替换。若当前正在使用上述模式，请在升级前切换到 TLS/REALITY 或支持的 AEAD 节点。
 
 ### 方式二：固定 Release 联机安装
 
-从同一个明确 tag 下载安装器和 checksum。下载、校验、审阅和执行都使用 root-only staging 中的同一个文件：
+从同一个明确 tag 下载安装器和 checksum。下载、校验、展示和执行使用 root-only staging 中的同一个文件，并在同一个严格退出的 shell 中进行；校验失败时不会继续执行安装器。
 
+<!-- bootstrap:online -->
 ```bash
-VERSION='<release-tag>'
-[[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-  || { echo 'VERSION 必须是 vMAJOR.MINOR.PATCH' >&2; exit 2; }
+sudo bash -s -- '<release-tag>' <<'BOOTSTRAP'
+set -euo pipefail
+umask 077
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+VERSION=$1
+[[ "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 BASE="https://github.com/longlannet/proxyscene/releases/download/${VERSION}"
-STAGE="/root/proxyscene-bootstrap-${VERSION}"
-sudo install -d -o root -g root -m 0700 "$STAGE"
-sudo curl -q -fsSL --proto '=https' --proto-redir '=https' -o "$STAGE/release.json" \
+STAGE=$(mktemp -d "/root/proxyscene-bootstrap-${VERSION}.XXXXXXXX")
+curl -q -fsSL --proto '=https' --proto-redir '=https' -o "$STAGE/release.json" \
   "https://api.github.com/repos/longlannet/proxyscene/releases/tags/${VERSION}"
-sudo curl -q -fL --proto '=https' --proto-redir '=https' \
+curl -q -fL --proto '=https' --proto-redir '=https' \
   -o "$STAGE/checksums.txt" "${BASE}/checksums.txt"
-sudo curl -q -fL --proto '=https' --proto-redir '=https' \
+curl -q -fL --proto '=https' --proto-redir '=https' \
   -o "$STAGE/install.sh" "${BASE}/install.sh"
-sudo bash -c '
-  set -euo pipefail
-  cd -- "$1"
-  jq -e --arg tag "$2" \
-    '\''type == "object" and .tag_name == $tag and .immutable == true'\'' release.json
-  awk '\''$2 == "install.sh" {count++; line=$0} END {if (count != 1) exit 1; print line}'\'' \
-    checksums.txt | sha256sum -c -
-' bash "$STAGE" "$VERSION"
-sudo cat -- "$STAGE/install.sh"
-sudo env PROXYSCENE_VERSION="$VERSION" bash "$STAGE/install.sh"
+cd -- "$STAGE"
+jq -se --arg tag "$VERSION" \
+  'length == 1 and (.[0] | type == "object" and .tag_name == $tag and .immutable == true)' release.json
+awk '$2 == "install.sh" {count++; line=$0} END {if (count != 1) exit 1; print line}' \
+  checksums.txt | sha256sum -c -
+cat -- install.sh
+exec env PROXYSCENE_VERSION="$VERSION" bash "$STAGE/install.sh"
+BOOTSTRAP
 ```
+<!-- /bootstrap:online -->
 
 从 `v0.8.0` 起，安装器内部也可使用 `latest`；它会先通过 GitHub API 把 `latest` 解析为明确 tag，随后只从该 tag 下载。上面的 bootstrap 仍要求显式版本，便于人工确认目标。自定义管理程序镜像必须设置明确 `PROXYSCENE_VERSION`，并让 `PROXYSCENE_BASE_URL` 直接指向该 tag 的资产目录；镜像只提供管理程序归档，`checksums.txt` 始终来自 `PROXYSCENE_REPO` 对应固定 tag 的 GitHub Release，因此镜像文件必须与该 Release 完全一致。
 
@@ -458,7 +490,9 @@ sudo proxyscene dev off
 
 程序会备份原始配置，并记录本程序写入过的开发代理地址；如果开启期间调整了开发代理端口，关闭时也会识别并清理这些已记录的 managed 值，尽量避免误删用户手工配置。npm 对无路径代理 URL 自动补出的单个尾 `/` 会按同一受管值处理，其他差异仍视为管理员修改。
 
-为保证 Git 配置能精确恢复，目标用户只能存在一个常规文件形式的 global 配置（`~/.gitconfig` 或 `~/.config/git/config`），且其中不能使用 `include`/`includeIf`；双 global 文件、符号链接/特殊文件或 include 拓扑会在任何写入前失败关闭。开启期间已经完成的同键新增值会在关闭时保留，但不要在 `dev on`/`dev off` 命令执行的瞬间由另一个进程同时修改这两个 Git 代理键；Git 的单条写入有文件锁，外部进程之间没有跨命令事务。
+为保证 Git 配置能精确恢复，目标用户只能存在一个常规文件形式的 global 配置（`~/.gitconfig` 或 `~/.config/git/config`），且其中不能使用 `include`/`includeIf`；双 global 文件、符号链接/特殊文件或 include 拓扑会在任何写入前失败关闭。每次 Git 修改会持有实际配置文件的 `.lock`，覆盖读取、比较和提交，并保留已经完成的同键新增值。遇到其它 Git 写入者的锁会停止并保留恢复记录，待写入结束后重试。重复 `dev on` 或开机恢复遇到管理员改值、Git 受管值之外的追加值时，会保留配置并拒绝覆盖；请先 `dev off` 完成保守恢复，再 `dev on` 重新采集原值。
+
+npm 只读取并原子修改记录用户的 `~/.npmrc`，不会以 root 运行 npm 配置命令，也不会读取当前项目的 `.npmrc` 或执行其中的重定向设置。其它原始配置行保留；代理键存在数组、环境变量插值或无法精确解释的值时会拒绝接管。项目级/全局级 npm 配置仍按 npm 自身优先级工作，项目代理可覆盖这里管理的用户级代理。所有跨用户工具命令在记录家目录中运行，使用显式最小环境，避免继承调用者凭据和运行时注入变量。
 
 默认监听地址：
 
@@ -491,38 +525,82 @@ sudo proxyscene tg on
 sudo proxyscene tg off
 ```
 
+这里管理指定 gateway 的 Telegram 出站连接。它不接管 LLM、搜索、其他频道、第三方媒体 URL 下载，
+也不构成禁止所有直连的网络隔离。服务外单独启动的 Hermes CLI 不继承服务 drop-in；Hermes 的独立发送工具
+在代理初始化异常时还可能使用没有显式代理的 Bot。因此不能把本场景用于承诺“所有 Telegram 流量都不直连”。
+
 Hermes 和 OpenClaw 使用不同的接管机制：
 
 - Hermes 只消费 Telegram 专用的 `TELEGRAM_PROXY`。系统级和用户级目标都把该变量直接写进各自的
   `90-proxyscene-telegram-proxy.conf` systemd drop-in，不使用跨服务共享的环境文件。
   每个目标在写入前先进入 `/opt/proxyscene/telegram-proxy-journal.json` 及其备份；journal 按
-  prepared/active/restoring 阶段记录精确托管内容，reload/restart 成功后才提交或释放 ownership。
-  程序不会注入 `HTTP_PROXY`、`ALL_PROXY` 等会改变服务全部出网的通用变量。Hermes `v0.19.0`
+  prepared/active/restoring 阶段记录精确托管内容，服务配置协调成功后才提交或释放 ownership；active 表示
+  配置所有权已提交，不代表 Telegram 已连通。
+  程序不会注入 `HTTP_PROXY`、`ALL_PROXY` 等会改变服务全部出网的通用变量。Hermes `v0.19.0` / `v0.21.5`
   会让匹配 Telegram API 或运行时 DoH 回退 IP 的 `NO_PROXY`/`no_proxy` 覆盖 `TELEGRAM_PROXY`；因此程序会在
   写入前检查 unit、systemd manager 最终环境和 `ExecStart`，发现 `api.telegram.org`、`*` 或可能匹配回退地址的
   公网 IPv4/CIDR 绕过项时拒绝接管。无法证明内容的有效 `EnvironmentFile`，以及可改变代码加载的
   `PYTHONHOME`、`PYTHONPATH`、`LD_PRELOAD`、`LD_LIBRARY_PATH`、`LD_AUDIT` 也会失败关闭。
   程序还会把 `HERMES_HOME`、`active_profile` 和 gateway 的 `PROJECT_ROOT` 绑定到服务用户的持久身份，并检查
   profile `.env`/`.op.env`、项目 `.env` 与 `/etc/hermes/.env`；其中声明 `TELEGRAM_PROXY`、`NO_PROXY`、
-  `no_proxy`、`TELEGRAM_FALLBACK_IPS`、`HERMES_HOME`、`HERMES_MANAGED_DIR` 或
+  `no_proxy`、`TELEGRAM_FALLBACK_IPS`、`HERMES_TELEGRAM_DISABLE_FALLBACK_IPS`、`HERMES_HOME`、`HERMES_MANAGED_DIR` 或
   `HERMES_S6_SUPERVISED_CHILD` 或上述代码加载变量时拒绝自动接管。dotenv 按 Hermes 实际支持的 UTF-8/带 BOM
   UTF-16 解析；UTF-32、无 BOM NUL 编码、非法 UTF-8/latin1 fallback 以及可被 Hermes 修复器从同一行拆出的
   粘连路由变量一律失败关闭。
   用户 profile 与 `/etc/hermes/config.yaml` 的顶层标量会被 Hermes 桥接为进程环境；其中声明上述任一
   路由变量时同样拒绝。托管配置必须是 root-owned、不可由组/其他用户写入的普通文件，且路径不能经过符号链接。
   `config.yaml` 中启用的外部 secret source 也必须可证明不会在启动后注入这些路由变量，否则同样拒绝。
+  仅支持没有命名 profile 的单 profile gateway。Hermes `v0.21.5` 可自动 multiplex，并已不再把
+  `multiplex_profiles=false` 作为可靠关闭方式；进程级 `TELEGRAM_PROXY` 无法保证次级 profile 的代理。
+  因此启用 multiplex、使用命名 active profile 或 `profiles` 中存在命名目录/符号链接时会拒绝接管，
+  恢复期间发现这些变化也会保留 ownership 记录并报错。NO_PROXY 检查同时覆盖逗号/Unicode 空白分隔、
+  通配域名、`//host` 和 IPv4 点分掩码；dotenv 声明检查使用 Python/Node 实际空白语义。
+  受管 drop-in 固定 `HERMES_TELEGRAM_DISABLE_FALLBACK_IPS=1`，关闭代理模式下不必要的 DNS/DoH 回退地址发现；
+  此设置与代理一起记录、校验并恢复，不修改应用 YAML。若环境存在会让 Hermes 跳过 managed 配置的
+  `PYTEST_CURRENT_TEST`，也会拒绝绑定该运行配置。
 - 用户级 OpenClaw gateway 不消费 `TELEGRAM_PROXY`。程序直接托管
   `<用户家目录>/.openclaw/openclaw.json` 的 `channels.telegram.proxy`，不为它写 env drop-in。
   修改前会在 `/opt/proxyscene/openclaw-proxy-journal.json` 及其备份中持久化原值、原容器结构和共享目标；
-  journal 按 prepared/active/restoring 阶段记录所有权，只有配置写入及相关服务重启都成功后才提交或删除记录。
+  journal 按 prepared/active/restoring 阶段记录所有权，配置写入及相关频道/服务协调成功后才提交或删除记录。
+  主 journal 和备份都在读取的同一个文件描述符上校验 root 所有权、root-only 权限与普通文件类型。
   自动接管仅限有效 unit 明确使用目标用户 `HOME`，且每条最终 `ExecStart` 都是绝对 `node`/`nodejs` 直接调用
-  绝对 `.../openclaw/dist/index.js gateway` 的情况；shell、`env`、`chroot` 等 wrapper 不会被接管。任何非默认配置选择器、
+  绝对 `.../openclaw/dist/{index.js,index.mjs,entry.js,entry.mjs} gateway` 的情况；允许官方生成的数字型 Node 内存参数
+  （如 `--max-old-space-size=3969`），仅接受经实际 Node 验证的等号赋值形式。shell、`env`、`chroot` 等 wrapper
+  不会被接管。任何非默认配置选择器、
   `--profile`/`--dev`、有效 `EnvironmentFile`、默认 `.env`/`gateway.env` 中的路径选择器、配置里的
-  `$include`/运行时 env 选择器，以及 `NODE_OPTIONS`、`NODE_PATH` 或动态链接器注入变量，都会使程序失败关闭。若任一 Telegram 账号定义了账号级 `proxy`，也会拒绝接管，
+  任意对象/数组层级的 `$include`、运行时 env 选择器、`NODE_PATH` 或动态链接器注入变量都会使程序失败关闭。
+  `NODE_OPTIONS` 仅允许同一数字内存参数白名单，`--require`、`--import`、`--eval` 等代码加载选项始终拒绝；
+  dotenv 中跨行或不能明确解析的声明也会拒绝。若任一 Telegram 账号定义了账号级 `proxy`，也会拒绝接管，
   因为 OpenClaw 的账号合并语义会让它覆盖顶层 `channels.telegram.proxy`。canonical 配置缺失但任一
   `~/.openclaw/clawdbot.json` 或 `~/.clawdbot/*.json` legacy 候选生效时也会拒绝；journal 不跨路径托管。
 - 系统级 OpenClaw 无法可靠映射到配置所属用户，因此只告警并跳过配置接管，需由管理员手动设置
   `channels.telegram.proxy`。
+
+OpenClaw 优先使用官方配置监视与 Telegram 频道重载。程序在写入前记录每个网关的配置代际和频道启动状态，
+写入后通过本地只读 `config.get` / `channels.status` 确认：代理值符合待提交记录、配置代际已装载、
+启用账号以新的启动代际就绪，并且 gateway 进程没有重启。CLI 以记录用户身份、最小环境执行，输出与时间均有上限；
+不在命令行传 token，不发送 Telegram 消息。当前已按 OpenClaw 2026.9.6 验证这一协议。
+当前自动频道确认支持本地非 TLS 网关和默认/`hybrid` 重载模式。旧版本、不支持的认证/启动方式、其他重载模式、
+远端/TLS 网关、缺少确认字段或超时会明确回退整服务重启；身份或配置冲突仍报错并保留记录。
+
+Hermes 0.21.5 默认冷启动会丢弃 Telegram 服务端积压更新，`systemctl reload` 也会重启整个网关。
+因此，运行中的 Hermes 首次接管、代理修改或恢复需要能证明最终消息策略为字面布尔 `false`：
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      drop_pending_on_cold_boot: false
+```
+
+请将该项合并进现有 `~/.hermes/config.yaml`，保留原配置；不要用上述片段覆盖整个文件。
+程序会按上游优先级检查用户配置、managed 配置、legacy `gateway.json` 和其他 Telegram 配置段的合并结果，
+不能证明消息保留时会在首次/更新写入前拒绝；恢复中遇到策略变化则保留可重试记录和仍属于本程序的配置。
+proxyscene 不会自动改写这项业务设置。已经停止的服务只保存/恢复代理配置，不会被启动；之后人工启动时仍遵循 Hermes 自身消息策略。
+
+`proxyscene status` 分开显示“配置是否已写入并核对”“服务是否运行”“频道/代理连通性是否探测”。
+状态命令只读，不发送消息，不把历史 active 记录或 systemctl 零退出码当作 Telegram 已连通。
+重复开启、开机恢复或仅更换 Xray 上游节点，托管客户端配置未变时不会无意义地重启网关。
 
 默认监听地址：
 
@@ -543,6 +621,8 @@ hermes-gateway user:root:hermes-gateway
   `Environment`、`UnsetEnvironment` 与 `ExecStart=` reset 后的最终结果，而不是按文件名或文本子串猜测。
 - 运行时校验拒绝有效 systemd specifier、`ExecStart` 的 `$` 展开、启动前后钩子、`PAMName`、`DynamicUser`，以及会让服务看到
   不同文件树的 `RootDirectory`/`RootImage`、bind/image/extension/tmpfs/inaccessible namespace 和 `ProtectHome` 设置。
+  Hermes 官方的 `ExecStop=-<PROJECT_ROOT>/venv/bin/python -m gateway.systemd_stop_mark` 和
+  `ExecStopPost=-<PROJECT_ROOT>/venv/bin/python -m gateway.cgroup_cleanup` 经路径、模块和参数精确绑定后允许；任意其他钩子仍拒绝。
 - OpenClaw 必须最终同时包含 `OPENCLAW_SERVICE_MARKER=openclaw` 和
   `OPENCLAW_SERVICE_KIND=gateway`；因此 node、guard 等角色不会误命中。
 - Hermes 必须由 argv[0] 直接执行 `hermes_cli`/`hermes-agent gateway run`，或由明确的 Python 解释器直接执行
@@ -586,13 +666,13 @@ sudo PROXYSCENE_TG_SERVICES='user:alice:hermes-gateway-coder' proxyscene tg off
 | `PROXYSCENE_BASE_URL` | 空 | 自定义管理程序归档基址（必须是明确 tag 的 HTTPS 目录）。它不会改变 checksum 来源；归档必须与 GitHub Release 完全一致。 |
 | `PROXYSCENE_BUILD_FROM_SOURCE` | `0` | 设为 `1` 时完全跳过 Release 路径，只从当前可信源码 checkout 编译；不会自动启用。 |
 | `--offline`（命令行选项） | - | 显式启用离线 bundle；不会因同目录出现二进制而自动启用。要求 root 拥有且组/其他用户不可写的解压路径和完整 manifest。 |
-| `GO_VERSION` | `1.26.5` | 显式源码编译所需 Go 版本下限。改为其他版本时必须同时显式设置 `GO_TARBALL_SHA256`，否则 fail closed。 |
-| `GO_TARBALL_SHA256` | 空 | Go 安装包 SHA256。默认 Go 1.26.5 留空时使用仓库内审阅的 linux/386、amd64、arm64、armv6l 固定 SHA256 和精确大小；Go 官方不提供可依赖的逐归档 `.sha256` URL。 |
+| `GO_VERSION` | `1.27.1` | 显式源码编译所需 Go 版本下限。改为其他版本时必须同时显式设置 `GO_TARBALL_SHA256`，否则 fail closed。 |
+| `GO_TARBALL_SHA256` | 空 | Go 安装包 SHA256。默认 Go 1.27.1 留空时使用仓库内审阅的 linux/386、amd64、arm64、armv6l 固定 SHA256 和精确大小；Go 官方不提供可依赖的逐归档 `.sha256` URL。 |
 | `SKIP_GO_INSTALL` | `0` | 设为 `1` 时只使用 PATH 中已有且版本合格的 Go。 |
 | `FORCE_GO_INSTALL` | `0` | 设为 `1` 时强制在 CoreDir 的 root-only 隐藏临时目录准备指定 Go；提交或回滚时删除，不会替换系统 Go。 |
 | `PROXYSCENE_MANAGER_DIR` | `/opt/proxyscene` | 管理器核心目录；必须位于 `/opt`、`/var/lib` 或 `/var/opt` 下的专用目录，不能指向系统目录或用户家目录。 |
 | `PROXYSCENE_SWITCH_BIN` | `/usr/local/bin/proxyscene` | 管理程序绝对安装路径；父目录必须可信，basename 必须是 `proxyscene`。 |
-| `XRAY_RELEASE_BASE` | 固定 Xray v26.3.27 GitHub Release | 当前固定版本的 HTTPS 归档基址。自定义基址仍必须提供与仓库内置架构 SHA256 一致的字节。 |
+| `XRAY_RELEASE_BASE` | 固定 Xray v26.9.9 GitHub Release | 当前固定版本的 HTTPS 归档基址。自定义基址仍必须提供与仓库内置架构 SHA256 一致的字节。 |
 | `XRAY_ZIP_URL` | 空 | 自定义当前架构 Xray zip HTTPS URL；必须同时设置 `XRAY_ZIP_SHA256`。 |
 | `XRAY_ZIP_SHA256` | 空 | 自定义 Xray zip 的明确 SHA256；格式或内容不匹配即终止。 |
 | `SKIP_XRAY_INSTALL` | `0` | 设为 `1` 时仅保留现有 root 所有、组/其他用户不可写、非符号链接且架构匹配的 ELF。 |
@@ -607,7 +687,7 @@ sudo SKIP_MANAGER_INIT=1 bash ./install.sh
 sudo PROXYSCENE_VERSION=v1.0.0 \
   PROXYSCENE_BASE_URL=https://mirror.example/proxyscene/v1.0.0 \
   bash ./install.sh
-sudo XRAY_RELEASE_BASE=https://mirror.example/xray/v26.3.27 bash ./install.sh
+sudo XRAY_RELEASE_BASE=https://mirror.example/xray/v26.9.9 bash ./install.sh
 ```
 
 安装脚本会拒绝把核心目录设置为 `/etc`、`/usr`、`/home`、`/root`、`/tmp` 等敏感系统路径。入口和每个锁创建函数都会重申 `umask 077`，新目录还使用显式 `mkdir -m 0700`，因此即使调用者原先使用宽松 umask，也不会出现可由普通用户抢先写入的新目录或锁文件窗口。已有非空目录必须带可识别的 `.managed-by-proxyscene` 标记，且所有已有路径祖先必须属于 root、不可由组或其他用户写入、不能是符号链接。安装器把 `installation-ownership.json` 与已验证的管理程序放在同一文件事务中提交或回滚，即使显式 `SKIP_MANAGER_INIT=1` 也会绑定核心目录、管理程序路径和两个 systemd unit locator；后续状态读写、安装和卸载必须与该记录一致。若固定的 `/etc/proxyscene-host-ownership.json` 已存在，安装器会在任何目标文件替换前要求它是 root 所有、`0600`、非符号链接、只有一个严格 JSON 值，并与这四个 locator 精确匹配；损坏或冲突一律 fail closed。
@@ -769,13 +849,15 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./dist/proxyscene ./cmd/pro
 
 发布不需要私钥或签名 Secret。首次发布前，仓库管理员必须先在 GitHub Settings 启用 **immutable releases**，并在发起工作流前用具备 Administration 读取权限的账号确认设置仍为 `enabled=true`。GitHub Actions 的 `GITHUB_TOKEN` 没有 Administration 权限，不能可靠读取该仓库设置；工作流会在发布后强制验证 Release 的 `immutable=true`。安装器也会拒绝可变 Release，防止发布后资产和同一份 checksum 被一起替换。
 
+先在目标提交中准备 `docs/releases/vMAJOR.MINOR.PATCH.md`，首行必须是 `# proxyscene vMAJOR.MINOR.PATCH`，写明升级要求、依赖版本和兼容限制。工作流会把这份经过审阅的说明传给发布 job，并在发布后核对公开正文。
+
 之后从 Actions 页面选择 `Release`、分支选择 `main`，输入 `vMAJOR.MINOR.PATCH`；也可以执行：
 
 ```bash
-gh workflow run Release --ref main -f version=v0.8.0
+gh workflow run Release --ref main -f version=v0.9.0
 ```
 
-不要预先创建或推送 tag。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 v0.7.1 到新版本的 Debian systemd 安装/升级 canary。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
+不要预先创建或推送 tag。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 v0.7.1、v0.8.0 到新版本的 Debian systemd 安装/升级 canary。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
 
 如果创建 draft、上传资产或发布期间中断，不要直接盲目重跑完整 workflow。先在 GitHub 核对同名 tag、draft/Release 和资产是否存在；确认残留内容及目标 commit 后，人工删除未发布的残留 draft/tag，或仅重跑尚未执行的只读验证。工作流不会自动删除发布对象。
 
@@ -837,7 +919,7 @@ sudo PROXYSCENE_GLOBAL_HTTP_PORT=7898 proxyscene global on
   `EnvironmentFile`、无法绑定的 home/profile/project 或会覆盖路由的应用 `.env`，以及 OpenClaw 的非默认配置
   路径/profile/dev/include/env 选择器或账号级 `proxy` 都会中止命令；需先由管理员消除冲突，程序不会猜测或只接管部分账号。
 - Hermes 的受管 drop-in 还固定 `PYTHONSAFEPATH=1`，防止 `python -m` 把 `WorkingDirectory` 中的同名模块置于
-  已绑定 venv 之前；重启后会同时核对该值和 `TELEGRAM_PROXY`。unit、manager、dotenv 或 secret source 中冲突的
+  已绑定 venv 之前；协调后会同时核对该值、`TELEGRAM_PROXY` 和 `HERMES_TELEGRAM_DISABLE_FALLBACK_IPS=1`。unit、manager、dotenv 或 secret source 中冲突的
   `PYTHONSAFEPATH` 会 fail closed。
 - 用户级 systemd 总线未运行或重启失败时，drop-in/OpenClaw journal 会保留，命令会报告部分失败；总线恢复后应重新执行
   开启/关闭命令，让 prepared/restoring 操作完成。
@@ -861,7 +943,7 @@ shellcheck ./install.sh ./scripts/*.sh
 sudo -- bash ./scripts/install-test.sh
 ```
 
-`scripts/verify-release-artifacts.sh` 读取 `DIST`、`VERSION`、`COMMIT` 和 `SOURCE_DATE_EPOCH`，可校验指定架构或默认四架构的完整 Release 产物。每个 Release 还包含架构无关的 `xray_source_v26.3.27.tar.gz`：它保存精确 Xray commit 及 ELF 中全部 34 个模块的 Go proxy source zip、go.mod、info、module sum 和独立 SHA256；verifier 会把该清单与 bundle 内实际 Xray ELF 逐项比较。`scripts/systemd-integration-test.sh` 会启动 systemd PID 1 的一次性 Debian 容器并执行真实安装/升级/卸载，只能显式设置 `PROXYSCENE_CONTAINER_TEST=1` 后传入当前 amd64 bundle 和 v0.7.1 amd64 bundle；普通 CI 只检查它的语法和 ShellCheck，不在 runner 或宿主机执行安装，正式 Release 的只读 build job 则把它作为发布前强制门禁。测试按精确容器名和本轮唯一 label 清理容器；固定 Debian 镜像引用只有在运行前不存在、可证明是本轮新拉取时才尝试删除。
+`scripts/verify-release-artifacts.sh` 读取 `DIST`、`VERSION`、`COMMIT` 和 `SOURCE_DATE_EPOCH`，可校验指定架构或默认四架构的完整 Release 产物。每个架构的 Xray 还会按固定 ELF SHA256、实际 Go 版本、精确源码提交/module sum 和完整依赖清单进行绑定，再扫描全部实际导入包；受影响的导入包会阻断构建，不设置漏洞忽略名单。官方裁剪符号的二进制扫描报告作为保守模块告警清单保留，不能将未导入包直接视为已证明可达。每个 Release 还包含架构无关的 `xray_source_v26.9.9.tar.gz`：它保存精确 Xray commit 及 ELF 中全部 47 个模块的 Go proxy source zip、go.mod、info、module sum 和独立 SHA256；verifier 会把该清单与 bundle 内实际 Xray ELF 逐项比较。`scripts/systemd-integration-test.sh` 会启动 systemd PID 1 的一次性 Debian 容器并执行真实安装/升级/卸载，只能显式设置 `PROXYSCENE_CONTAINER_TEST=1` 后传入当前 amd64 bundle 和已固定 SHA256 的 v0.7.1 或 v0.8.0 amd64 bundle；普通 CI 只检查它的语法和 ShellCheck，不在 runner 或宿主机执行安装，正式 Release 的只读 build job 则把它作为发布前强制门禁。测试按精确容器名和本轮唯一 label 清理容器；固定 Debian 镜像引用只有在运行前不存在、可证明是本轮新拉取时才尝试删除。
 
 ## 安全与敏感信息
 

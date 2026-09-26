@@ -7,14 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
-	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -63,20 +60,23 @@ var openClawConfigSelectionEnvKeys = map[string]bool{
 }
 
 var hermesRuntimeDotEnvKeys = map[string]bool{
-	"HOME":                       true,
-	"HERMES_HOME":                true,
-	"HERMES_MANAGED_DIR":         true,
-	"HERMES_S6_SUPERVISED_CHILD": true,
-	"LD_AUDIT":                   true,
-	"LD_LIBRARY_PATH":            true,
-	"LD_PRELOAD":                 true,
-	"NO_PROXY":                   true,
-	"PYTHONHOME":                 true,
-	"PYTHONPATH":                 true,
-	"PYTHONSAFEPATH":             true,
-	"TELEGRAM_FALLBACK_IPS":      true,
-	"TELEGRAM_PROXY":             true,
-	"no_proxy":                   true,
+	"GATEWAY_MULTIPLEX_PROFILES":           true,
+	"HOME":                                 true,
+	"HERMES_HOME":                          true,
+	"HERMES_MANAGED_DIR":                   true,
+	"HERMES_S6_SUPERVISED_CHILD":           true,
+	"HERMES_TELEGRAM_DISABLE_FALLBACK_IPS": true,
+	"LD_AUDIT":                             true,
+	"LD_LIBRARY_PATH":                      true,
+	"LD_PRELOAD":                           true,
+	"NO_PROXY":                             true,
+	"PYTEST_CURRENT_TEST":                  true,
+	"PYTHONHOME":                           true,
+	"PYTHONPATH":                           true,
+	"PYTHONSAFEPATH":                       true,
+	"TELEGRAM_FALLBACK_IPS":                true,
+	"TELEGRAM_PROXY":                       true,
+	"no_proxy":                             true,
 }
 
 var hermesCodeInjectionEnvKeys = map[string]bool{
@@ -204,7 +204,7 @@ func validateOpenClawEffectiveUnit(content, expectedHome string) error {
 		if key == "HOME" {
 			continue
 		}
-		if value, present := environment[key]; present && strings.TrimSpace(value) != "" {
+		if value, present := environment[key]; present && openClawUnsafeConfigSelector(key, value) {
 			return fmt.Errorf("有效环境声明了配置选择器 %s", key)
 		}
 	}
@@ -220,6 +220,10 @@ func validateOpenClawEffectiveUnit(content, expectedHome string) error {
 		return err
 	}
 	for _, name := range passEnvironment {
+		// Validate NODE_OPTIONS against the effective manager environment below.
+		if name == "NODE_OPTIONS" {
+			continue
+		}
 		if openClawConfigSelectionEnvKeys[strings.ToUpper(name)] {
 			return fmt.Errorf("PassEnvironment 可能从 systemd manager 继承配置选择器 %s", name)
 		}
@@ -254,10 +258,92 @@ func openClawGatewayArgv(argv []string) bool {
 	if base != "node" && base != "nodejs" {
 		return false
 	}
-	script := argv[1]
-	wantSuffix := filepath.Join("openclaw", "dist", "index.js")
-	return filepath.IsAbs(script) && filepath.Clean(script) == script &&
-		strings.HasSuffix(script, string(os.PathSeparator)+wantSuffix) && argv[2] == "gateway"
+	scriptIndex := 1
+	for scriptIndex < len(argv) && strings.HasPrefix(argv[scriptIndex], "-") {
+		if !openClawMemoryOption(argv[scriptIndex]) {
+			return false
+		}
+		scriptIndex++
+	}
+	if scriptIndex+1 >= len(argv) || argv[scriptIndex+1] != "gateway" {
+		return false
+	}
+	script := argv[scriptIndex]
+	if !filepath.IsAbs(script) || filepath.Clean(script) != script {
+		return false
+	}
+	switch filepath.Base(script) {
+	case "index.js", "index.mjs", "entry.js", "entry.mjs":
+		return strings.HasSuffix(filepath.Dir(script), string(os.PathSeparator)+filepath.Join("openclaw", "dist"))
+	default:
+		return false
+	}
+}
+
+// Keep this whitelist limited to numeric memory controls. Flags that load code
+// must never pass as harmless options even if the official entrypoint follows.
+
+func openClawMemoryOption(arg string) bool {
+	flag, value, assigned := strings.Cut(arg, "=")
+	if !assigned || value == "" {
+		return false
+	}
+	flag = strings.ReplaceAll(flag, "_", "-")
+	switch flag {
+	case "--max-old-space-size", "--max-semi-space-size", "--max-heap-size", "--max-old-space-size-percentage":
+	default:
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	limit, err := strconv.ParseUint(value, 10, 53)
+	return err == nil && (flag != "--max-old-space-size-percentage" || limit > 0 && limit <= 100)
+}
+
+func openClawMemoryNodeOptions(value string) bool {
+	// NODE_OPTIONS uses literal spaces and double quotes, not shell syntax.
+	// Refuse escapes and control characters instead of guessing how Node
+	// would consume them; numeric heap options do not need either feature.
+	args := []string{}
+	var token strings.Builder
+	quoted := false
+	for _, char := range value {
+		switch {
+		case char == '"':
+			quoted = !quoted
+		case char == ' ' && !quoted:
+			if token.Len() != 0 {
+				args = append(args, token.String())
+				token.Reset()
+			}
+		case char == '\\' || char < ' ' || char > '~':
+			return false
+		default:
+			token.WriteRune(char)
+		}
+	}
+	if quoted {
+		return false
+	}
+	if token.Len() != 0 {
+		args = append(args, token.String())
+	}
+	for _, arg := range args {
+		if !openClawMemoryOption(arg) {
+			return false
+		}
+	}
+	return true
+}
+
+func openClawUnsafeConfigSelector(key, value string) bool {
+	if strings.TrimSpace(value) == "" {
+		return false
+	}
+	return key != "NODE_OPTIONS" || !openClawMemoryNodeOptions(value)
 }
 
 func openClawExecSelector(argv []string) string {
@@ -369,7 +455,7 @@ func effectiveSectionWordList(content, wantedSection, directive string) ([]strin
 	return files, nil
 }
 
-func validateTelegramServiceExecutionModel(content string, allowExecStopPost bool) error {
+func validateTelegramServiceExecutionModel(content string, allowHermesStopHooks bool) error {
 	for _, directive := range []string{"Environment", "UnsetEnvironment", "PassEnvironment", "User", "WorkingDirectory", "ExecStart"} {
 		words, err := effectiveServiceWordList(content, directive)
 		if err != nil {
@@ -424,7 +510,6 @@ func validateTelegramServiceExecutionModel(content string, allowExecStopPost boo
 		"ExecCondition",
 		"ExecStartPre",
 		"ExecStartPost",
-		"ExecStop",
 		"PAMName",
 		"RootDirectory",
 		"RootImage",
@@ -437,8 +522,8 @@ func validateTelegramServiceExecutionModel(content string, allowExecStopPost boo
 		"ExtensionDirectories",
 		"NetworkNamespacePath",
 	}
-	if !allowExecStopPost {
-		forbiddenDirectives = append(forbiddenDirectives, "ExecStopPost")
+	if !allowHermesStopHooks {
+		forbiddenDirectives = append(forbiddenDirectives, "ExecStop", "ExecStopPost")
 	}
 	for _, directive := range forbiddenDirectives {
 		words, err := effectiveServiceWordList(content, directive)
@@ -532,7 +617,7 @@ func validateOpenClawManagerEnvironment(content string, inherited map[string]str
 			// higher precedence than the user manager's inherited HOME.
 			continue
 		}
-		if value, present := environment[key]; present && strings.TrimSpace(value) != "" {
+		if value, present := environment[key]; present && openClawUnsafeConfigSelector(key, value) {
 			return fmt.Errorf("systemd manager 环境声明了配置选择器 %s", key)
 		}
 	}
@@ -547,12 +632,92 @@ func rejectOpenClawSelectorDotEnv(user string, identity *persistedUserIdentity, 
 	if err != nil {
 		return fmt.Errorf("无法安全检查 OpenClaw 环境文件 %s：%w", path, err)
 	}
+	if err := validateDotEnvText(raw); err != nil {
+		return fmt.Errorf("无法安全检查 OpenClaw 环境文件 %s：%w", path, err)
+	}
+	nodeOptionsChecked, nodeOptionsSafe := false, false
 	for _, key := range openClawDotEnvDeclaredKeys(raw) {
+		if key == "NODE_OPTIONS" {
+			if !nodeOptionsChecked {
+				nodeOptionsSafe = openClawDotEnvHasOnlyMemoryOptions(raw)
+				nodeOptionsChecked = true
+			}
+			if nodeOptionsSafe {
+				continue
+			}
+		}
 		if openClawConfigSelectionEnvKeys[strings.ToUpper(key)] {
 			return fmt.Errorf("OpenClaw 环境文件 %s 声明了配置选择器 %s，拒绝接管默认配置", path, key)
 		}
 	}
 	return nil
+}
+
+func openClawDotEnvHasOnlyMemoryOptions(raw []byte) bool {
+	// The declaration scanner deliberately over-approximates dotenv syntax.
+	// Only relax NODE_OPTIONS for unambiguous single-line assignments; bare,
+	// multiline or malformed declarations remain unsafe.
+	for _, line := range strings.FieldsFunc(normalizeDotEnvLineEndings(string(raw)), func(r rune) bool {
+		return r == '\n' || r == '\u2028' || r == '\u2029'
+	}) {
+		declared := false
+		for _, key := range openClawDotEnvDeclaredKeys([]byte(line)) {
+			if key == "NODE_OPTIONS" {
+				declared = true
+			}
+		}
+		if !declared {
+			continue
+		}
+		line = strings.TrimFunc(line, dotEnvSpace)
+		if strings.HasPrefix(line, "export") {
+			line = strings.TrimLeftFunc(line[len("export"):], dotEnvSpace)
+		}
+		if !strings.HasPrefix(line, "NODE_OPTIONS") {
+			return false
+		}
+		tail := line[len("NODE_OPTIONS"):]
+		value := strings.TrimLeftFunc(tail, dotEnvSpace)
+		if strings.HasPrefix(value, "=") {
+			value = value[1:]
+		} else if strings.HasPrefix(tail, ":") && len(tail) > 1 {
+			space, _ := utf8.DecodeRuneInString(tail[1:])
+			if !dotEnvSpace(space) {
+				return false
+			}
+			value = tail[1:]
+		} else {
+			return false
+		}
+		value = strings.TrimFunc(value, dotEnvSpace)
+		if len(value) > 0 && (value[0] == '\'' || value[0] == '"' || value[0] == '`') {
+			quote := value[0]
+			end := strings.IndexByte(value[1:], quote)
+			if end < 0 {
+				return false
+			}
+			end++
+			rest := strings.TrimFunc(value[end+1:], dotEnvSpace)
+			if rest != "" && !strings.HasPrefix(rest, "#") {
+				return false
+			}
+			value = value[1:end]
+		} else {
+			var comment bool
+			value, _, comment = strings.Cut(value, "#")
+			value = strings.TrimFunc(value, dotEnvSpace)
+			// dotenv can attach a quoted value on a later line to an empty
+			// assignment. Require explicit quotes or a comment terminator for
+			// empty values so the following line cannot hide a Node preload.
+			if value == "" && !comment {
+				return false
+			}
+		}
+		if !openClawMemoryNodeOptions(value) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateOpenClawRuntimeDotEnvFiles(user string, identity *persistedUserIdentity) error {
@@ -582,72 +747,6 @@ func readOpenClawRuntimeFile(user string, expected *persistedUserIdentity, path 
 	}
 	defer syscall.Close(dirFD)
 	return readRegularFileAtNoFollow(dirFD, filepath.Base(cleanPath), max)
-}
-
-func dotenvDeclaredKeys(raw []byte) []string {
-	return declaredDotEnvKeys(raw, false)
-}
-
-func openClawDotEnvDeclaredKeys(raw []byte) []string {
-	return declaredDotEnvKeys(raw, true)
-}
-
-func normalizeDotEnvLineEndings(content string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(content, "\r\n", "\n"), "\r", "\n")
-}
-
-func declaredDotEnvKeys(raw []byte, allowNodeColonAssignment bool) []string {
-	keys := []string{}
-	content := strings.TrimPrefix(normalizeDotEnvLineEndings(string(raw)), "\uFEFF")
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "export") && len(line) > len("export") {
-			r, _ := utf8.DecodeRuneInString(line[len("export"):])
-			if unicode.IsSpace(r) {
-				line = strings.TrimSpace(line[len("export"):])
-			}
-		}
-		key := ""
-		rest := ""
-		colonAssignment := false
-		if strings.HasPrefix(line, "'") {
-			end := strings.IndexByte(line[1:], '\'')
-			if end < 0 {
-				continue
-			}
-			end++
-			key = line[1:end]
-			rest = strings.TrimSpace(line[end+1:])
-		} else {
-			delimiters := "= #\t"
-			if allowNodeColonAssignment {
-				delimiters = "=: #\t"
-			}
-			end := strings.IndexAny(line, delimiters)
-			if end < 0 {
-				continue
-			}
-			key = line[:end]
-			if allowNodeColonAssignment && line[end] == ':' {
-				afterColon := line[end+1:]
-				if afterColon != "" {
-					r, _ := utf8.DecodeRuneInString(afterColon)
-					colonAssignment = unicode.IsSpace(r)
-				}
-			}
-			rest = strings.TrimSpace(line[end:])
-		}
-		if !strings.HasPrefix(rest, "=") && !colonAssignment {
-			continue
-		}
-		if key != "" {
-			keys = append(keys, key)
-		}
-	}
-	return keys
 }
 
 func decodeHermesDotEnv(raw []byte) (string, error) {
@@ -704,12 +803,16 @@ func decodeHermesUTF16(raw []byte, order binary.ByteOrder) (string, error) {
 }
 
 func rejectOpenClawRuntimeConfigSelectors(raw []byte) error {
+	var resolvedShape any
+	if err := decodeOpenClawJSON5Value(raw, &resolvedShape); err != nil {
+		return err
+	}
+	if openClawConfigContainsInclude(resolvedShape) {
+		return fmt.Errorf("OpenClaw 配置使用 $include，无法证明被包含配置没有路径选择器或账号级 proxy")
+	}
 	cfg, err := decodeRawJSONObject(raw, "OpenClaw 顶层配置")
 	if err != nil {
 		return err
-	}
-	if _, present := cfg["$include"]; present {
-		return fmt.Errorf("OpenClaw 配置使用 $include，无法证明被包含配置没有路径选择器或账号级 proxy")
 	}
 	envRaw, present := cfg["env"]
 	if !present {
@@ -761,6 +864,24 @@ func rejectOpenClawRuntimeConfigSelectors(raw []byte) error {
 	return nil
 }
 
+func openClawConfigContainsInclude(value any) bool {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if key == "$include" || openClawConfigContainsInclude(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if openClawConfigContainsInclude(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func firstOpenClawConfigSelector(values map[string]json.RawMessage) (string, bool, error) {
 	for key, raw := range values {
 		if !openClawConfigSelectionEnvKeys[strings.ToUpper(strings.TrimSpace(key))] {
@@ -770,7 +891,7 @@ func firstOpenClawConfigSelector(values map[string]json.RawMessage) (string, boo
 		if err := decodeOpenClawJSON5Value(raw, &value); err != nil {
 			return "", false, fmt.Errorf("OpenClaw 配置选择器 %s 的值不是字符串：%w", key, err)
 		}
-		if strings.TrimSpace(value) != "" {
+		if openClawUnsafeConfigSelector(key, value) {
 			return key, true, nil
 		}
 	}
@@ -778,6 +899,10 @@ func firstOpenClawConfigSelector(values map[string]json.RawMessage) (string, boo
 }
 
 func validateHermesTargetRuntime(target systemdTargetName, identity *persistedUserIdentity, expectedProxy string) error {
+	return validateHermesTargetRuntimeWithRestartPolicy(target, identity, expectedProxy, false)
+}
+
+func validateHermesTargetRuntimeWithRestartPolicy(target systemdTargetName, identity *persistedUserIdentity, expectedProxy string, checkRestartPolicy bool) error {
 	if target.UserMode {
 		if err := verifyTelegramUserIdentity(target, identity); err != nil {
 			return err
@@ -787,7 +912,8 @@ func validateHermesTargetRuntime(target systemdTargetName, identity *persistedUs
 	if err != nil {
 		return err
 	}
-	if err := validateHermesEffectiveUnit(content); err != nil {
+	projectRoot, err := validateHermesEffectiveUnit(content)
+	if err != nil {
 		return fmt.Errorf("目标 Hermes 服务 %s 无法保证 Telegram 代理生效：%w", canonicalTelegramTargetName(target), err)
 	}
 	managerEnvironment, err := telegramTargetManagerEnvironment(target, identity, telegramLookupUserIdentity)
@@ -810,44 +936,53 @@ func validateHermesTargetRuntime(target systemdTargetName, identity *persistedUs
 	if err := validateHermesPythonSafePath(effectiveEnvironment, expectedProxy != ""); err != nil {
 		return fmt.Errorf("目标 Hermes 服务 %s 的 Python 模块搜索路径不安全：%w", canonicalTelegramTargetName(target), err)
 	}
-	if err := validateHermesRuntimeFiles(target, identity, content, effectiveEnvironment); err != nil {
+	if err := validateHermesFallbackDiscoveryEnvironment(effectiveEnvironment, expectedProxy != ""); err != nil {
+		return fmt.Errorf("目标 Hermes 服务 %s 的 Telegram 辅助网络发现不符合受管策略：%w", canonicalTelegramTargetName(target), err)
+	}
+	if err := validateHermesRuntimeFilesWithRestartPolicy(target, identity, content, projectRoot, effectiveEnvironment, checkRestartPolicy); err != nil {
 		return fmt.Errorf("目标 Hermes 服务 %s 的应用级环境无法安全验证：%w", canonicalTelegramTargetName(target), err)
 	}
 	return nil
 }
 
-func validateHermesEffectiveUnit(content string) error {
+// validateHermesEffectiveUnit returns the project root bound to the validated
+// ExecStart. Reuse it only within this runtime check; later operations must read
+// and validate the effective unit and user identity again.
+func validateHermesEffectiveUnit(content string) (string, error) {
 	if err := validateTelegramServiceExecutionModel(content, true); err != nil {
-		return err
+		return "", err
 	}
 	execStarts, err := effectiveServiceExecStarts(content)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(execStarts) != 1 || !hermesGatewayArgv(execStarts[0]) {
-		return fmt.Errorf("有效 ExecStart 必须且只能有一个 Hermes gateway 直接调用")
+		return "", fmt.Errorf("有效 ExecStart 必须且只能有一个 Hermes gateway 直接调用")
 	}
-	projectRoot, err := hermesProjectRootFromExec(content)
+	projectRoot, err := hermesProjectRootFromArgv(execStarts[0])
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := validateHermesCleanupHook(content, projectRoot); err != nil {
-		return err
+		return "", err
+	}
+	if err := validateHermesPlannedStopHook(content, projectRoot); err != nil {
+		return "", err
 	}
 	environmentFiles, err := effectiveServiceEnvironmentFiles(content)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(environmentFiles) != 0 {
-		return fmt.Errorf("存在有效 EnvironmentFile，无法证明其中的 NO_PROXY 不会绕过 Telegram")
+		return "", fmt.Errorf("存在有效 EnvironmentFile，无法证明其中的 NO_PROXY 不会绕过 Telegram")
 	}
 	passEnvironment, err := effectiveServicePassEnvironment(content)
 	if err != nil {
-		return err
+		return "", err
 	}
 	for _, name := range passEnvironment {
 		if hermesRuntimeDotEnvKeys[name] {
-			return fmt.Errorf("PassEnvironment 可能从 systemd manager 继承 Hermes 路由变量 %s", name)
+			return "", fmt.Errorf("PassEnvironment 可能从 systemd manager 继承 Hermes 路由变量 %s", name)
 		}
 	}
 	for _, argv := range execStarts {
@@ -855,39 +990,50 @@ func validateHermesEffectiveUnit(content string) error {
 			upperArg := strings.ToUpper(arg)
 			for name := range hermesRuntimeDotEnvKeys {
 				if containsShellAssignment(upperArg, strings.ToUpper(name)) {
-					return fmt.Errorf("ExecStart 内声明了 Hermes 路由变量 %s，无法证明 Telegram 代理生效", name)
+					return "", fmt.Errorf("ExecStart 内声明了 Hermes 路由变量 %s，无法证明 Telegram 代理生效", name)
 				}
 			}
 			if containsCommandOption(arg, "--profile") || containsCommandOption(arg, "-p") {
-				return fmt.Errorf("ExecStart 使用 Hermes profile 选择器，无法绑定实际 HERMES_HOME")
+				return "", fmt.Errorf("ExecStart 使用 Hermes profile 选择器，无法绑定实际 HERMES_HOME")
 			}
 		}
 	}
 	environment, err := effectiveServiceEnvironment(content)
 	if err != nil {
-		return err
+		return "", err
+	}
+	if err := validateHermesMultiplexEnvironment(environment); err != nil {
+		return "", err
 	}
 	if environment["HERMES_S6_SUPERVISED_CHILD"] != "" {
-		return fmt.Errorf("HERMES_S6_SUPERVISED_CHILD 会改变 Hermes active_profile 选择，无法绑定实际 HERMES_HOME")
+		return "", fmt.Errorf("HERMES_S6_SUPERVISED_CHILD 会改变 Hermes active_profile 选择，无法绑定实际 HERMES_HOME")
 	}
 	for key := range hermesCodeInjectionEnvKeys {
 		if environment[key] != "" {
-			return fmt.Errorf("%s 会改变 Hermes 实际加载的代码", key)
+			return "", fmt.Errorf("%s 会改变 Hermes 实际加载的代码", key)
 		}
 	}
 	if err := validateHermesPythonSafePath(environment, false); err != nil {
-		return err
+		return "", err
 	}
 	for _, key := range []string{"NO_PROXY", "no_proxy"} {
 		if entry, ok := firstHermesTelegramNoProxyMatch(environment[key]); ok {
-			return fmt.Errorf("%s 中的 %q 会绕过 api.telegram.org 或 Hermes Telegram 回退网段", key, entry)
+			return "", fmt.Errorf("%s 中的 %q 会绕过 api.telegram.org 或 Hermes Telegram 回退网段", key, entry)
 		}
 	}
-	return nil
+	return projectRoot, nil
 }
 
 func validateHermesCleanupHook(content, projectRoot string) error {
-	commands, err := effectiveServiceCommands(content, "ExecStopPost")
+	return validateHermesStopHook(content, projectRoot, "ExecStopPost", "gateway.cgroup_cleanup")
+}
+
+func validateHermesPlannedStopHook(content, projectRoot string) error {
+	return validateHermesStopHook(content, projectRoot, "ExecStop", "gateway.systemd_stop_mark")
+}
+
+func validateHermesStopHook(content, projectRoot, directive, module string) error {
+	commands, err := effectiveServiceCommands(content, directive)
 	if err != nil {
 		return err
 	}
@@ -896,8 +1042,8 @@ func validateHermesCleanupHook(content, projectRoot string) error {
 	}
 	expectedCommand := "-" + filepath.Join(projectRoot, "venv", "bin", "python")
 	if len(commands) != 1 || len(commands[0]) != 3 ||
-		commands[0][0] != expectedCommand || commands[0][1] != "-m" || commands[0][2] != "gateway.cgroup_cleanup" {
-		return fmt.Errorf("ExecStopPost 必须且只能是与 Hermes PROJECT_ROOT 绑定的 %s -m gateway.cgroup_cleanup", expectedCommand)
+		commands[0][0] != expectedCommand || commands[0][1] != "-m" || commands[0][2] != module {
+		return fmt.Errorf("%s 必须且只能是与 Hermes PROJECT_ROOT 绑定的 %s -m %s", directive, expectedCommand, module)
 	}
 	return nil
 }
@@ -935,6 +1081,9 @@ func effectiveServiceCommands(content, directive string) ([][]string, error) {
 }
 
 func validateHermesManagerEnvironment(environment map[string]string) error {
+	if err := validateHermesMultiplexEnvironment(environment); err != nil {
+		return err
+	}
 	if environment["HERMES_S6_SUPERVISED_CHILD"] != "" {
 		return fmt.Errorf("HERMES_S6_SUPERVISED_CHILD 会改变 Hermes active_profile 选择")
 	}
@@ -965,7 +1114,14 @@ func validateHermesPythonSafePath(environment map[string]string, required bool) 
 	return nil
 }
 
-func validateHermesRuntimeFiles(target systemdTargetName, identity *persistedUserIdentity, content string, environment map[string]string) error {
+func validateHermesRuntimeFiles(target systemdTargetName, identity *persistedUserIdentity, content, projectRoot string, environment map[string]string) error {
+	return validateHermesRuntimeFilesWithRestartPolicy(target, identity, content, projectRoot, environment, false)
+}
+
+func validateHermesRuntimeFilesWithRestartPolicy(target systemdTargetName, identity *persistedUserIdentity, content, projectRoot string, environment map[string]string, checkRestartPolicy bool) error {
+	if _, present := environment["PYTEST_CURRENT_TEST"]; present {
+		return fmt.Errorf("PYTEST_CURRENT_TEST 会改变 Hermes managed 配置加载，无法绑定实际生效配置")
+	}
 	user, runtimeIdentity, err := hermesRuntimeIdentity(target, identity, content)
 	if err != nil {
 		return err
@@ -984,6 +1140,11 @@ func validateHermesRuntimeFiles(target systemdTargetName, identity *persistedUse
 		return fmt.Errorf("HERMES_HOME 必须位于服务用户 %s 的已绑定 home 内：%s", user, hermesHome)
 	}
 
+	defaultRoot := filepath.Join(runtimeIdentity.Home, ".hermes")
+	if strings.HasPrefix(hermesHome, defaultRoot+string(os.PathSeparator)) &&
+		filepath.Dir(hermesHome) != filepath.Join(defaultRoot, "profiles") {
+		return fmt.Errorf("HERMES_HOME 位于默认根内但不是直接 profile，无法绑定新版 Hermes profile 枚举根")
+	}
 	hermesRoot := hermesHome
 	activeHome := hermesHome
 	if filepath.Base(filepath.Dir(hermesHome)) == "profiles" {
@@ -1004,10 +1165,10 @@ func validateHermesRuntimeFiles(target systemdTargetName, identity *persistedUse
 		}
 	}
 
-	projectRoot, err := hermesProjectRootFromExec(content)
-	if err != nil {
+	if err := validateHermesSingleProfile(user, runtimeIdentity, hermesRoot, activeHome); err != nil {
 		return err
 	}
+
 	expectedProjectRoot := filepath.Join(hermesRoot, "hermes-agent")
 	if projectRoot != expectedProjectRoot {
 		return fmt.Errorf("检测到 Hermes PROJECT_ROOT=%s 与可验证路径 %s 不一致", projectRoot, expectedProjectRoot)
@@ -1038,8 +1199,22 @@ func validateHermesRuntimeFiles(target systemdTargetName, identity *persistedUse
 	if err := rejectHermesSystemDotEnv("/etc/hermes/.env"); err != nil {
 		return err
 	}
-	if err := rejectHermesManagedConfig("/etc/hermes/config.yaml"); err != nil {
-		return err
+	managedConfigPath := "/etc/hermes/config.yaml"
+	managedRaw, err := readHermesManagedRuntimeFile(managedConfigPath, maxHermesRuntimeConfigBytes)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("无法安全检查 Hermes managed 配置文件 %s：%w", managedConfigPath, err)
+	}
+	if err == nil {
+		if err := rejectHermesConfigOverrides(managedConfigPath, managedRaw); err != nil {
+			return err
+		}
+	}
+	if checkRestartPolicy {
+		legacyRaw, err := readHermesRuntimeFile(user, runtimeIdentity, filepath.Join(activeHome, "gateway.json"), maxHermesRuntimeConfigBytes)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("无法安全检查 Hermes gateway.json 的重启消息策略：%w", err)
+		}
+		return validateHermesTelegramRestartConfig(configPath, configRaw, managedRaw, legacyRaw)
 	}
 	return nil
 }
@@ -1100,39 +1275,18 @@ func effectiveServiceSingleWord(content, directive string) (string, error) {
 	return value, nil
 }
 
-func hermesProjectRootFromExec(content string) (string, error) {
-	execStarts, err := effectiveServiceExecStarts(content)
-	if err != nil {
-		return "", err
-	}
-	root := ""
-	for _, argv := range execStarts {
-		if !hermesGatewayArgv(argv) {
+// The caller has already required one direct Hermes gateway ExecStart.
+func hermesProjectRootFromArgv(argv []string) (string, error) {
+	for _, arg := range argv {
+		if !filepath.IsAbs(arg) || filepath.Clean(arg) != arg {
 			continue
 		}
-		candidate := ""
-		for _, arg := range argv {
-			if !filepath.IsAbs(arg) || filepath.Clean(arg) != arg {
-				continue
-			}
-			marker := string(os.PathSeparator) + "venv" + string(os.PathSeparator) + "bin" + string(os.PathSeparator)
-			if index := strings.Index(arg, marker); index > 0 {
-				candidate = filepath.Clean(arg[:index])
-				break
-			}
+		marker := string(os.PathSeparator) + "venv" + string(os.PathSeparator) + "bin" + string(os.PathSeparator)
+		if index := strings.Index(arg, marker); index > 0 {
+			return filepath.Clean(arg[:index]), nil
 		}
-		if candidate == "" {
-			return "", fmt.Errorf("无法从 Hermes gateway ExecStart 绑定 PROJECT_ROOT")
-		}
-		if root != "" && root != candidate {
-			return "", fmt.Errorf("检测到 Hermes gateway ExecStart 指向多个 PROJECT_ROOT")
-		}
-		root = candidate
 	}
-	if root == "" {
-		return "", fmt.Errorf("没有可验证 PROJECT_ROOT 的 Hermes gateway ExecStart")
-	}
-	return root, nil
+	return "", fmt.Errorf("无法从 Hermes gateway ExecStart 绑定 PROJECT_ROOT")
 }
 
 func validHermesProfileName(name string) bool {
@@ -1275,6 +1429,9 @@ func rejectHermesConfigOverrides(path string, raw []byte) error {
 	if err := yaml.Unmarshal(raw, &document); err != nil {
 		return fmt.Errorf("无法安全解析 Hermes config.yaml %s：%w", path, err)
 	}
+	if err := rejectHermesMultiplexConfig(document); err != nil {
+		return fmt.Errorf("电报代理：Hermes config.yaml %s：%w", path, err)
+	}
 	for name, value := range document {
 		if hermesRuntimeDotEnvKeys[name] && hermesConfigEnvironmentScalar(value) {
 			return fmt.Errorf("检测到 Hermes config.yaml %s 的顶层标量 %s 会在启动后覆盖或绕过代理", path, name)
@@ -1334,92 +1491,4 @@ func hermesConfigEnvironmentScalar(value any) bool {
 	default:
 		return false
 	}
-}
-
-func firstHermesTelegramNoProxyMatch(value string) (string, bool) {
-	for _, entry := range strings.Split(value, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry != "" && hermesNoProxyEntryMatchesTelegram(entry) {
-			return entry, true
-		}
-	}
-	return "", false
-}
-
-func hermesNoProxyEntryMatchesTelegram(entry string) bool {
-	token := strings.ToLower(strings.TrimSpace(entry))
-	if token == "*" {
-		return true
-	}
-	host, hasPort := noProxyTokenHost(token)
-	if host == "" || hasPort {
-		return false
-	}
-	if prefix, err := netip.ParsePrefix(host); err == nil {
-		return hermesNoProxyIPv4PrefixCanMatchFallback(prefix.Masked())
-	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		return hermesFallbackIPv4Allowed(addr)
-	}
-	apiHost := "api.telegram.org"
-	if strings.HasPrefix(host, "*.") {
-		return strings.HasSuffix(apiHost, host[1:])
-	}
-	if strings.HasPrefix(host, ".") {
-		return apiHost == host[1:] || strings.HasSuffix(apiHost, host)
-	}
-	return apiHost == host || strings.HasSuffix(apiHost, "."+host)
-}
-
-func hermesFallbackIPv4Allowed(addr netip.Addr) bool {
-	return addr.Is4() && !addr.IsPrivate() && !addr.IsLoopback() &&
-		!addr.IsLinkLocalUnicast() && !addr.IsUnspecified()
-}
-
-func hermesNoProxyIPv4PrefixCanMatchFallback(prefix netip.Prefix) bool {
-	if !prefix.Addr().Is4() {
-		return false
-	}
-	// Hermes accepts arbitrary non-private IPv4 fallback addresses from config
-	// and DoH. A prefix is safe only when every address is inside one of the
-	// categories Hermes rejects. This deliberately treats other reserved ranges
-	// conservatively because Python's ipaddress classification varies by release.
-	for _, internal := range []netip.Prefix{
-		netip.MustParsePrefix("10.0.0.0/8"),
-		netip.MustParsePrefix("127.0.0.0/8"),
-		netip.MustParsePrefix("169.254.0.0/16"),
-		netip.MustParsePrefix("172.16.0.0/12"),
-		netip.MustParsePrefix("192.168.0.0/16"),
-	} {
-		if internal.Bits() <= prefix.Bits() && internal.Contains(prefix.Addr()) {
-			return false
-		}
-	}
-	return !(prefix.Bits() == 32 && prefix.Addr().IsUnspecified())
-}
-
-func noProxyTokenHost(token string) (string, bool) {
-	if strings.Contains(token, "://") {
-		parsed, err := url.Parse(token)
-		if err != nil || parsed.Hostname() == "" {
-			return "", false
-		}
-		return strings.ToLower(strings.TrimSuffix(parsed.Hostname(), ".")), parsed.Port() != ""
-	}
-	if strings.HasPrefix(token, "[") {
-		end := strings.IndexByte(token, ']')
-		if end < 0 {
-			return strings.Trim(token, "[]"), false
-		}
-		host := token[1:end]
-		rest := token[end+1:]
-		return strings.TrimSuffix(host, "."), strings.HasPrefix(rest, ":") && rest[1:] != ""
-	}
-	if strings.Count(token, ":") == 1 {
-		host, port, _ := strings.Cut(token, ":")
-		if _, err := strconv.Atoi(port); err == nil {
-			return strings.TrimSuffix(host, "."), true
-		}
-	}
-	return strings.TrimSuffix(strings.Trim(token, "[]"), "."), false
 }

@@ -464,3 +464,35 @@ func TestUseNodeInStoreChineseScopeAliases(t *testing.T) {
 		t.Fatalf("未知范围应报错")
 	}
 }
+
+func TestUserCommandDoesNotInheritCallerSecretsOrWorkingDirectory(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := lookupLocalUserIdentity(current.Username)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		// Exercise the actual privilege boundary with a numeric identity. The
+		// target does not need a passwd entry or access to the caller's cwd.
+		identity = localUserIdentity{Name: "audit-user", UID: 65534, GID: 65534, Home: "/tmp"}
+	}
+	t.Setenv("PROXYSCENE_AUDIT_ROOT_SENTINEL", "fake-root-only-secret")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "fake-credential")
+	t.Setenv("NODE_OPTIONS", "--fake-runtime-hook")
+	t.Setenv("BASH_ENV", "/nonexistent/caller-hook")
+	cmd, _, err := commandForUserIdentity(context.Background(), identity.Name, identity, "/bin/sh", "-c", `printf '%s\n' "$HOME" "$PWD" "${PROXYSCENE_AUDIT_ROOT_SENTINEL-unset}" "${AWS_SECRET_ACCESS_KEY-unset}" "${NODE_OPTIONS-unset}" "${BASH_ENV-unset}"; id -u`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("child: %v: %s", err, out)
+	}
+	want := identity.Home + "\n" + identity.Home + "\nunset\nunset\nunset\nunset\n" + strconv.Itoa(identity.UID) + "\n"
+	if string(out) != want {
+		t.Fatalf("isolated command output = %q, want %q", out, want)
+	}
+}

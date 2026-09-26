@@ -1,6 +1,6 @@
 module proxyscene
 
-go 1.26.5
+go 1.27.1
 
 require (
 	github.com/titanous/json5 v1.0.0

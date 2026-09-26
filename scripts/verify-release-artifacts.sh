@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
-export LC_ALL=C TZ=UTC
+export LC_ALL=C TZ=UTC GOENV=off GOWORK=off GOTOOLCHAIN=local GOFLAGS=''
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -12,17 +12,17 @@ VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo d
 VERSION="${VERSION#v}"
 COMMIT="${COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD 2>/dev/null || echo 0)}"
-XRAY_VERSION="v26.3.27"
-XRAY_COMMIT="d2758a023cd7f4174a5a5fa4ff66e487d4342ba0"
-XRAY_SOURCE_MODULE_VERSION="v1.260327.0"
-XRAY_SOURCE_MODULE_SUM="h1:g4TzxMwyPrxslZh6uD+FiG3lXKTrnNO+b4ky2OhogHE="
+XRAY_VERSION="v26.9.9"
+XRAY_COMMIT="52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120"
+XRAY_SOURCE_MODULE_VERSION="v1.260327.1-0.20260908222543-52a412d9e2f5"
+XRAY_SOURCE_MODULE_SUM="h1:BsUC2sCXcdVCb09SUh1iWku0ci779t4bUIlKUor1ZRI="
 
 fail() {
   printf 'release artifact verification failed: %s\n' "$*" >&2
   exit 1
 }
 
-for tool in awk cmp date diff find go grep mkdir mktemp od rm sha256sum sort stat strings tar tr; do
+for tool in awk cmp date diff find go grep jq mkdir mktemp od rm sha256sum sort stat strings tar tr; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing required tool: $tool"
 done
 [[ -d "$DIST" ]] || fail "missing dist directory: $DIST"
@@ -201,6 +201,7 @@ for arch in "${targets[@]}"; do
 
   validate_elf "$manager_dir/proxyscene" "$arch" "$arch manager"
   validate_elf "$bundle_dir/xray" "$arch" "$arch Xray"
+  "$SCRIPT_DIR/verify-xray-security.sh" "$bundle_dir/xray"
   cmp "$manager_dir/proxyscene" "$bundle_dir/proxyscene" \
     || fail "$arch manager differs between standalone and bundle archives"
   cmp "$manager_dir/LICENSE" "$bundle_dir/LICENSE" \
@@ -218,6 +219,16 @@ for arch in "${targets[@]}"; do
   if [[ -z "$reference_xray" ]]; then
     reference_xray="$bundle_dir/xray"
     reference_xray_license="$bundle_dir/LICENSE-Xray"
+    cp -- "$reference_xray" "$work/tampered-xray"
+    printf 'tampered\n' >> "$work/tampered-xray"
+    if "$SCRIPT_DIR/verify-xray-security.sh" "$work/tampered-xray" > "$work/tamper-check.log" 2>&1; then
+      fail "Xray security gate accepted changed runtime bytes"
+    fi
+    grep -Fq 'binary digest differs from the reviewed upstream asset' "$work/tamper-check.log" \
+      || fail "Xray security gate failed tampered bytes for an unexpected reason"
+    rm -- "$work/tampered-xray"
+    TEST_LOG_DIR="$work/cache-regressions" "$SCRIPT_DIR/verify-xray-security-test.sh" \
+      "$SCRIPT_DIR/verify-xray-security.sh" "$reference_xray"
   fi
 
   embedded="$(strings -a "$manager_dir/proxyscene")"
@@ -295,10 +306,10 @@ actual_source_files="$(find "$source_root" -type f ! -name source-manifest.sha25
 (cd "$source_root" && sha256sum -c source-manifest.sha256) >/dev/null \
   || fail "Xray source manifest verification failed"
 
-expected_module_dirs="$(awk 'BEGIN { for (i = 0; i < 35; i++) printf "%04d\n", i }')"
+expected_module_dirs="$(awk 'BEGIN { for (i = 0; i < 48; i++) printf "%04d\n", i }')"
 actual_module_dirs="$(find "$source_root/modules" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)"
 [[ "$actual_module_dirs" == "$expected_module_dirs" ]] \
-  || fail "Xray source archive does not contain exactly 35 numbered module directories"
+  || fail "Xray source archive does not contain exactly 48 numbered module directories"
 while IFS= read -r module_index; do
   module_files="$(find "$source_root/modules/$module_index" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)"
   [[ "$module_files" == $'go.mod\ninfo.json\nsource.zip' ]] \
@@ -326,7 +337,7 @@ awk -F '\t' \
   NR > 2 {
     if ($1 != "dependency") exit 1
   }
-  END { if (NR != 36) exit 1 }
+  END { if (NR != 49) exit 1 }
 ' "$source_root/MODULES.tsv" \
   || fail "Xray source module inventory is invalid"
 
@@ -342,9 +353,23 @@ cmp -- "$binary_deps" "$source_deps" \
 
 {
   IFS= read -r _header
-  while IFS=$'\t' read -r _kind _module _version _sum zip_sha source_path; do
+  while IFS=$'\t' read -r _kind module version expected_sum zip_sha source_path; do
     [[ "$(sha256sum "$source_root/$source_path" | awk '{print $1}')" == "$zip_sha" ]] \
       || fail "Xray source zip digest mismatch: $source_path"
+    # The Xray security gates above rehashed the complete cache (including Xray
+    # itself). Bind archive bytes to that verified cache, not only its manifest.
+    metadata="$(go mod download -json "$module@$version")" \
+      || fail "cannot obtain verified module source: $module@$version"
+    jq -e --arg module "$module" --arg version "$version" --arg sum "$expected_sum" \
+      '.Path == $module and .Version == $version and .Sum == $sum' <<< "$metadata" >/dev/null \
+      || fail "archived module identity mismatch: $module@$version"
+    module_source_root="$source_root/${source_path%/source.zip}"
+    cmp -- "$module_source_root/source.zip" "$(jq -er '.Zip' <<< "$metadata")" \
+      || fail "archived source differs from verified module contents: $module@$version"
+    cmp -- "$module_source_root/go.mod" "$(jq -er '.GoMod' <<< "$metadata")" \
+      || fail "archived go.mod differs from verified module metadata: $module@$version"
+    cmp -- "$module_source_root/info.json" "$(jq -er '.Info' <<< "$metadata")" \
+      || fail "archived info differs from verified module metadata: $module@$version"
   done
 } < "$source_root/MODULES.tsv"
 
@@ -354,6 +379,10 @@ grep -Fq -- "$XRAY_COMMIT" "$source_root/README" \
   || fail "Xray source archive README is not bound to the reviewed commit"
 cmp -- LICENSE-GPL-3.0 "$source_root/LICENSE-GPL-3.0" \
   || fail "Xray source archive GPL-3.0 text differs from the reviewed copy"
+"$SCRIPT_DIR/generate-xray-third-party-licenses.sh" \
+  "$reference_xray" "$work/verified-xray-licenses" "$XRAY_VERSION" "$XRAY_COMMIT"
+cmp -- THIRD_PARTY_LICENSES-Xray "$work/verified-xray-licenses" \
+  || fail "Xray license collection differs from verified module source contents"
 cmp -- THIRD_PARTY_LICENSES-Xray "$source_root/THIRD_PARTY_LICENSES-Xray" \
   || fail "Xray source archive license collection differs from the reviewed copy"
 cmp -- "$reference_xray_license" "$source_root/LICENSE-Xray" \

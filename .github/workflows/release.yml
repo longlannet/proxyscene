@@ -57,6 +57,16 @@ jobs:
             exit 1
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Prepare reviewed release notes
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          notes="docs/releases/${VERSION}.md"
+          [[ -f "$notes" && ! -L "$notes" && -s "$notes" ]]
+          [[ "$(head -n 1 "$notes")" == "# proxyscene ${VERSION}" ]]
+          cp -- "$notes" "$RUNNER_TEMP/release-notes.md"
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
@@ -65,7 +75,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils jq shellcheck unzip
+          sudo apt-get install -y binutils jq python3 shellcheck unzip
       - name: Verify module cache
         run: go mod verify
       - name: Formatting
@@ -86,14 +96,15 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Static analysis
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
       - name: Vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: Shell validation
         run: |
-          bash -n install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
-          shellcheck install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
+          for script in install.sh scripts/*.sh; do bash -n "$script"; done
+          shellcheck install.sh scripts/*.sh
           sudo -- bash scripts/install-test.sh
+          sudo -- bash scripts/bootstrap-test.sh
       - name: Workflow validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
       - name: Require clean source before build
@@ -146,11 +157,8 @@ jobs:
           tar xzf dist/proxyscene_bundle_linux_amd64.tar.gz -C "$verify_dir"
           PROXYSCENE_TEST_XRAY="$verify_dir/proxyscene_bundle_linux_amd64/xray" \
             go test ./internal/manager -run '^TestGeneratedTransportConfigsPassPinnedXray$'
-      - name: Disposable systemd install and v0.7.1 upgrade canary
+      - name: Disposable systemd install and baseline upgrade canaries
         shell: bash
-        env:
-          V071_BUNDLE_URL: https://github.com/longlannet/proxyscene/releases/download/v0.7.1/proxyscene_bundle_linux_amd64.tar.gz
-          V071_BUNDLE_SHA256: 08a12e5716166c76095c54f6ea8227db8f623a719051479ceb7d6720c5c0da38
         run: |
           set -euo pipefail
           canary_dir="$(mktemp -d "${RUNNER_TEMP}/proxyscene-systemd-canary.XXXXXX")"
@@ -158,13 +166,21 @@ jobs:
             rm -rf -- "$canary_dir"
           }
           trap cleanup EXIT
-          old_bundle="$canary_dir/proxyscene_bundle_linux_amd64-v0.7.1.tar.gz"
-          curl -q -fsSL --proto '=https' --proto-redir '=https' \
-            --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 \
-            --max-filesize 104857600 -o "$old_bundle" "$V071_BUNDLE_URL"
-          printf '%s  %s\n' "$V071_BUNDLE_SHA256" "$old_bundle" | sha256sum -c -
-          PROXYSCENE_CONTAINER_TEST=1 bash scripts/systemd-integration-test.sh \
-            dist/proxyscene_bundle_linux_amd64.tar.gz "$old_bundle"
+          versions=(v0.7.1 v0.8.0)
+          digests=(
+            08a12e5716166c76095c54f6ea8227db8f623a719051479ceb7d6720c5c0da38
+            6f650d09dcb67d1f745b2e381e6358b2821253edea8b365415f9922e0bbe171a
+          )
+          for i in "${!versions[@]}"; do
+            old_bundle="$canary_dir/proxyscene_bundle_linux_amd64-${versions[$i]}.tar.gz"
+            curl -q -fsSL --proto '=https' --proto-redir '=https' \
+              --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 \
+              --max-filesize 104857600 -o "$old_bundle" \
+              "https://github.com/longlannet/proxyscene/releases/download/${versions[$i]}/proxyscene_bundle_linux_amd64.tar.gz"
+            printf '%s  %s\n' "${digests[$i]}" "$old_bundle" | sha256sum -c -
+            PROXYSCENE_CONTAINER_TEST=1 bash scripts/systemd-integration-test.sh \
+              dist/proxyscene_bundle_linux_amd64.tar.gz "$old_bundle"
+          done
       - name: Require clean source after build
         shell: bash
         env:
@@ -189,6 +205,13 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 1
+      - name: Upload reviewed release notes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/release-notes.md
+          if-no-files-found: error
+          retention-days: 1
 
   publish:
     name: Publish release
@@ -204,6 +227,11 @@ jobs:
         with:
           name: release-set
           path: dist
+      - name: Download reviewed release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-notes
+          path: release-metadata
       - name: Create Release
         shell: bash
         env:
@@ -242,7 +270,7 @@ jobs:
           gh release create "$VERSION" dist/* \
             --target "$EXPECTED_COMMIT" \
             --title "$VERSION" \
-            --generate-notes \
+            --notes-file release-metadata/release-notes.md \
             --draft
           gh release edit "$VERSION" --draft=false --latest
 
@@ -262,6 +290,11 @@ jobs:
         with:
           name: release-set
           path: dist
+      - name: Download reviewed release notes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-notes
+          path: release-metadata
       - name: Verify immutable Latest and downloaded assets
         shell: bash
         env:
@@ -283,6 +316,10 @@ jobs:
             .immutable == true and
             .draft == false and
             .prerelease == false
+          ' "$verify_dir/release.json" >/dev/null
+          jq -e --rawfile notes release-metadata/release-notes.md '
+            def normalized: gsub("\r\n"; "\n") | sub("\n+$"; "");
+            (.body | normalized) == ($notes | normalized)
           ' "$verify_dir/release.json" >/dev/null
           gh api "repos/${GITHUB_REPOSITORY}/releases/latest" > "$verify_dir/latest.json"
           jq -e --arg version "$VERSION" '

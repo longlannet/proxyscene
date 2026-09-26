@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 )
 
 // OpenClaw 不读取 TELEGRAM_*PROXY 环境变量，其「仅代理 Telegram」的唯一开关是配置项
@@ -230,16 +231,44 @@ func validateOpenClawProxyJournal(journal *openClawProxyJournal) error {
 	return nil
 }
 
-func (a *App) loadOpenClawProxyJournal() (*openClawProxyJournal, error) {
-	load := func(path string) (*openClawProxyJournal, error) {
-		raw, err := readRegularFileNoFollow(path, maxOpenClawJournalBytes)
-		if err != nil {
-			return nil, err
-		}
-		return decodeOpenClawProxyJournal(raw)
+func readOpenClawJournalFile(path string) (*openClawProxyJournal, error) {
+	dirFD, err := syscall.Open(filepath.Dir(path), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
 	}
-	mainJournal, mainErr := load(a.openClawJournalPath())
-	backupJournal, backupErr := load(a.openClawJournalBackupPath())
+	defer syscall.Close(dirFD)
+	fd, err := syscall.Openat(dirFD, filepath.Base(path), syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	// Validate the opened inode before reading it. A later pathname lookup could
+	// validate a different file from the one whose ownership data we decode.
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil {
+		return nil, err
+	}
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG || stat.Mode&0o077 != 0 ||
+		(os.Geteuid() == 0 && stat.Uid != 0) {
+		return nil, fmt.Errorf("OpenClaw 代理 journal 必须是 root-owned、root-only 普通文件：%s", path)
+	}
+	if stat.Size > maxOpenClawJournalBytes {
+		return nil, fmt.Errorf("OpenClaw 代理 journal 超过 %d 字节上限", maxOpenClawJournalBytes)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxOpenClawJournalBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > maxOpenClawJournalBytes {
+		return nil, fmt.Errorf("OpenClaw 代理 journal 超过 %d 字节上限", maxOpenClawJournalBytes)
+	}
+	return decodeOpenClawProxyJournal(raw)
+}
+
+func (a *App) loadOpenClawProxyJournal() (*openClawProxyJournal, error) {
+	mainJournal, mainErr := readOpenClawJournalFile(a.openClawJournalPath())
+	backupJournal, backupErr := readOpenClawJournalFile(a.openClawJournalBackupPath())
 	if mainErr == nil && backupErr == nil {
 		switch {
 		case mainJournal.Generation > backupJournal.Generation:

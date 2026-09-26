@@ -94,6 +94,19 @@ func (a *App) addNodeIndexed(st *Store, raw, name, scope string, urlIndex map[st
 }
 
 func prepareNode(raw string) (preparedNode, error) {
+	prepared, err := prepareStoredNode(raw)
+	if err != nil {
+		return preparedNode{}, err
+	}
+	if err := validateNodeRuntimeCompatibility(prepared.Parsed); err != nil {
+		return preparedNode{}, err
+	}
+	return prepared, nil
+}
+
+// Old nodes must remain readable and removable after an Xray upgrade. Validate
+// their syntax here; enforce current runtime support on import and config use.
+func prepareStoredNode(raw string) (preparedNode, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return preparedNode{}, fmt.Errorf("节点链接不能为空")
@@ -481,8 +494,8 @@ func parseSS(raw string) (*parsedNode, error) {
 	body = strings.Split(strings.Split(body, "#")[0], "?")[0]
 	var userinfo, hostport string
 	if strings.Contains(body, "@") {
-		parts := strings.SplitN(body, "@", 2)
-		userinfo, hostport = parts[0], parts[1]
+		separator := strings.LastIndexByte(body, '@')
+		userinfo, hostport = body[:separator], body[separator+1:]
 		// SIP002 允许 host:port 后带一个可选的 `/`（如 ss://...@host:port/?plugin=... 或
 		// ss://...@host:port/#name）。前面已去掉 ? 和 #，这里再去掉路径分隔符，否则
 		// net.SplitHostPort 会因端口含 `/` 失败、整条链接被当作无效丢弃。
@@ -492,7 +505,15 @@ func parseSS(raw string) (*parsedNode, error) {
 			}
 			hostport = hostport[:i]
 		}
-		if !strings.Contains(userinfo, ":") {
+		if strings.Contains(userinfo, ":") {
+			// Only plaintext SIP002 userinfo is URI escaped. Base64 payloads
+			// already contain the literal password, including '%' and '+'.
+			decoded, err := url.PathUnescape(userinfo)
+			if err != nil {
+				return nil, fmt.Errorf("SS userinfo 转义无效")
+			}
+			userinfo = decoded
+		} else {
 			if b, err := decodeBase64URL(userinfo); err == nil {
 				userinfo = string(b)
 			}
@@ -502,11 +523,12 @@ func parseSS(raw string) (*parsedNode, error) {
 		if err != nil {
 			return nil, fmt.Errorf("SS payload 不是有效 Base64")
 		}
-		parts := strings.SplitN(string(b), "@", 2)
-		if len(parts) != 2 {
+		payload := string(b)
+		separator := strings.LastIndexByte(payload, '@')
+		if separator < 0 {
 			return nil, fmt.Errorf("SS 格式无效")
 		}
-		userinfo, hostport = parts[0], parts[1]
+		userinfo, hostport = payload[:separator], payload[separator+1:]
 	}
 	up := strings.SplitN(userinfo, ":", 2)
 	if len(up) != 2 || strings.TrimSpace(up[0]) == "" || strings.TrimSpace(up[1]) == "" {
@@ -666,7 +688,7 @@ func buildRealityClientSettings(q url.Values) (map[string]any, error) {
 	return map[string]any{
 		"serverName":  serverName,
 		"fingerprint": fingerprint,
-		"publicKey":   publicKey,
+		"publicKey":   base64.RawURLEncoding.EncodeToString(decoded),
 		"shortId":     shortID,
 		"spiderX":     spiderX,
 	}, nil

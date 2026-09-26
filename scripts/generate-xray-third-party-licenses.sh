@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export GOENV=off GOWORK=off GOTOOLCHAIN=local
 
 umask 077
 export LC_ALL=C

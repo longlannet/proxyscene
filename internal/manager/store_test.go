@@ -1166,3 +1166,54 @@ func TestSemanticInvalidMainRecoversValidBackup(t *testing.T) {
 		t.Fatalf("did not recover valid backup: %+v", got)
 	}
 }
+
+func TestStoreNullMainRecoversAndPreservesBackup(t *testing.T) {
+	a := testApp(t)
+	st := newStore()
+	st.DefaultNodeID = "node-keep"
+	st.Nodes = []Node{{ID: "node-keep", Name: "keep", Protocol: "ss", RawURL: "ss://aes-256-gcm:secret@h:8388"}}
+	if err := a.saveStore(st); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(a.cfg.StorePath(), []byte(" \nnull\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := a.loadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DefaultNodeID != st.DefaultNodeID || len(got.Nodes) != 1 {
+		t.Fatalf("backup was ignored: %+v", got)
+	}
+	if err := a.saveStore(got); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := os.ReadFile(a.cfg.StoreBackupPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, _, err := decodeStore(backup)
+	if err != nil || len(recovered.Nodes) != 1 {
+		t.Fatalf("healthy backup was lost: %+v, %v", recovered, err)
+	}
+}
+
+func TestStoreRejectsNonObjectMainAndBackup(t *testing.T) {
+	for _, raw := range []string{"null", "[]", "42", "true", `"text"`} {
+		t.Run(raw, func(t *testing.T) {
+			a := testApp(t)
+			if err := os.WriteFile(a.cfg.StorePath(), []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(a.cfg.StoreBackupPath(), []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := a.loadStore(); err == nil {
+				t.Fatal("non-object main and backup accepted")
+			}
+		})
+	}
+	if st, _, err := decodeStore([]byte("{}")); err != nil || st == nil || st.SceneEnabled == nil {
+		t.Fatalf("empty object should remain valid and initialized: %+v, %v", st, err)
+	}
+}

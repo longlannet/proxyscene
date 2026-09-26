@@ -3,6 +3,7 @@ package manager
 import (
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 )
@@ -116,14 +117,6 @@ func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
 		return nil
 	}
 	a.stageRuntimeConfig(st)
-	var telegramTargets []systemdTargetName
-	var err error
-	if enabled && scene == SceneTelegram {
-		telegramTargets, err = a.telegramTargets(st, false)
-		if err != nil {
-			return err
-		}
-	}
 	if enabled {
 		st.SceneEnabled[scene] = true
 		// syncXrayServiceForStore 已写配置、校验并启动核心服务，无需再次 startXrayService。
@@ -132,13 +125,7 @@ func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
 			journalErr := a.persistSceneRollbackIfNeeded(st, before)
 			return errors.Join(err, rollbackErr, journalErr)
 		}
-		// 电报场景复用上面已发现的 telegramTargets，保证应用与持久化的目标一致。
-		var applyErr error
-		if scene == SceneTelegram {
-			_, applyErr = a.applyTelegram(st, telegramTargets)
-		} else {
-			applyErr = a.applyScene(st, scene)
-		}
+		applyErr := a.applyScene(st, scene)
 		if applyErr != nil {
 			rollbackErr := a.rollbackSceneState(st, before, scene)
 			journalErr := a.persistSceneRollbackIfNeeded(st, before)
@@ -280,23 +267,62 @@ func (a *App) applyDev() error {
 	if !gitAvailable && !npmAvailable {
 		return fmt.Errorf("开发代理需要 git 或 npm，但当前都不可用")
 	}
-	if err := a.backupDevConfig(user); err != nil {
+	priorOwnership, err := a.loadDevBackup()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	rejectNewOwnership := func(reason error) error {
+		var cleanupErr error
+		if priorOwnership == nil {
+			cleanupErr = devRemoveBackup(a.cfg.DevBackupPath())
+		} else {
+			cleanupErr = a.writeDevBackup(priorOwnership)
+		}
+		return errors.Join(reason, wrapRollbackError("撤销尚未应用的开发代理 ownership", cleanupErr))
+	}
+	if err := a.backupDevConfig(user); err != nil {
+		return rejectNewOwnership(err)
 	}
 	backup, err := a.loadDevBackup()
 	if err != nil {
-		return err
+		return rejectNewOwnership(err)
 	}
 	if backup.User != user {
-		return fmt.Errorf("开发代理备份用户 %s 与目标用户 %s 不匹配", backup.User, user)
+		return rejectNewOwnership(fmt.Errorf("开发代理备份用户 %s 与目标用户 %s 不匹配", backup.User, user))
 	}
 	if err := verifyDevUserIdentity(user, backup.Identity); err != nil {
-		return err
+		return rejectNewOwnership(err)
 	}
 	proxy := a.cfg.HTTPAddr(SceneDev)
 	snapshot, err := snapshotDevProxyConfig(user, backup, gitAvailable, npmAvailable)
 	if err != nil {
-		return err
+		return rejectNewOwnership(err)
+	}
+
+	// Newly acquired ownership and the apply snapshot must describe the same
+	// proxy values. Otherwise an edit between the two reads would be overwritten
+	// while the eventual restore still used the earlier ownership values.
+	if gitAvailable && (priorOwnership == nil || !priorOwnership.GitManaged) &&
+		(!slices.Equal(snapshot.GitHTTPProxy, backup.GitHTTPProxy) || !slices.Equal(snapshot.GitHTTPSProxy, backup.GitHTTPSProxy)) {
+		return rejectNewOwnership(fmt.Errorf("开发代理：Git 原值在首次备份后变化，拒绝覆盖：%w", errUserFileChanged))
+	}
+	if npmAvailable && (priorOwnership == nil || !priorOwnership.NPMManaged) &&
+		(!optionalStringsEqual(snapshot.NPMProxy, backup.NPMProxy) || !optionalStringsEqual(snapshot.NPMHTTPSProxy, backup.NPMHTTPSProxy)) {
+		return rejectNewOwnership(fmt.Errorf("npm 原值在首次备份后变化，拒绝覆盖：%w", errUserFileChanged))
+	}
+	if priorOwnership != nil {
+		managedHTTP := managedDevProxyValues(backup, true, proxy)
+		managedHTTPS := managedDevProxyValues(backup, false, proxy)
+		if gitAvailable && priorOwnership.GitManaged &&
+			(!devGitApplyValueKnown(snapshot.GitHTTPProxy, backup.GitHTTPProxy, managedHTTP) ||
+				!devGitApplyValueKnown(snapshot.GitHTTPSProxy, backup.GitHTTPSProxy, managedHTTPS)) {
+			return rejectNewOwnership(fmt.Errorf("开发代理：Git 代理已被用户修改，请先停用再重新启用开发代理：%w", errUserFileChanged))
+		}
+		if npmAvailable && priorOwnership.NPMManaged &&
+			(!devNPMApplyValueKnown(snapshot.NPMProxy, backup.NPMProxy, managedHTTP) ||
+				!devNPMApplyValueKnown(snapshot.NPMHTTPSProxy, backup.NPMHTTPSProxy, managedHTTPS)) {
+			return rejectNewOwnership(fmt.Errorf("npm 代理已被用户修改，请先停用再重新启用开发代理：%w", errUserFileChanged))
+		}
 	}
 	rollback := func() error {
 		return a.restoreDevProxySnapshotDurable(snapshot, proxy)
@@ -306,16 +332,16 @@ func (a *App) applyDev() error {
 		if err == nil {
 			return nil
 		}
-		if appliedSteps == 0 {
-			return err
+		if appliedSteps == 0 && !errors.Is(err, errDevConfigMutationUncertain) {
+			return rejectNewOwnership(err)
 		}
 		return errors.Join(err, wrapRollbackError("恢复开发代理本轮修改", rollback()))
 	}
 	if gitAvailable {
 		if !backup.GitManaged {
-			return fmt.Errorf("开发代理 ownership 备份未绑定 Git global 配置")
+			return rejectNewOwnership(fmt.Errorf("开发代理 ownership 备份未绑定 Git global 配置"))
 		}
-		if err := runGitConfigMutationForIdentity(user, backup.Identity, backup.GitConfigLocation, "--replace-all", "--", "http.proxy", proxy); err != nil {
+		if err := devMutateGitConfig(user, backup.Identity, backup.GitConfigLocation, snapshot.GitHTTPProxy, "--replace-all", "--", "http.proxy", proxy); err != nil {
 			return apply(err)
 		}
 		appliedSteps++
@@ -325,7 +351,7 @@ func (a *App) applyDev() error {
 		if err := verifyManagedGitProxy(user, backup.Identity, backup.GitConfigLocation, "http.proxy", proxy); err != nil {
 			return apply(err)
 		}
-		if err := runGitConfigMutationForIdentity(user, backup.Identity, backup.GitConfigLocation, "--replace-all", "--", "https.proxy", proxy); err != nil {
+		if err := devMutateGitConfig(user, backup.Identity, backup.GitConfigLocation, snapshot.GitHTTPSProxy, "--replace-all", "--", "https.proxy", proxy); err != nil {
 			return apply(err)
 		}
 		appliedSteps++
@@ -339,11 +365,11 @@ func (a *App) applyDev() error {
 		fmt.Println("提示：未找到 git，跳过 git 代理设置")
 	}
 	if npmAvailable {
-		if err := runDevAsPersistedUser(user, backup.Identity, "npm", "config", "set", "proxy", proxy); err != nil {
+		if err := devMutateNPMConfig(user, backup.Identity, "proxy", snapshot.NPMProxy, &proxy); err != nil {
 			return apply(err)
 		}
 		appliedSteps++
-		if err := runDevAsPersistedUser(user, backup.Identity, "npm", "config", "set", "https-proxy", proxy); err != nil {
+		if err := devMutateNPMConfig(user, backup.Identity, "https-proxy", snapshot.NPMHTTPSProxy, &proxy); err != nil {
 			return apply(err)
 		}
 		appliedSteps++
@@ -398,193 +424,6 @@ func snapshotDevProxyConfig(user string, ownership *devProxyBackup, gitAvailable
 		return nil, fmt.Errorf("开发代理应用快照无效，拒绝修改用户配置：%w", err)
 	}
 	return snapshot, nil
-}
-
-// applyTelegram applies every usable target and returns the targets for which a
-// durable injection/config ownership record now exists. Errors are aggregated so
-// callers can roll back every partial success instead of losing its identity.
-func (a *App) applyTelegram(st *Store, targets []systemdTargetName) ([]systemdTargetName, error) {
-	if targets == nil {
-		var err error
-		targets, err = a.telegramTargets(st, false)
-		if err != nil {
-			return nil, err
-		}
-	}
-	var errs []error
-	if err := warnSystemWideUserTelegramUnits(); err != nil {
-		errs = append(errs, err)
-	}
-	dropIn := []byte("[Service]\n" + telegramProxySystemdEnvironmentLines(a.cfg))
-	proxyURL := a.cfg.HTTPAddr(SceneTelegram)
-	manageOpenClaw := a.cfg.ManageOpenClawConfig
-	userManagers := map[string]systemdTargetName{}
-	warnedBus := map[string]bool{}
-	restart := []systemdTargetName{}
-	openClawPendingCommit := map[string]bool{}
-	hermesPendingCommit := map[string]telegramHermesApplyPreparation{}
-	desired := map[string]bool{}
-	ready := map[string]bool{}
-	applied := []systemdTargetName{}
-	systemReload := false
-	for _, target := range targets {
-		key := canonicalTelegramTargetName(target)
-		if target.UserMode {
-			if _, err := a.verifyKnownTelegramTargetIdentity(target); err != nil {
-				errs = append(errs, fmt.Errorf("校验 Telegram 目标 %s 的持久用户身份失败：%w", key, err))
-				continue
-			}
-			if !telegramUserUnitExists(target.User, target.Service) {
-				fmt.Printf("提示：用户级目标 %s 未安装，已跳过注入；安装后请重新执行 proxyscene tg on\n", key)
-				continue
-			}
-			if !warnedBus[target.User] {
-				warnIfUserBusMissing(target.User)
-				warnedBus[target.User] = true
-			}
-		} else if !telegramSystemUnitExists(target.Service) {
-			fmt.Printf("提示：系统级目标 %s 未安装，已跳过注入；安装后请重新执行 proxyscene tg on\n", target.Service)
-			continue
-		}
-		isOpenClaw, classifyErr := a.classifyOpenClawTarget(target)
-		if classifyErr != nil {
-			errs = append(errs, fmt.Errorf("识别 Telegram 目标 %s 失败：%w", key, classifyErr))
-			continue
-		}
-		if ownershipErr := a.validateTelegramTargetOwnershipClass(target, isOpenClaw); ownershipErr != nil {
-			// The target is still explicitly desired. Retain the old owner unchanged;
-			// stale cleanup must not turn a type-conflict rejection into a mutation.
-			desired[key] = true
-			errs = append(errs, fmt.Errorf("校验 Telegram 目标 %s 的 ownership 类型失败：%w", key, ownershipErr))
-			continue
-		}
-		if isOpenClaw {
-			if target.UserMode {
-				if !manageOpenClaw {
-					continue
-				}
-				desired[key] = true
-				managed, changed, err := a.applyOpenClawTelegramProxy(target, proxyURL)
-				if managed {
-					applied = appendUniqueTelegramTarget(applied, target)
-					if err == nil && !changed {
-						ready[key] = true
-					}
-				}
-				if changed {
-					// Runtime validation reads the effective unit from disk. Reload the
-					// user manager before restart so systemd cannot use an older cached
-					// unit than the one we validated. The map also deduplicates multiple
-					// OpenClaw gateways owned by the same user manager.
-					userManagers[target.User] = target
-					restart = appendUniqueTelegramTarget(restart, target)
-					if managed {
-						openClawPendingCommit[key] = true
-					}
-				}
-				if err != nil {
-					errs = append(errs, fmt.Errorf("设置 %s 的 OpenClaw Telegram 代理失败：%w", key, err))
-				}
-			} else {
-				fmt.Printf("警告：系统级 openclaw 单元 %s 无法确定配置归属用户，已跳过，请手动设置 channels.telegram.proxy=%s\n", target.Service, proxyURL)
-			}
-			continue
-		}
-
-		desired[key] = true
-		prepared, err := a.prepareHermesTelegramApply(target, dropIn)
-		if prepared.managed {
-			applied = appendUniqueTelegramTarget(applied, target)
-			if err == nil && !prepared.reconcile {
-				ready[key] = true
-			}
-		}
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if !prepared.reconcile {
-			continue
-		}
-		hermesPendingCommit[key] = prepared
-		if target.UserMode {
-			userManagers[target.User] = target
-			restart = appendUniqueTelegramTarget(restart, target)
-		} else {
-			systemReload = true
-			restart = appendUniqueTelegramTarget(restart, target)
-		}
-	}
-	systemReloadFailed := false
-	if systemReload {
-		if err := systemctlRun("重新加载 systemd 配置", "daemon-reload"); err != nil {
-			errs = append(errs, err)
-			systemReloadFailed = true
-		}
-	}
-	userReloadFailed := map[string]bool{}
-	for userName, target := range userManagers {
-		identity, managed, identityErr := a.knownTelegramTargetIdentity(target)
-		if identityErr != nil || !managed {
-			if identityErr == nil {
-				identityErr = fmt.Errorf("目标缺少持久 ownership 身份")
-			}
-			errs = append(errs, fmt.Errorf("重新加载用户 %s 的 systemd 配置前身份校验失败：%w", userName, identityErr))
-			userReloadFailed[userName] = true
-			continue
-		}
-		if err := userSystemctlRun(userName, identity, "重新加载用户级 systemd 配置", "daemon-reload"); err != nil {
-			errs = append(errs, err)
-			userReloadFailed[userName] = true
-		}
-	}
-	for _, target := range restart {
-		key := canonicalTelegramTargetName(target)
-		if (!target.UserMode && systemReloadFailed) || (target.UserMode && userReloadFailed[target.User]) {
-			continue
-		}
-		if target.UserMode {
-			managed, identityErr := a.verifyKnownTelegramTargetIdentity(target)
-			if identityErr != nil || !managed {
-				if identityErr == nil {
-					identityErr = fmt.Errorf("目标缺少持久 ownership 身份")
-				}
-				errs = append(errs, fmt.Errorf("重启 Telegram 目标 %s 前身份校验失败：%w", key, identityErr))
-				continue
-			}
-		}
-		if err := a.restartTelegramTarget(target); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if openClawPendingCommit[key] {
-			if err := a.commitOpenClawTelegramProxyApply(target); err != nil {
-				errs = append(errs, fmt.Errorf("提交 %s 的 OpenClaw apply journal 失败：%w", key, err))
-				continue
-			}
-			ready[key] = true
-		}
-		if prepared, ok := hermesPendingCommit[key]; ok {
-			if prepared.release {
-				if err := a.commitHermesTelegramRestore(target); err != nil {
-					errs = append(errs, fmt.Errorf("释放 %s 的 Hermes Telegram ownership 失败：%w", key, err))
-				}
-				continue
-			}
-			if err := a.commitHermesTelegramApply(target); err != nil {
-				errs = append(errs, fmt.Errorf("提交 %s 的 Hermes Telegram apply journal 失败：%w", key, err))
-				continue
-			}
-			ready[key] = true
-		}
-	}
-	if err := a.cleanupStaleTelegramOwnership(st, desired, ready); err != nil {
-		errs = append(errs, err)
-	}
-	if len(applied) == 0 {
-		errs = append(errs, fmt.Errorf("没有实际接管任何 OpenClaw/Hermes systemd 目标服务"))
-	}
-	return applied, errors.Join(errs...)
 }
 
 func appendUniqueTelegramTarget(targets []systemdTargetName, target systemdTargetName) []systemdTargetName {
@@ -692,17 +531,40 @@ func (a *App) restartTelegramTarget(target systemdTargetName) error {
 	if err := a.validatePreparedHermesTelegramRestart(target); err != nil {
 		return err
 	}
-	if target.UserMode {
-		identity, managed, err := a.knownTelegramTargetIdentity(target)
-		if err != nil {
+	identity, hermesOwned, openClawOwned, err := a.telegramTargetOwnership(target)
+	if err != nil {
+		return err
+	}
+	if hermesOwned && openClawOwned {
+		return fmt.Errorf("目标 %s 的代理 ownership 类型冲突", canonicalTelegramTargetName(target))
+	}
+	if target.UserMode && !hermesOwned && !openClawOwned {
+		return fmt.Errorf("目标 %s 缺少持久 ownership 身份，拒绝操作用户服务", canonicalTelegramTargetName(target))
+	}
+	running, err := telegramTargetRunning(target, identity)
+	if err != nil {
+		return err
+	}
+	if !running {
+		fmt.Printf("目标 %s 未运行，仅保存配置；尚未验证 Telegram 连接\n", canonicalTelegramTargetName(target))
+		return nil
+	}
+	// Check the message policy after the final running-state decision. A gateway
+	// that was stopped during preflight may have started in the meantime.
+	if !openClawOwned {
+		if err := telegramValidateHermesRestartPolicy(target, identity); err != nil {
 			return err
 		}
-		if !managed {
-			return fmt.Errorf("目标 %s 缺少持久 ownership 身份，拒绝操作用户服务", canonicalTelegramTargetName(target))
-		}
-		return userSystemctlRun(target.User, identity, "重启用户级服务 "+target.Service, "try-restart", "--", target.Service)
 	}
-	return systemctlRun("重启系统级服务 "+target.Service, "try-restart", "--", target.Service)
+	if target.UserMode {
+		err = userSystemctlRun(target.User, identity, "重启用户级服务 "+target.Service, "try-restart", "--", target.Service)
+	} else {
+		err = systemctlRun("重启系统级服务 "+target.Service, "try-restart", "--", target.Service)
+	}
+	if err != nil {
+		return err
+	}
+	return confirmTelegramTargetRunning(target, identity)
 }
 
 // warnSystemWideUserTelegramUnits 扫描系统级 user-unit 目录（这些单元对所有用户的
@@ -749,7 +611,7 @@ func telegramProxyEnvPairs(cfg Config) []string {
 // sys.path 首位。固定 PYTHONSAFEPATH 可防止 HERMES_HOME 中的同名模块遮蔽
 // 已从受绑定 venv 加载的 hermes_cli；Hermes 当前要求 Python 3.11+。
 func hermesManagedEnvironmentPairs(cfg Config) []string {
-	return append(telegramProxyEnvPairs(cfg), "PYTHONSAFEPATH=1")
+	return append(telegramProxyEnvPairs(cfg), "PYTHONSAFEPATH=1", hermesDisableFallbackEnv+"=1")
 }
 
 func telegramProxyEnvironmentLines(cfg Config) string {
@@ -805,6 +667,12 @@ func (a *App) cleanupManagedOpenClawTargets(trigger systemdTargetName, allowShar
 	if !allowShared && len(targets) > 1 {
 		return targets, fmt.Errorf("用户 %s 有多个 OpenClaw 服务共享同一配置，差集清理必须保留到完整关闭场景", trigger.User)
 	}
+	reloadPlans := map[string]*openClawTelegramReloadPlan{}
+	for _, target := range targets {
+		if telegramUserUnitExists(target.User, target.Service) {
+			reloadPlans[canonicalTelegramTargetName(target)] = a.prepareOpenClawTelegramReload(target)
+		}
+	}
 	restartAll, err := a.prepareRestoreOpenClawTelegramProxy(trigger)
 	if err != nil {
 		return targets, err
@@ -849,7 +717,7 @@ func (a *App) cleanupManagedOpenClawTargets(trigger systemdTargetName, allowShar
 				errs = append(errs, fmt.Errorf("重启用户 %s 的 OpenClaw 服务前身份再次校验失败：%w", target.User, identityErr))
 				continue
 			}
-			if err := a.restartTelegramTarget(target); err != nil {
+			if err := a.reconcileOpenClawTelegramTarget(target, reloadPlans[canonicalTelegramTargetName(target)]); err != nil {
 				errs = append(errs, err)
 			}
 		}

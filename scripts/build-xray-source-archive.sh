@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export GOENV=off GOWORK=off GOTOOLCHAIN=local
 
 umask 022
 export LC_ALL=C TZ=UTC
@@ -7,10 +8,10 @@ export LC_ALL=C TZ=UTC
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-readonly XRAY_VERSION="v26.3.27"
-readonly XRAY_COMMIT="d2758a023cd7f4174a5a5fa4ff66e487d4342ba0"
-readonly XRAY_SOURCE_MODULE_VERSION="v1.260327.0"
-readonly XRAY_SOURCE_MODULE_SUM="h1:g4TzxMwyPrxslZh6uD+FiG3lXKTrnNO+b4ky2OhogHE="
+readonly XRAY_VERSION="v26.9.9"
+readonly XRAY_COMMIT="52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120"
+readonly XRAY_SOURCE_MODULE_VERSION="v1.260327.1-0.20260908222543-52a412d9e2f5"
+readonly XRAY_SOURCE_MODULE_SUM="h1:BsUC2sCXcdVCb09SUh1iWku0ci779t4bUIlKUor1ZRI="
 
 fail() {
   printf 'Xray source archive build failed: %s\n' "$*" >&2
@@ -112,7 +113,7 @@ while IFS=$'\t' read -r module version sum; do
   install_module_source dependency "$module" "$version" "$version" "$sum" "$index_text"
   index=$((index + 1))
 done < "$deps"
-[[ "$index" -eq 35 ]] || fail "expected 34 linked modules, got $((index - 1))"
+[[ "$index" -eq 48 ]] || fail "expected 47 linked modules, got $((index - 1))"
 
 install -m 0644 "$ROOT/SOURCE-Xray" "$source_root/README"
 install -m 0644 "$ROOT/LICENSE-GPL-3.0" "$source_root/LICENSE-GPL-3.0"

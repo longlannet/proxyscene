@@ -59,6 +59,36 @@ func stubDevCommands(t *testing.T) {
 	oldResolveTopology := devResolveGitTopology
 	oldValidateTopology := devValidateGitTopology
 	oldGitConfigExists := devGitConfigExists
+	oldReadNPM := devReadNPMConfig
+	oldMutateNPM := devMutateNPMConfig
+	oldMutateGit := devMutateGitConfig
+	devReadNPMConfig = func(user string, identity *persistedUserIdentity, key string) (*string, error) {
+		out, err := devOutputAsUser(user, identity, "npm", "config", "get", key)
+		if err != nil {
+			return nil, err
+		}
+		lines := strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n")
+		value := ""
+		for i := len(lines) - 1; i >= 0; i-- {
+			if trimmed := strings.TrimSpace(lines[i]); trimmed != "" {
+				value = trimmed
+				break
+			}
+		}
+		if value == "" || value == "undefined" || value == "null" {
+			return nil, nil
+		}
+		return &value, nil
+	}
+	devMutateNPMConfig = func(user string, identity *persistedUserIdentity, key string, expected, desired *string) error {
+		if desired != nil {
+			return runDevAsPersistedUser(user, identity, "npm", "config", "set", key, *desired)
+		}
+		return runDevAsPersistedUser(user, identity, "npm", "config", "delete", key)
+	}
+	devMutateGitConfig = func(user string, identity *persistedUserIdentity, location devGitConfigLocation, expected []string, args ...string) error {
+		return runGitConfigMutationForIdentity(user, identity, location, args...)
+	}
 	devResolveGitTopology = func(string, *persistedUserIdentity) (devGitConfigLocation, error) { return devGitConfigHome, nil }
 	devValidateGitTopology = func(string, *persistedUserIdentity, devGitConfigLocation) error { return nil }
 	devGitConfigExists = func(*persistedUserIdentity, devGitConfigLocation) (bool, error) { return true, nil }
@@ -72,6 +102,9 @@ func stubDevCommands(t *testing.T) {
 		devResolveGitTopology = oldResolveTopology
 		devValidateGitTopology = oldValidateTopology
 		devGitConfigExists = oldGitConfigExists
+		devReadNPMConfig = oldReadNPM
+		devMutateNPMConfig = oldMutateNPM
+		devMutateGitConfig = oldMutateGit
 	})
 }
 

@@ -197,7 +197,7 @@ func TestValidateTelegramUnitsRejectDynamicSystemdExpansion(t *testing.T) {
 		"hermes exec variable":         hermesRuntimeUnit("Environment=EXTRA=--profile\\sblue\nExecStart=\nExecStart=/opt/hermes/venv/bin/python -m hermes_cli.main gateway run $EXTRA\n"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := validateHermesEffectiveUnit(unit); err == nil {
+			if _, err := validateHermesEffectiveUnit(unit); err == nil {
 				t.Fatal("dynamic Hermes unit was accepted")
 			}
 		})
@@ -275,7 +275,7 @@ func TestValidateTelegramUnitsRejectLateEnvironmentAndPathNamespaces(t *testing.
 			}
 		})
 		t.Run(directive+"/hermes", func(t *testing.T) {
-			if err := validateHermesEffectiveUnit(hermesRuntimeUnit(directive + "=" + value + "\n")); err == nil {
+			if _, err := validateHermesEffectiveUnit(hermesRuntimeUnit(directive + "=" + value + "\n")); err == nil {
 				t.Fatal("Hermes unit with alternate environment or file view was accepted")
 			}
 		})
@@ -285,7 +285,7 @@ func TestValidateTelegramUnitsRejectLateEnvironmentAndPathNamespaces(t *testing.
 	if err := validateOpenClawEffectiveUnit(openClawRuntimeUnit(reset), "/home/alice"); err != nil {
 		t.Fatalf("fully reset directives rejected for OpenClaw: %v", err)
 	}
-	if err := validateHermesEffectiveUnit(hermesRuntimeUnit(reset)); err != nil {
+	if _, err := validateHermesEffectiveUnit(hermesRuntimeUnit(reset)); err != nil {
 		t.Fatalf("fully reset directives rejected for Hermes: %v", err)
 	}
 
@@ -298,7 +298,7 @@ func TestValidateTelegramUnitsRejectLateEnvironmentAndPathNamespaces(t *testing.
 			if name == "openclaw" {
 				err = validateOpenClawEffectiveUnit(unit, "/home/alice")
 			} else {
-				err = validateHermesEffectiveUnit(unit)
+				_, err = validateHermesEffectiveUnit(unit)
 			}
 			if err == nil {
 				t.Fatal("unit sharing another network namespace was accepted")
@@ -309,7 +309,7 @@ func TestValidateTelegramUnitsRejectLateEnvironmentAndPathNamespaces(t *testing.
 	if err := validateOpenClawEffectiveUnit(joinsReset+openClawRuntimeUnit(""), "/home/alice"); err != nil {
 		t.Fatalf("reset OpenClaw JoinsNamespaceOf rejected: %v", err)
 	}
-	if err := validateHermesEffectiveUnit(joinsReset + hermesRuntimeUnit("")); err != nil {
+	if _, err := validateHermesEffectiveUnit(joinsReset + hermesRuntimeUnit("")); err != nil {
 		t.Fatalf("reset Hermes JoinsNamespaceOf rejected: %v", err)
 	}
 
@@ -318,7 +318,7 @@ func TestValidateTelegramUnitsRejectLateEnvironmentAndPathNamespaces(t *testing.
 		if err := validateOpenClawEffectiveUnit(openClawRuntimeUnit(extra), "/home/alice"); err == nil {
 			t.Errorf("multiple active %s definitions were accepted for OpenClaw", directive)
 		}
-		if err := validateHermesEffectiveUnit(hermesRuntimeUnit(extra)); err == nil {
+		if _, err := validateHermesEffectiveUnit(hermesRuntimeUnit(extra)); err == nil {
 			t.Errorf("multiple active %s definitions were accepted for Hermes", directive)
 		}
 	}
@@ -330,7 +330,7 @@ func TestValidateHermesEffectiveUnitRejectsMultipleExecStarts(t *testing.T) {
 		"second gateway":    "Type=oneshot\nExecStart=/opt/hermes/venv/bin/python -m hermes_cli.main gateway run\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := validateHermesEffectiveUnit(hermesRuntimeUnit(extra)); err == nil {
+			if _, err := validateHermesEffectiveUnit(hermesRuntimeUnit(extra)); err == nil {
 				t.Fatal("Hermes unit with multiple ExecStart commands was accepted")
 			}
 		})
@@ -348,7 +348,7 @@ func TestValidateHermesEffectiveUnitAllowsBoundCleanupHook(t *testing.T) {
 			"ExecStart=/opt/hermes/venv/bin/hermes-agent gateway run\n" + cleanup,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := validateHermesEffectiveUnit(unit); err != nil {
+			if _, err := validateHermesEffectiveUnit(unit); err != nil {
 				t.Fatalf("bound Hermes cleanup hook rejected: %v", err)
 			}
 		})
@@ -371,7 +371,7 @@ func TestValidateHermesEffectiveUnitRejectsUnboundCleanupHook(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			unit := hermesRuntimeUnit("ExecStopPost=" + cleanup + "\n")
-			if err := validateHermesEffectiveUnit(unit); err == nil {
+			if _, err := validateHermesEffectiveUnit(unit); err == nil {
 				t.Fatal("Hermes unit with unbound cleanup hook was accepted")
 			}
 		})
@@ -384,7 +384,7 @@ func TestValidateHermesEffectiveUnitRejectsChrootWrapper(t *testing.T) {
 	if unitIsHermesGatewayExec(unit) {
 		t.Fatal("chroot wrapper was identified as a host Hermes gateway")
 	}
-	if err := validateHermesEffectiveUnit(unit); err == nil {
+	if _, err := validateHermesEffectiveUnit(unit); err == nil {
 		t.Fatal("chroot wrapper was accepted by the Hermes runtime validator")
 	}
 }
@@ -590,7 +590,7 @@ func TestValidateHermesEffectiveUnitRejectsProxyBypass(t *testing.T) {
 		"escaped no proxy": hermesRuntimeUnit(`Environment="N\x4f_PROXY=api.telegram.org"` + "\n"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := validateHermesEffectiveUnit(unit); err == nil {
+			if _, err := validateHermesEffectiveUnit(unit); err == nil {
 				t.Fatal("Hermes bypass runtime was accepted")
 			}
 		})
@@ -816,7 +816,7 @@ func TestValidateHermesRuntimeFilesRejectsMismatchedHome(t *testing.T) {
 	target := systemdTargetName{Service: "hermes-test.service"}
 	environment := map[string]string{"HOME": "/srv/other", "HERMES_HOME": "/root/.hermes"}
 	content := hermesRuntimeUnit("User=root\n")
-	if err := validateHermesRuntimeFiles(target, nil, content, environment); err == nil {
+	if err := validateHermesRuntimeFiles(target, nil, content, "/opt/hermes", environment); err == nil {
 		t.Fatal("mismatched HOME was accepted")
 	}
 }
@@ -844,21 +844,25 @@ func TestValidateHermesEffectiveUnitHonorsFinalEnvironment(t *testing.T) {
 		"environment file reset": hermesRuntimeUnit("EnvironmentFile=/etc/hidden.env\nEnvironmentFile=\n"),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := validateHermesEffectiveUnit(unit); err != nil {
+			if _, err := validateHermesEffectiveUnit(unit); err != nil {
 				t.Fatalf("safe final Hermes runtime rejected: %v", err)
 			}
 		})
 	}
 }
 
-func TestHermesConsoleScriptGatewayKeepsBoundProjectRoot(t *testing.T) {
-	unit := "[Service]\nExecStart=/opt/hermes/venv/bin/hermes-agent gateway run\n"
-	if err := validateHermesEffectiveUnit(unit); err != nil {
-		t.Fatalf("Hermes console-script gateway rejected: %v", err)
-	}
-	root, err := hermesProjectRootFromExec(unit)
-	if err != nil || root != "/opt/hermes" {
-		t.Fatalf("console-script project root=%q err=%v", root, err)
+func TestHermesGatewayKeepsBoundProjectRoot(t *testing.T) {
+	for name, unit := range map[string]string{
+		"python module":          hermesRuntimeUnit(""),
+		"console script":         "[Service]\nExecStart=/opt/hermes/venv/bin/hermes-agent gateway run\n",
+		"reset replaces project": "[Service]\nExecStart=/old/hermes/venv/bin/python -m hermes_cli.main gateway run\nExecStart=\nExecStart=/opt/hermes/venv/bin/python -m hermes_cli.main gateway run\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			root, err := validateHermesEffectiveUnit(unit)
+			if err != nil || root != "/opt/hermes" {
+				t.Fatalf("validated project root=%q err=%v", root, err)
+			}
+		})
 	}
 }
 

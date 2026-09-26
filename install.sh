@@ -7,14 +7,14 @@ PATH="$TRUSTED_ROOT_PATH"
 export PATH
 
 SCRIPT_NAME="proxyscene 安装器"
-DEFAULT_GO_VERSION="1.26.5"
+DEFAULT_GO_VERSION="1.27.1"
 DEFAULT_CORE_DIR="/opt/proxyscene"
 DEFAULT_INSTALL_BIN="/usr/local/bin/proxyscene"
 DEFAULT_SYSTEMD_SERVICE="proxyscene.service"
 DEFAULT_RESTORE_SERVICE="proxyscene-restore.service"
 DEFAULT_REPO="longlannet/proxyscene"
 DEFAULT_MANAGER_VERSION="latest"
-DEFAULT_XRAY_VERSION="v26.3.27"
+DEFAULT_XRAY_VERSION="v26.9.9"
 DEFAULT_XRAY_RELEASE_BASE="https://github.com/XTLS/Xray-core/releases/download/${DEFAULT_XRAY_VERSION}"
 DEFAULT_DOWNLOAD_TIMEOUT=300
 INSTALL_LOCK_PATH="/run/proxyscene-install.lock"
@@ -24,22 +24,26 @@ HOST_LOCK_PATH="/run/proxyscene-host-ownership.lock"
 SYSTEMD_UNIT_DIR="/etc/systemd/system"
 
 # Repository-reviewed digests for the four supported Xray release archives.
-XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
-XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
-XRAY_SHA256_386="d1eeb0d9a9106eefd286fbb73595c2dfe1c48c56aa91ba1c9aefe04f188d0927"
-XRAY_SHA256_ARMV7="c7265ae13c63ca0241a037df4ef960ad37938c8a67d984cc08834b2cfdf5654b"
+XRAY_SHA256_AMD64="1eb9175d0f0a8f8149c9230a7fc5ae66ce332ed20a53155ce61fe62e3f58b7df"
+XRAY_SHA256_ARM64="3e38d72dfc5eb65c91df0e5583e9b6676c32232041da47de6ae73946b526d66c"
+XRAY_SHA256_386="52a825a06d77f6e2d0d72d8d873b1fd277ae503ac9a2aedb112f4f5db0e347e0"
+XRAY_SHA256_ARMV7="5b2a9e2767c0197f7bd41c2db133f91440e845771e621178e0fd2b8520228e5f"
+XRAY_SIZE_AMD64=21356337
+XRAY_SIZE_ARM64=19837074
+XRAY_SIZE_386=20519149
+XRAY_SIZE_ARMV7=20461728
 
-# Repository-reviewed Go 1.26.5 archive digests and exact byte sizes. Go does
+# Repository-reviewed Go 1.27.1 archive digests and exact byte sizes. Go does
 # not publish per-archive .sha256 URLs; custom Go versions therefore require an
 # explicit GO_TARBALL_SHA256 instead of changing checksum provenance silently.
-GO_SHA256_386="88c162b204e6eefcc32499453b492e80209f4a4c78c33092636901c540fb0d05"
-GO_SHA256_AMD64="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
-GO_SHA256_ARM64="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
-GO_SHA256_ARMV6L="6dae9edab81c13bccf962dec15f1fd2ec26c14a6821b4d2c92dab4130c289d7a"
-GO_SIZE_386=65203409
-GO_SIZE_AMD64=66879095
-GO_SIZE_ARM64=63759990
-GO_SIZE_ARMV6L=65406756
+GO_SHA256_386="3b72028095439d2bc0ce84e271cc70328a878d879020c5721eaa46df5f72fbc0"
+GO_SHA256_AMD64="63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445"
+GO_SHA256_ARM64="3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec"
+GO_SHA256_ARMV6L="44893f200fb034791d4188df9fc9b9e73eadbb5fceafd5166703f0b9bab73fc2"
+GO_SIZE_386=68698442
+GO_SIZE_AMD64=70553950
+GO_SIZE_ARM64=67009954
+GO_SIZE_ARMV6L=68968196
 
 GO_VERSION="${GO_VERSION:-$DEFAULT_GO_VERSION}"
 GO_TARBALL_SHA256="${GO_TARBALL_SHA256:-}"
@@ -109,13 +113,13 @@ usage() {
   PROXYSCENE_BUILD_FROM_SOURCE=1                只从当前源码目录编译
 
 常用变量：
-  GO_VERSION=1.26.5                            源码编译需要的 Go 版本；改版本时必须显式提供 SHA256
+  GO_VERSION=1.27.1                            源码编译需要的 Go 版本；改版本时必须显式提供 SHA256
   GO_TARBALL_SHA256=...                        非默认 Go 版本必填；默认版本使用仓库内四架构固定值
   SKIP_GO_INSTALL=1                            只使用 PATH 中已有的受支持 Go
   FORCE_GO_INSTALL=1                           强制使用事务目录中的临时指定 Go
   PROXYSCENE_MANAGER_DIR=/opt/proxyscene       Xray 与状态目录
   PROXYSCENE_SWITCH_BIN=/usr/local/bin/proxyscene
-  XRAY_RELEASE_BASE=https://.../v26.3.27       固定版本 Xray 的下载基址
+  XRAY_RELEASE_BASE=https://.../v26.9.9       固定版本 Xray 的下载基址
   XRAY_ZIP_URL=https://mirror/xray.zip         自定义当前架构 Xray zip；必须同时提供 SHA256
   XRAY_ZIP_SHA256=...                          自定义 Xray zip 的固定 SHA256
   SKIP_XRAY_INSTALL=1                          保留经文件类型、属主和架构检查的现有 Xray
@@ -210,6 +214,16 @@ xray_sha256_for_release_arch() {
     arm64) printf '%s\n' "$XRAY_SHA256_ARM64" ;;
     386) printf '%s\n' "$XRAY_SHA256_386" ;;
     armv7) printf '%s\n' "$XRAY_SHA256_ARMV7" ;;
+    *) return 1 ;;
+  esac
+}
+
+xray_archive_size_for_release_arch() {
+  case "$1" in
+    amd64) printf '%s\n' "$XRAY_SIZE_AMD64" ;;
+    arm64) printf '%s\n' "$XRAY_SIZE_ARM64" ;;
+    386) printf '%s\n' "$XRAY_SIZE_386" ;;
+    armv7) printf '%s\n' "$XRAY_SIZE_ARMV7" ;;
     *) return 1 ;;
   esac
 }
@@ -954,7 +968,7 @@ xray_marker_for_source() {
 }
 
 install_xray() {
-  local release_arch url expected unpack file marker marker_source digest
+  local release_arch url expected unpack file marker marker_source digest expected_size
   release_arch="$(arch_release)" || fatal "当前架构没有受支持的 Xray 产物：$(uname -m)"
   if [[ "$SKIP_XRAY_INSTALL" == "1" ]]; then
     validate_root_regular_file "$CORE_DIR/xray" "现有 Xray"
@@ -979,6 +993,10 @@ install_xray() {
   fi
   fetch_https "$url" "$TX_DIR/xray.zip" 104857600 || fatal "下载 Xray 失败"
   verify_sha256_file "Xray" "$TX_DIR/xray.zip" "$expected"
+  if [[ "$marker_source" == "official" ]]; then
+    expected_size="$(xray_archive_size_for_release_arch "$release_arch")" || fatal "缺少 Xray 归档精确大小"
+    [[ "$(stat -c '%s' "$TX_DIR/xray.zip")" == "$expected_size" ]] || fatal "Xray 归档大小与固定官方版本不匹配"
+  fi
   unpack="$TX_DIR/xray-unpack"
   mkdir "$unpack"
   unzip -oq "$TX_DIR/xray.zip" -d "$unpack"

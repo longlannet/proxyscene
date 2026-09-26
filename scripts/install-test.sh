@@ -69,13 +69,13 @@ assert_eq "$GO_SHA256_386" "$(go_tarball_sha256_for_arch 386)" "386 Go SHA256"
 assert_eq "$GO_SHA256_AMD64" "$(go_tarball_sha256_for_arch amd64)" "amd64 Go SHA256"
 assert_eq "$GO_SHA256_ARM64" "$(go_tarball_sha256_for_arch arm64)" "arm64 Go SHA256"
 assert_eq "$GO_SHA256_ARMV6L" "$(go_tarball_sha256_for_arch armv6l)" "armv6l Go SHA256"
-assert_eq 65203409 "$(go_tarball_size_for_arch 386)" "386 Go archive size"
-assert_eq 66879095 "$(go_tarball_size_for_arch amd64)" "amd64 Go archive size"
-assert_eq 63759990 "$(go_tarball_size_for_arch arm64)" "arm64 Go archive size"
-assert_eq 65406756 "$(go_tarball_size_for_arch armv6l)" "armv6l Go archive size"
+assert_eq 68698442 "$(go_tarball_size_for_arch 386)" "386 Go archive size"
+assert_eq 70553950 "$(go_tarball_size_for_arch amd64)" "amd64 Go archive size"
+assert_eq 67009954 "$(go_tarball_size_for_arch arm64)" "arm64 Go archive size"
+assert_eq 68968196 "$(go_tarball_size_for_arch armv6l)" "armv6l Go archive size"
 assert_fails "unsupported Go archive architecture" go_tarball_sha256_for_arch riscv64
 assert_eq \
-  "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-arm64-v8a.zip" \
+  "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/Xray-linux-arm64-v8a.zip" \
   "$(xray_download_url_for_arch arm64)" \
   "fixed Xray URL"
 
@@ -85,12 +85,12 @@ if normalize_sha256 not-a-digest >/dev/null 2>&1; then
   fail "invalid SHA256 accepted"
 fi
 
-assert_eq 1.26.5 "$(parse_go_version_output 'go version go1.26.5 linux/amd64')" "Go version parsing"
+assert_eq 1.27.1 "$(parse_go_version_output 'go version go1.27.1 linux/amd64')" "Go version parsing"
 assert_fails "development Go version" parse_go_version_output 'go version devel go1.27-deadbeef linux/amd64'
-go_version_meets_requirement 1.27.0 1.26.5 || fail "newer Go did not meet explicit requirement"
-assert_fails "Go below explicit requirement" go_version_meets_requirement 1.26.5 1.27.0
-go_version_matches_exactly 1.26.5 1.26.5 || fail "exact downloaded Go version rejected"
-assert_fails "downloaded Go version mismatch" go_version_matches_exactly 1.26.6 1.26.5
+go_version_meets_requirement 1.28.0 1.27.1 || fail "newer Go did not meet explicit requirement"
+assert_fails "Go below explicit requirement" go_version_meets_requirement 1.27.1 1.28.0
+go_version_matches_exactly 1.27.1 1.27.1 || fail "exact downloaded Go version rejected"
+assert_fails "downloaded Go version mismatch" go_version_matches_exactly 1.27.2 1.27.1
 
 assert_eq "$DEFAULT_XRAY_VERSION" \
   "$(xray_marker_for_source official "$DEFAULT_XRAY_VERSION")" \
@@ -343,7 +343,7 @@ downloaded_go_toolchain_for_test() (
   mkdir -p "$CORE_DIR" "$TX_DIR" "$fixture_root/go/bin"
   install -m 0700 /dev/stdin "$fixture_root/go/bin/go" <<'FAKE_GO'
 #!/bin/sh
-printf 'go version go1.26.5 linux/amd64\n'
+printf 'go version go1.27.1 linux/amd64\n'
 FAKE_GO
   tar -czf "$GO_FIXTURE_ARCHIVE" -C "$fixture_root" go
   GO_TARBALL_SHA256="$(sha256_file "$GO_FIXTURE_ARCHIVE")"
@@ -448,9 +448,9 @@ assert_fails "invalid Go checksum" bash -c \
   _ "$ROOT/install.sh"
 # shellcheck disable=SC2016 # child-shell variables are intentionally literal here.
 assert_fails "custom Go version without checksum" bash -c \
-  'export PROXYSCENE_INSTALL_TESTING=1 GO_VERSION=1.26.6; source "$1"; validate_common_inputs' \
+  'export PROXYSCENE_INSTALL_TESTING=1 GO_VERSION=1.27.2; source "$1"; validate_common_inputs' \
   _ "$ROOT/install.sh"
-GO_VERSION=1.26.6 GO_TARBALL_SHA256="$GO_SHA256_AMD64" validate_common_inputs
+GO_VERSION=1.27.2 GO_TARBALL_SHA256="$GO_SHA256_AMD64" validate_common_inputs
 
 permission_root="$(mktemp -d)"
 core_mode_for_test="$({

@@ -180,6 +180,9 @@ func (a *App) loadStoreBackup() (*Store, error) {
 }
 
 func decodeStore(data []byte) (*Store, bool, error) {
+	if trimmed := bytes.TrimSpace(data); len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, false, fmt.Errorf("状态 JSON 必须是对象")
+	}
 	st := newStore()
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -235,7 +238,7 @@ func validateStoreSemantics(st *Store) (bool, error) {
 		if len(node.RawURL) > maxNodeURLBytes || strings.TrimSpace(node.RawURL) != node.RawURL || urls[node.RawURL] {
 			return false, fmt.Errorf("状态含过长、带外部空白或重复的节点链接")
 		}
-		prepared, err := prepareNode(node.RawURL)
+		prepared, err := prepareStoredNode(node.RawURL)
 		if err != nil {
 			return false, fmt.Errorf("状态节点 %s 无效：%w", node.ID, err)
 		}

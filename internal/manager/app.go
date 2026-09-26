@@ -245,7 +245,7 @@ func (a *App) printSceneStatus(st *Store) {
 	}
 	fmt.Printf("全局代理：%s\n", onOff(st.SceneEnabled[SceneGlobal]))
 	fmt.Printf("开发代理：%s\n", onOff(st.SceneEnabled[SceneDev]))
-	fmt.Printf("电报服务代理：%s\n", onOff(st.SceneEnabled[SceneTelegram]))
+	fmt.Printf("电报代理配置开关：%s（连接状态见 status）\n", onOff(st.SceneEnabled[SceneTelegram]))
 }
 
 func onOff(v bool) string {
@@ -261,6 +261,7 @@ func (a *App) status() error {
 		return err
 	}
 	a.printSceneStatus(st)
+	a.printTelegramTargetStatus()
 	fmt.Printf("核心目录：%s\n", a.cfg.CoreDir)
 	fmt.Printf("Xray：%s\n", a.cfg.XrayBin())
 	fmt.Printf("配置：%s\n", a.cfg.XrayConfig())

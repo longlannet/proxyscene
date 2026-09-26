@@ -5,8 +5,9 @@ umask 077
 
 readonly CONTAINER_IMAGE="debian:13@sha256:fac46bff2e02f51425b6e33b0e1169f55dfb053d83511ca28aa50c09fd5ed7a4"
 readonly CURRENT_CONTAINER_BUNDLE="/artifacts/current-amd64-bundle.tar.gz"
-readonly V071_CONTAINER_BUNDLE="/artifacts/v0.7.1-amd64-bundle.tar.gz"
+readonly BASELINE_CONTAINER_BUNDLE="/artifacts/baseline-amd64-bundle.tar.gz"
 readonly V071_BUNDLE_SHA256="08a12e5716166c76095c54f6ea8227db8f623a719051479ceb7d6720c5c0da38"
+readonly V080_BUNDLE_SHA256="6f650d09dcb67d1f745b2e381e6358b2821253edea8b365415f9922e0bbe171a"
 
 log() {
   printf '\n==> %s\n' "$*"
@@ -15,6 +16,16 @@ log() {
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
+}
+
+# Bind both the baseline release and its installer contract to reviewed bytes.
+# The outer and inner phases call this independently before extracting a bundle.
+upgrade_baseline_identity() {
+  case "$1" in
+    "$V071_BUNDLE_SHA256") printf '%s\n' 'v0.7.1 1.22.12' ;;
+    "$V080_BUNDLE_SHA256") printf '%s\n' 'v0.8.0 1.26.5' ;;
+    *) fail "unsupported upgrade baseline bundle SHA256: $1" ;;
+  esac
 }
 
 require_command() {
@@ -210,8 +221,9 @@ inside_container() {
   local test_root current_dir old_dir current_manager_sha current_xray_sha
   local fault_dir fault_bin trusted_fault_bin fault_core fault_manager fault_state fault_output
   local rollback_test_root rollback_output tampered_dir tamper_output
-  local old_manager_sha old_state old_version custom_port node_url
-  local oc_user oc_uid oc_group openclaw_config hermes_before openclaw_before count_after
+  local old_manager_sha old_state old_version custom_port node_url upgraded_global_port
+  local baseline_identity baseline_version baseline_go_version
+  local oc_user oc_uid oc_group openclaw_config hermes_before openclaw_before count_after telegram_before
   local failure_output global_profile_original global_profile_concurrent global_apt_original
   local legacy_drop_in legacy_env legacy_state_tmp
   local -a fault_env
@@ -234,6 +246,8 @@ inside_container() {
   done
   assert_file "$current_archive"
   assert_file "$old_archive"
+  baseline_identity="$(upgrade_baseline_identity "$(sha256_file "$old_archive")")"
+  read -r baseline_version baseline_go_version <<< "$baseline_identity"
 
 	test_root="$(mktemp -d /root/proxyscene-systemd-integration.XXXXXX)"
 	cleanup_inside() {
@@ -246,19 +260,21 @@ inside_container() {
   trap cleanup_inside EXIT
 
   current_dir="$(extract_single_root_bundle "$current_archive" "$test_root/current" current)"
-  old_dir="$(extract_single_root_bundle "$old_archive" "$test_root/v0.7.1" v0.7.1)"
+  old_dir="$(extract_single_root_bundle "$old_archive" "$test_root/baseline" "$baseline_version")"
   assert_file "$current_dir/bundle-manifest.sha256"
   current_manager_sha="$(sha256_file "$current_dir/proxyscene")"
   current_xray_sha="$(sha256_file "$current_dir/xray")"
   old_manager_sha="$(sha256_file "$old_dir/proxyscene")"
   [[ "$current_manager_sha" != "$old_manager_sha" ]] \
-    || fail "current and v0.7.1 manager binaries are byte-identical"
-  assert_contains "$old_dir/install.sh" 'DEFAULT_GO_VERSION="1.22.12"' "v0.7.1 installer identity"
+    || fail "current and $baseline_version manager binaries are byte-identical"
+  grep -Fxq "DEFAULT_GO_VERSION=\"$baseline_go_version\"" "$old_dir/install.sh" \
+    || fail "$baseline_version installer default Go version differs from $baseline_go_version"
   old_version="$("$old_dir/proxyscene" version)"
-  [[ "$old_version" == "proxyscene 0.7.1"* ]] \
-    || fail "v0.7.1 bundle binary reported an unexpected version: $old_version"
+  [[ "$old_version" == "proxyscene ${baseline_version#v}" || \
+    "$old_version" == "proxyscene ${baseline_version#v} ("*")" ]] \
+    || fail "$baseline_version bundle binary reported an unexpected version: $old_version"
 
-  node_url='vless://00000000-0000-4000-8000-000000000001@198.51.100.10:443?encryption=none&security=none&type=tcp#systemd-integration'
+  node_url='vless://00000000-0000-4000-8000-000000000001@198.51.100.10:443?encryption=none&security=tls&sni=example.com&type=tcp#systemd-integration'
   custom_port=17890
 
   log "offline manifest rejection happens before any installation change"
@@ -396,28 +412,46 @@ FAULT_SYSTEMCTL
   assert_no_path /etc/systemd/system/proxyscene-init-fault.service
   assert_no_path /etc/systemd/system/proxyscene-init-fault-restore.service
 
-  log "v0.7.1 offline install with node and global scene"
+  log "$baseline_version offline install with node and global scene"
   (
     cd "$old_dir"
-    ./install.sh --offline "$node_url"
+    case "$baseline_version" in
+      v0.7.1) ./install.sh --offline "$node_url" ;;
+      v0.8.0)
+        ./install.sh --offline
+        printf '%s\n' "$node_url" | /usr/local/bin/proxyscene node add --stdin
+        ;;
+    esac
   )
   old_state=/opt/proxyscene/state.json
   assert_eq "$old_manager_sha" "$(sha256_file /usr/local/bin/proxyscene)" \
-    "installed v0.7.1 manager SHA256"
-  assert_json "$old_state" '.nodes | length == 1' "v0.7.1 node count"
+    "installed $baseline_version manager SHA256"
+  assert_json "$old_state" '.nodes | length == 1' "$baseline_version node count"
   assert_eq "$node_url" "$(jq -r '.nodes[0].raw_url' "$old_state")" \
-    "v0.7.1 node URL"
+    "$baseline_version node URL"
   env PROXYSCENE_GLOBAL_HTTP_PORT="$custom_port" \
     PROXYSCENE_GLOBAL_SOCKS_PORT=17894 \
     /usr/local/bin/proxyscene global on
-  assert_json "$old_state" '.scene_enabled.global == true' "v0.7.1 global scene"
-  wait_for "v0.7.1 Xray service" service_is_active proxyscene.service
+  assert_json "$old_state" '.scene_enabled.global == true' "$baseline_version global scene"
+  wait_for "$baseline_version Xray service" service_is_active proxyscene.service
   assert_file /etc/profile.d/proxyscene-global-proxy.sh
   assert_file /etc/apt/apt.conf.d/99proxyscene-global-proxy
   assert_contains /etc/profile.d/proxyscene-global-proxy.sh ":${custom_port}" \
-    "v0.7.1 custom global port"
+    "$baseline_version custom global port"
 
-  log "upgrade v0.7.1 in place from the current offline bundle"
+  case "$baseline_version" in
+    v0.7.1)
+      assert_json "$old_state" '.runtime_config == null' "v0.7.1 has no persisted runtime configuration"
+      upgraded_global_port=7890
+      ;;
+    v0.8.0)
+      assert_json "$old_state" ".runtime_config.global_http_port == $custom_port" \
+        "v0.8.0 custom global port persisted before upgrade"
+      upgraded_global_port="$custom_port"
+      ;;
+  esac
+
+  log "upgrade $baseline_version in place from the current offline bundle"
   (
     cd "$current_dir"
     ./install.sh --offline
@@ -445,12 +479,12 @@ FAULT_SYSTEMCTL
     assert_eq 600 "$(stat -c '%a' "$journal_path")" "global ownership journal mode"
     assert_json "$journal_path" \
       '.phase == "active" and all(.artifacts[]; .original_present == false)' \
-      "legacy global files migrated into durable ownership"
+      "global files retain or migrate into durable ownership"
   done
   assert_eq enabled "$(systemctl is-enabled proxyscene-restore.service)" \
     "upgraded restore unit"
   assert_json /opt/proxyscene/config.json \
-    '.inbounds[] | select(.tag == "global-http" and .port == 7890)' \
+    ".inbounds[] | select(.tag == \"global-http\" and .port == $upgraded_global_port)" \
     "upgraded global inbound"
 
   log "custom runtime port survives a restore-unit start without caller environment"
@@ -608,7 +642,17 @@ SECOND_GLOBAL_CONFIG
     /root/.hermes-integration/hermes-agent/venv/bin/python <<'HERMES_HELPER'
 #!/usr/bin/env bash
 set -euo pipefail
+case "$*" in
+  '-m gateway.systemd_stop_mark'|'-m gateway.cgroup_cleanup')
+    printf '%s\n' "$2" >> /run/proxyscene-integration-targets/hermes.hooks
+    exit 0
+    ;;
+  '-m hermes_cli.main gateway run') ;;
+  *) exit 2 ;;
+esac
 printf '%s\n' "$$" >> /run/proxyscene-integration-targets/hermes.starts
+printf '%s\n' "${HERMES_TELEGRAM_DISABLE_FALLBACK_IPS-}" \
+  > /run/proxyscene-integration-targets/hermes.fallback-ips-disabled
 exec /usr/bin/sleep infinity
 HERMES_HELPER
   install -m 0644 /dev/stdin /etc/systemd/system/hermes-gateway.service <<'HERMES_UNIT'
@@ -621,10 +665,46 @@ User=root
 Environment=HOME=/root
 Environment=HERMES_HOME=/root/.hermes-integration
 ExecStart=/root/.hermes-integration/hermes-agent/venv/bin/python -m hermes_cli.main gateway run
+ExecStop=-/root/.hermes-integration/hermes-agent/venv/bin/python -m gateway.systemd_stop_mark
+ExecStopPost=-/root/.hermes-integration/hermes-agent/venv/bin/python -m gateway.cgroup_cleanup
 
 [Install]
 WantedBy=multi-user.target
 HERMES_UNIT
+
+  systemctl daemon-reload
+  systemctl enable --now -- hermes-gateway.service
+  wait_for "Hermes fixture" service_is_active hermes-gateway.service
+  wait_for "Hermes fixture process start" target_start_count_greater_than hermes 0
+  log "running Hermes default queue policy refuses ownership before any restart"
+  hermes_before="$(target_start_count hermes)"
+  telegram_before="$(jq -c '(.scene_enabled.telegram // false)' "$old_state")"
+  failure_output="$test_root/hermes-queue-policy.log"
+  expect_failure "Hermes default drop-pending queue policy" "$failure_output" \
+    env PROXYSCENE_TG_SERVICES=hermes-gateway /usr/local/bin/proxyscene tg on
+  assert_contains "$failure_output" 'drop_pending_on_cold_boot' "Hermes queue-policy rejection reason"
+  assert_no_path /root/.hermes-integration/config.yaml
+  assert_no_path /etc/systemd/system/hermes-gateway.service.d/90-proxyscene-telegram-proxy.conf
+  for journal_path in \
+    /opt/proxyscene/telegram-proxy-journal.json \
+    /opt/proxyscene/telegram-proxy-journal.json.bak; do
+    if [[ -e "$journal_path" ]]; then
+      assert_json "$journal_path" '(.targets // {}) | has("hermes-gateway.service") | not' \
+        "queue-policy rejection did not claim Hermes ownership"
+    fi
+  done
+  assert_eq "$telegram_before" "$(jq -c '(.scene_enabled.telegram // false)' "$old_state")" \
+    "queue-policy rejection preserved the prior Telegram scene state"
+  assert_eq "$hermes_before" "$(target_start_count hermes)" "queue-policy rejection did not restart Hermes"
+  service_is_active hermes-gateway.service || fail "queue-policy rejection stopped Hermes"
+  printf 'HERMES_QUEUE_GUARD_OK no_config_write no_ownership no_restart\n'
+  install -m 0600 /dev/stdin /root/.hermes-integration/config.yaml <<'HERMES_CONFIG'
+platforms:
+  telegram:
+    extra:
+      drop_pending_on_cold_boot: false
+HERMES_CONFIG
+
 
   oc_user=proxyscene-oc-test
   useradd --create-home --shell /bin/bash "$oc_user"
@@ -638,6 +718,11 @@ if (process.argv[2] !== 'gateway') {
   process.exit(2);
 }
 const fs = require('node:fs');
+if (process.argv[3] === 'call') {
+  fs.appendFileSync('/run/proxyscene-integration-targets/openclaw.rpc-calls', `${process.argv[4]}\n`);
+  process.stderr.write('unsupported fixture RPC\n');
+  process.exit(2);
+}
 fs.appendFileSync('/run/proxyscene-integration-targets/openclaw.starts', `${process.pid}\n`);
 setInterval(() => {}, 2147483647);
 OPENCLAW_HELPER
@@ -656,7 +741,7 @@ Type=simple
 Environment=OPENCLAW_SERVICE_MARKER=openclaw
 Environment=OPENCLAW_SERVICE_KIND=gateway
 Environment=HOME=/home/$oc_user
-ExecStart=/usr/bin/node /opt/openclaw/dist/index.js gateway
+ExecStart=/usr/bin/node --max-old-space-size=256 /opt/openclaw/dist/index.js gateway
 
 [Install]
 WantedBy=default.target
@@ -678,13 +763,12 @@ OPENCLAW_CONFIG
   systemctl start -- "user-runtime-dir@${oc_uid}.service"
   systemctl start -- "user@${oc_uid}.service"
   wait_for "OpenClaw test user bus" test -S "/run/user/${oc_uid}/bus"
-  systemctl daemon-reload
-  systemctl enable --now -- hermes-gateway.service
   user_systemctl "$oc_user" "$oc_uid" daemon-reload
   user_systemctl "$oc_user" "$oc_uid" enable --now -- openclaw-gateway.service
-  wait_for "Hermes fixture" service_is_active hermes-gateway.service
   wait_for "OpenClaw fixture" user_systemctl "$oc_user" "$oc_uid" \
     is-active --quiet -- openclaw-gateway.service
+  wait_for "OpenClaw fixture process start" target_start_count_greater_than openclaw 0
+
   log "legacy Telegram files require exact Store ownership evidence"
   legacy_drop_in=/etc/systemd/system/hermes-gateway.service.d/10-openclaw-hermes-telegram-proxy.conf
   legacy_env=/etc/openclaw-hermes-tg-proxy.env
@@ -730,6 +814,10 @@ LEGACY_ENV
     /etc/systemd/system/hermes-gateway.service.d/90-proxyscene-telegram-proxy.conf \
     'Environment="TELEGRAM_PROXY=http://127.0.0.1:7892"' \
     "Hermes direct Telegram proxy"
+  assert_contains \
+    /etc/systemd/system/hermes-gateway.service.d/90-proxyscene-telegram-proxy.conf \
+    'Environment="HERMES_TELEGRAM_DISABLE_FALLBACK_IPS=1"' \
+    "Hermes fallback IP discovery disabled"
   assert_no_path \
     /etc/systemd/system/hermes-gateway.service.d/10-openclaw-hermes-telegram-proxy.conf
   assert_no_path \
@@ -766,6 +854,16 @@ LEGACY_ENV
     target_start_count_greater_than hermes "$hermes_before"
   wait_for "OpenClaw restart after proxy injection" \
     target_start_count_greater_than openclaw "$openclaw_before"
+  assert_eq 1 "$(cat /run/proxyscene-integration-targets/hermes.fallback-ips-disabled)" \
+    "running Hermes received the fallback-discovery guard"
+  assert_contains /run/proxyscene-integration-targets/hermes.hooks 'gateway.systemd_stop_mark' \
+    "official Hermes planned-stop hook executed"
+  assert_contains /run/proxyscene-integration-targets/hermes.hooks 'gateway.cgroup_cleanup' \
+    "official Hermes cleanup hook executed"
+  assert_contains /run/proxyscene-integration-targets/openclaw.rpc-calls 'config.get' \
+    "OpenClaw attempted the read-only RPC before falling back"
+  assert_eq "$((openclaw_before + 1))" "$(target_start_count openclaw)" \
+    "unsupported RPC caused exactly one OpenClaw restart"
   hermes_before="$(target_start_count hermes)"
   openclaw_before="$(target_start_count openclaw)"
   /usr/local/bin/proxyscene tg on
@@ -942,6 +1040,8 @@ outer_cleanup() {
     elif docker inspect "$cleanup_container_id" >/dev/null 2>&1; then
       printf 'FAIL: 特权测试容器在删除后仍然存在：%s（%s）\n' "${TEST_CONTAINER_NAME:-unknown}" "$cleanup_container_id" >&2
       cleanup_failed=1
+    else
+      printf 'CLEANUP_VERIFIED container=%s id=%s absent\n' "$TEST_CONTAINER_NAME" "$cleanup_container_id"
     fi
   fi
   if [[ "${TEST_IMAGE_PREEXISTED:-1}" == "0" ]] && \
@@ -955,7 +1055,12 @@ outer_cleanup() {
     fi
   fi
   if [[ -n "${OUTER_TEST_ROOT:-}" && "$OUTER_TEST_ROOT" == /tmp/proxyscene-systemd-integration.* ]]; then
-    rm -rf -- "$OUTER_TEST_ROOT"
+    if ! rm -rf -- "$OUTER_TEST_ROOT" || [[ -e "$OUTER_TEST_ROOT" || -L "$OUTER_TEST_ROOT" ]]; then
+      printf 'FAIL: temporary test staging remained: %s\n' "$OUTER_TEST_ROOT" >&2
+      cleanup_failed=1
+    else
+      printf 'CLEANUP_VERIFIED staging=%s absent\n' "$OUTER_TEST_ROOT"
+    fi
   fi
   if (( status == 0 && cleanup_failed != 0 )); then
     return 1
@@ -966,7 +1071,7 @@ outer_cleanup() {
 outer_main() {
   local current_bundle="$1"
   local old_bundle="$2"
-  local script_path bootstrap_state container_id
+  local script_path bootstrap_state container_id baseline_identity
 
   [[ "${PROXYSCENE_CONTAINER_TEST:-0}" == "1" ]] \
     || fail "refusing to run: set PROXYSCENE_CONTAINER_TEST=1 explicitly"
@@ -979,11 +1084,11 @@ outer_main() {
   current_bundle="$(readlink -e -- "$current_bundle")" \
     || fail "current amd64 bundle does not exist"
   old_bundle="$(readlink -e -- "$old_bundle")" \
-    || fail "v0.7.1 amd64 bundle does not exist"
+    || fail "baseline amd64 bundle does not exist"
   assert_trusted_input_file "$current_bundle"
   assert_trusted_input_file "$old_bundle"
-  assert_eq "$V071_BUNDLE_SHA256" "$(sha256_file "$old_bundle")" \
-    "verified v0.7.1 bundle SHA256"
+  baseline_identity="$(upgrade_baseline_identity "$(sha256_file "$old_bundle")")"
+  log "verified upgrade baseline ${baseline_identity%% *}"
   script_path="$(readlink -e -- "${BASH_SOURCE[0]}")"
   assert_trusted_input_file "$script_path"
 
@@ -1000,7 +1105,7 @@ outer_main() {
   trap outer_cleanup EXIT
   trap 'exit 130' INT TERM HUP
   install -m 0444 "$current_bundle" "$OUTER_TEST_ROOT/current-amd64-bundle.tar.gz"
-  install -m 0444 "$old_bundle" "$OUTER_TEST_ROOT/v0.7.1-amd64-bundle.tar.gz"
+  install -m 0444 "$old_bundle" "$OUTER_TEST_ROOT/baseline-amd64-bundle.tar.gz"
   install -m 0555 "$script_path" "$OUTER_TEST_ROOT/systemd-integration-test.sh"
 
   log "starting isolated privileged Debian 13 systemd container"
@@ -1034,6 +1139,8 @@ outer_main() {
   fi
   TEST_CONTAINER_ID="$container_id"
   [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || fail "docker returned an invalid container id"
+  printf 'CANARY_IDENTITY container=%s id=%s label=%s staging=%s image_preexisted=%s\n' \
+    "$TEST_CONTAINER_NAME" "$TEST_CONTAINER_ID" "$TEST_RUN_TOKEN" "$OUTER_TEST_ROOT" "$TEST_IMAGE_PREEXISTED"
 
   bootstrap_state=""
   for _ in $(seq 1 180); do
@@ -1058,14 +1165,14 @@ outer_main() {
     --env PROXYSCENE_CONTAINER_TEST=1 \
     "$TEST_CONTAINER_ID" \
     bash /artifacts/systemd-integration-test.sh --inside \
-      "$CURRENT_CONTAINER_BUNDLE" "$V071_CONTAINER_BUNDLE"
+      "$CURRENT_CONTAINER_BUNDLE" "$BASELINE_CONTAINER_BUNDLE"
   log "all isolated systemd integration tests passed"
 }
 
 if [[ "${1:-}" == "--inside" ]]; then
-  [[ $# -eq 3 ]] || fail "internal usage: --inside CURRENT_BUNDLE V0.7.1_BUNDLE"
+  [[ $# -eq 3 ]] || fail "internal usage: --inside CURRENT_BUNDLE VERIFIED_BASELINE_BUNDLE"
   inside_container "$2" "$3"
 else
-  [[ $# -eq 2 ]] || fail "usage: PROXYSCENE_CONTAINER_TEST=1 $0 CURRENT_AMD64_BUNDLE VERIFIED_V0.7.1_AMD64_BUNDLE"
+  [[ $# -eq 2 ]] || fail "usage: PROXYSCENE_CONTAINER_TEST=1 $0 CURRENT_AMD64_BUNDLE VERIFIED_BASELINE_AMD64_BUNDLE"
   outer_main "$1" "$2"
 fi

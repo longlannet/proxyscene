@@ -2,6 +2,7 @@
 # Build deterministic proxyscene release archives. Xray is pinned by version and
 # by a repository-reviewed SHA256 for every supported architecture.
 set -euo pipefail
+export GOENV=off GOWORK=off GOTOOLCHAIN=local
 umask 022
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,15 +14,15 @@ VERSION="${VERSION#v}"
 COMMIT="${COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
 DIST="${DIST:-dist}"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD 2>/dev/null || echo 0)}"
-XRAY_VERSION="v26.3.27"
-XRAY_COMMIT="d2758a023cd7f4174a5a5fa4ff66e487d4342ba0"
+XRAY_VERSION="v26.9.9"
+XRAY_COMMIT="52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120"
 XRAY_RELEASE_BASE="${XRAY_RELEASE_BASE:-https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}}"
 DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-300}"
 
-XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
-XRAY_SHA256_ARM64="4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c"
-XRAY_SHA256_386="d1eeb0d9a9106eefd286fbb73595c2dfe1c48c56aa91ba1c9aefe04f188d0927"
-XRAY_SHA256_ARMV7="c7265ae13c63ca0241a037df4ef960ad37938c8a67d984cc08834b2cfdf5654b"
+XRAY_SHA256_AMD64="1eb9175d0f0a8f8149c9230a7fc5ae66ce332ed20a53155ce61fe62e3f58b7df"
+XRAY_SHA256_ARM64="3e38d72dfc5eb65c91df0e5583e9b6676c32232041da47de6ae73946b526d66c"
+XRAY_SHA256_386="52a825a06d77f6e2d0d72d8d873b1fd277ae503ac9a2aedb112f4f5db0e347e0"
+XRAY_SHA256_ARMV7="5b2a9e2767c0197f7bd41c2db133f91440e845771e621178e0fd2b8520228e5f"
 
 LDFLAGS="-s -w -buildid= -X proxyscene/internal/manager.Version=${VERSION} -X proxyscene/internal/manager.Commit=${COMMIT}"
 
@@ -83,14 +84,21 @@ require_mode() {
 }
 
 fetch_xray() {
-  local target="$1" xrayarch="$2" out="$3" expected size
+  local target="$1" xrayarch="$2" out="$3" expected size expected_size
   expected="$(xray_sha256 "$target")"
+  case "$target" in
+    amd64) expected_size=21356337 ;;
+    arm64) expected_size=19837074 ;;
+    386) expected_size=20519149 ;;
+    armv7) expected_size=20461728 ;;
+    *) return 1 ;;
+  esac
   curl -q -fsSL --proto '=https' --proto-redir '=https' \
     --connect-timeout 15 --max-time "$DOWNLOAD_TIMEOUT" \
     --retry 3 --retry-delay 2 --max-filesize 104857600 \
     -o "$out/xray.zip" "${XRAY_RELEASE_BASE}/Xray-linux-${xrayarch}.zip"
   size="$(stat -c '%s' "$out/xray.zip")"
-  [[ "$size" -le 104857600 ]] || { echo "Xray 归档超过 100 MiB 上限" >&2; exit 1; }
+  [[ "$size" == "$expected_size" ]] || { echo "Xray 归档与固定官方精确大小不一致" >&2; exit 1; }
   printf '%s  %s\n' "$expected" "$out/xray.zip" | sha256sum -c -
   unzip -oq "$out/xray.zip" -d "$out/x"
   for file in xray LICENSE; do

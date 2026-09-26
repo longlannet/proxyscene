@@ -1145,32 +1145,24 @@ func commandForUserIdentity(ctx context.Context, user string, identity localUser
 		)
 	}
 	cmd.Env = env
+	cmd.Dir = identity.Home
 	return cmd, label, nil
 }
 
 func userConfigCommandEnvironment(identity localUserIdentity) []string {
-	env := make([]string, 0, len(os.Environ())+4)
-	for _, item := range os.Environ() {
-		key, _, ok := strings.Cut(item, "=")
-		if !ok {
-			continue
-		}
-		upper := strings.ToUpper(key)
-		if upper == "HOME" || upper == "USER" || upper == "LOGNAME" ||
-			upper == "XDG_CONFIG_HOME" || upper == "XDG_RUNTIME_DIR" || upper == "DBUS_SESSION_BUS_ADDRESS" || strings.HasPrefix(upper, "GIT_CONFIG") ||
-			strings.HasPrefix(upper, "NPM_CONFIG_") || upper == "HTTP_PROXY" ||
-			upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY" {
-			continue
-		}
-		env = append(env, item)
+	// These commands configure another account. A blacklist cannot prevent new
+	// tool-specific settings or credentials from crossing that identity boundary.
+	// Keep PATH for installed tools (including Node), and make all other inputs
+	// explicit. Never inherit loader/runtime hooks or credentials.
+	return []string{
+		"PATH=" + os.Getenv("PATH"),
+		"LANG=C",
+		"LC_ALL=C",
+		"HOME=" + identity.Home,
+		"USER=" + identity.Name,
+		"LOGNAME=" + identity.Name,
+		"XDG_RUNTIME_DIR=/run/user/" + strconv.Itoa(identity.UID),
 	}
-	env = append(env,
-		"HOME="+identity.Home,
-		"USER="+identity.Name,
-		"LOGNAME="+identity.Name,
-		"XDG_RUNTIME_DIR=/run/user/"+strconv.Itoa(identity.UID),
-	)
-	return env
 }
 
 // stdinReader 是进程级共享的标准输入读取器。共享单个 bufio.Reader 可避免每次

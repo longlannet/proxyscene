@@ -804,12 +804,12 @@ func TestGeneratedTransportConfigsPassPinnedXray(t *testing.T) {
 		"grpc":        "vless://" + id + "@example.com:443?type=grpc&serviceName=svc&security=tls",
 		"httpupgrade": "vless://" + id + "@example.com:443?type=httpupgrade&host=cdn.example.com&path=%2Fup&security=tls",
 		"xhttp":       "vless://" + id + "@example.com:443?type=xhttp&host=cdn.example.com&path=%2Fx&mode=packet-up&security=tls",
-		"vless-none":  "vless://" + id + "@example.com:443?type=raw&security=none",
+		"vless-none":  "vless://" + id + "@127.0.0.1:443?type=raw&security=none",
 		"vless-reality": "vless://" + id + "@example.com:443?type=raw&security=reality&sni=reality.example.com&pbk=" +
 			url.QueryEscape(publicKey),
 		"vless-flow-vision": "vless://" + id + "@example.com:443?type=raw&security=tls&flow=xtls-rprx-vision",
 		"vless-flow-udp443": "vless://" + id + "@example.com:443?type=raw&security=tls&flow=xtls-rprx-vision-udp443",
-		"trojan-none":       "trojan://secret@example.com:443?type=raw&security=none",
+		"trojan-none":       "trojan://secret@127.0.0.1:443?type=raw&security=none",
 		"trojan-tls":        "trojan://secret@example.com:443?type=raw&security=tls&sni=tls.example.com",
 		"trojan-reality": "trojan://secret@example.com:443?type=raw&security=reality&sni=reality.example.com&pbk=" +
 			url.QueryEscape(publicKey),
@@ -818,6 +818,15 @@ func TestGeneratedTransportConfigsPassPinnedXray(t *testing.T) {
 			"net": "ws", "tls": "tls", "sni": "tls.example.com", "host": "cdn.example.com", "path": "/ws",
 		}),
 	}
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = 0xfb
+	}
+	for name, encoding := range map[string]*base64.Encoding{"raw-url": base64.RawURLEncoding, "padded-url": base64.URLEncoding, "raw-standard": base64.RawStdEncoding, "padded-standard": base64.StdEncoding} {
+		cases["reality-key-"+name] = "vless://" + id + "@example.com:443?security=reality&sni=example.com&pbk=" + url.QueryEscape(encoding.EncodeToString(key))
+	}
+	cases["ss-escaped-password"] = "ss://aes-256-gcm:p%40ss%3Aword+%25@example.com:8388"
+	cases["ss-legacy-at-password"] = "ss://" + base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:p@ss@example.com:8388"))
 	for _, cipher := range []string{"auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero"} {
 		cases["vmess-cipher-"+cipher] = vmessURL(t, map[string]any{
 			"v": "2", "add": "example.com", "port": 443, "id": id,
@@ -829,7 +838,6 @@ func TestGeneratedTransportConfigsPassPinnedXray(t *testing.T) {
 		"aes-256-gcm", "aead_aes_256_gcm",
 		"chacha20-poly1305", "aead_chacha20_poly1305", "chacha20-ietf-poly1305",
 		"xchacha20-poly1305", "aead_xchacha20_poly1305", "xchacha20-ietf-poly1305",
-		"none", "plain",
 	} {
 		cases["shadowsocks-method-"+method] = "ss://" + method + ":secret@example.com:8388"
 	}
@@ -850,6 +858,82 @@ func TestGeneratedTransportConfigsPassPinnedXray(t *testing.T) {
 			output, err := exec.CommandContext(ctx, bin, "run", "-test", "-format", "json", "-config", config).CombinedOutput()
 			if err != nil {
 				t.Fatalf("Xray -test failed: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestSSPasswordEncodingForms(t *testing.T) {
+	for _, tc := range []struct{ name, raw, want string }{
+		{"plaintext escapes", "ss://aes-256-gcm:p%40ss%3Aword+%25@example.com:8388", "p@ss:word+%"},
+		{"encoded userinfo literal", "ss://" + base64.RawURLEncoding.EncodeToString([]byte("aes-256-gcm:p%40ss+")) + "@example.com:8388", "p%40ss+"},
+		{"legacy at sign", "ss://" + base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:p@ss%40+@example.com:8388")), "p@ss%40+"},
+		{"legacy ipv6", "ss://" + base64.RawURLEncoding.EncodeToString([]byte("aes-256-gcm:p@ss@[2001:db8::1]:8388")), "p@ss"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pn, err := parseNode(tc.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := outboundPassword(t, pn); got != tc.want {
+				t.Fatalf("password = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if _, err := parseNode("ss://aes-256-gcm:bad%xx@example.com:8388"); err == nil {
+		t.Fatal("invalid percent escape accepted")
+	}
+}
+
+func TestRealityPublicKeyEncodingsNormalizeForXray(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = 0xfb
+	}
+	canonical := base64.RawURLEncoding.EncodeToString(key)
+	for _, encoding := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.StdEncoding} {
+		encoded := encoding.EncodeToString(key)
+		t.Run(encoded, func(t *testing.T) {
+			pn, err := parseNode("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=reality&sni=example.com&pbk=" + url.QueryEscape(encoded))
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings := pn.Outbound["streamSettings"].(map[string]any)["realitySettings"].(map[string]any)
+			if settings["publicKey"] != canonical {
+				t.Fatalf("publicKey = %q, want %q", settings["publicKey"], canonical)
+			}
+		})
+	}
+}
+
+func TestPinnedXrayRejectsRemovedModesButKeepsStoredNodesReadable(t *testing.T) {
+	for _, raw := range []string{
+		"vless://11111111-1111-1111-1111-111111111111@example.com:443?security=none",
+		"trojan://secret@8.8.8.8:443?security=none",
+		"ss://none:secret@example.com:8388",
+		"ss://plain:secret@example.com:8388",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			if _, err := prepareNode(raw); err == nil || !strings.Contains(err.Error(), "Xray v26.9.9") {
+				t.Fatalf("import should explain removed mode: %v", err)
+			}
+			prepared, err := prepareStoredNode(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a := testApp(t)
+			st := newStore()
+			st.Nodes = []Node{{ID: "old", Name: "old", Protocol: prepared.Parsed.Protocol, RawURL: raw}}
+			st.DefaultNodeID = "old"
+			if err := a.saveStore(st); err != nil {
+				t.Fatalf("legacy node cannot be retained for migration: %v", err)
+			}
+			got, err := a.loadStore()
+			if err != nil || len(got.Nodes) != 1 {
+				t.Fatalf("legacy node cannot be read: %+v, %v", got, err)
+			}
+			if _, err := a.outboundForScene(got, SceneGlobal, "test"); err == nil {
+				t.Fatal("legacy unsupported node reached runtime")
 			}
 		})
 	}

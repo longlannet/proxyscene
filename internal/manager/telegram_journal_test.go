@@ -23,6 +23,16 @@ type telegramJournalTestHarness struct {
 func newTelegramJournalTestHarness(t *testing.T) *telegramJournalTestHarness {
 	t.Helper()
 	h := &telegramJournalTestHarness{app: testApp(t), dir: t.TempDir()}
+	stubTelegramServiceState(t, telegramServiceState{LoadState: "loaded", ActiveState: "active"})
+	oldRestartPolicy := telegramValidateHermesRestartPolicy
+	t.Cleanup(func() { telegramValidateHermesRestartPolicy = oldRestartPolicy })
+	telegramValidateHermesRestartPolicy = func(systemdTargetName, *persistedUserIdentity) error { return nil }
+	oldReloadState := openClawReloadUnitState
+	t.Cleanup(func() { openClawReloadUnitState = oldReloadState })
+	openClawReloadUnitState = func(systemdTargetName, *persistedUserIdentity) (string, error) {
+		return "", errors.New("fixture has no gateway RPC")
+	}
+
 	h.systemPath = filepath.Join(h.dir, "hermes-journal-test.service.d", telegramManagedDropInName)
 	h.legacyPath = filepath.Join(h.dir, "legacy-system.conf")
 	h.envPath = filepath.Join(h.dir, "legacy.env")

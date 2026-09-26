@@ -550,35 +550,7 @@ func unitIsHermesGatewayExec(content string) bool {
 }
 
 func effectiveServiceExecStarts(content string) ([][]string, error) {
-	section := ""
-	execStarts := [][]string{}
-	for _, line := range systemdLogicalLines(content) {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
-			continue
-		}
-		if section != "Service" {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "ExecStart" {
-			continue
-		}
-		words, err := splitSystemdWords(value)
-		if err != nil {
-			return nil, err
-		}
-		if len(words) == 0 {
-			execStarts = nil
-			continue
-		}
-		execStarts = append(execStarts, words)
-	}
-	return execStarts, nil
+	return effectiveServiceCommands(content, "ExecStart")
 }
 
 func systemdLogicalLines(content string) []string {

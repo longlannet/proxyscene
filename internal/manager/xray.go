@@ -247,7 +247,7 @@ func (a *App) outboundForScene(st *Store, scene Scene, tag string) (map[string]a
 	if n == nil {
 		return nil, fmt.Errorf("节点不存在：%s", id)
 	}
-	pn, err := parseNode(n.RawURL)
+	pn, err := parseRuntimeNode(n.RawURL)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +267,7 @@ func (a *App) checkXrayConfigAt(path string) error {
 }
 
 func (a *App) testNode(n Node) error {
-	pn, err := parseNode(n.RawURL)
+	pn, err := parseRuntimeNode(n.RawURL)
 	if err != nil {
 		return err
 	}

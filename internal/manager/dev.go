@@ -446,22 +446,7 @@ func parseGitNullOutput(out string) ([]string, error) {
 }
 
 func getNPMConfig(user string, identity *persistedUserIdentity, key string) (*string, error) {
-	out, err := devOutputAsUser(user, identity, "npm", "config", "get", key)
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(strings.ReplaceAll(out, "\r\n", "\n"), "\n")
-	v := ""
-	for i := len(lines) - 1; i >= 0; i-- {
-		if s := strings.TrimSpace(lines[i]); s != "" {
-			v = s
-			break
-		}
-	}
-	if v == "" || v == "undefined" || v == "null" {
-		return nil, nil
-	}
-	return &v, nil
+	return devReadNPMConfig(user, identity, key)
 }
 
 func commandExitCode(err error) int {
@@ -707,9 +692,9 @@ func (a *App) restoreDevGitProxy(backup *devProxyBackup, key string, original, m
 		// The command completed before a crash or an ambiguous journal write.
 		case slices.Equal(current, before):
 			if restorePlan.Next == 0 {
-				err = runGitConfigForIdentity(backup.User, backup.Identity, backup.GitConfigLocation, "--unset-all", "--", key)
+				err = devMutateGitConfig(backup.User, backup.Identity, backup.GitConfigLocation, before, "--unset-all", "--", key)
 			} else {
-				err = runGitConfigForIdentity(backup.User, backup.Identity, backup.GitConfigLocation, "--add", "--", key, restorePlan.Desired[restorePlan.Next-1])
+				err = devMutateGitConfig(backup.User, backup.Identity, backup.GitConfigLocation, before, "--add", "--", key, restorePlan.Desired[restorePlan.Next-1])
 			}
 			if err != nil {
 				return fmt.Errorf("执行 git %s 恢复步骤 %d 失败：%w", key, restorePlan.Next, err)
@@ -789,11 +774,7 @@ func (a *App) restoreDevNPMProxy(backup *devProxyBackup, key string, original *s
 	if !optionalStringsEqual(current, restorePlan.Before) {
 		return fmt.Errorf("npm %s 在恢复期间被并发修改，拒绝覆盖并保留开发代理备份", key)
 	}
-	if restorePlan.Desired != nil {
-		err = runDevAsPersistedUser(backup.User, backup.Identity, "npm", "config", "set", key, *restorePlan.Desired)
-	} else {
-		err = runDevAsPersistedUser(backup.User, backup.Identity, "npm", "config", "delete", key)
-	}
+	err = devMutateNPMConfig(backup.User, backup.Identity, key, restorePlan.Before, restorePlan.Desired)
 	if err != nil {
 		return err
 	}
@@ -843,6 +824,17 @@ func optionalStringsEqual(left, right *string) bool {
 		return left == nil && right == nil
 	}
 	return *left == *right
+}
+
+// A repeat apply may replace only the recorded baseline or a single value we
+// previously managed. This also covers a crash after ownership was written but
+// before the first mutation: an administrator's later edit must not be erased.
+func devGitApplyValueKnown(current, original, managed []string) bool {
+	return slices.Equal(current, original) || len(current) == 1 && containsString(managed, current[0])
+}
+
+func devNPMApplyValueKnown(current, original *string, managed []string) bool {
+	return optionalStringsEqual(current, original) || current != nil && containsManagedNPMProxy(managed, *current)
 }
 
 func containsManagedNPMProxy(managed []string, current string) bool {

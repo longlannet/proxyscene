@@ -3,13 +3,13 @@ Xray-core Corresponding Source Notice
 
 The unmodified Xray-core executable in the proxyscene offline bundles is from:
 
-- Release: v26.3.27
-- Source commit: d2758a023cd7f4174a5a5fa4ff66e487d4342ba0
-- Upstream source: https://github.com/XTLS/Xray-core/tree/v26.3.27
-- Upstream build Go version recorded in the ELF: go1.26.1
+- Release: v26.9.9 (upstream prerelease, selected after four-architecture verification)
+- Source commit: 52a412d9e2f5c2a5142b1b4e2ab3771dacb8b120
+- Upstream source: https://github.com/XTLS/Xray-core/tree/v26.9.9
+- Upstream build Go version recorded in the ELF: go1.27.1
 
 The same immutable proxyscene GitHub Release carries
-`xray_source_v26.3.27.tar.gz`. Its SHA256 is listed in that Release's
+`xray_source_v26.9.9.tar.gz`. Its SHA256 is listed in that Release's
 `checksums.txt`. The source archive contains the exact Xray-core source module
 and the source module zip, go.mod, and module metadata for every Go module
 recorded in the redistributed ELF by `go version -m`. It also contains the

@@ -45,12 +45,15 @@ architecture. Metadata, download, and checksum failures stop the Release install
 implicit source fallback. Source compilation requires explicit `PROXYSCENE_BUILD_FROM_SOURCE=1`
 and an `install.sh` physically located in the intended source checkout containing `go.mod`.
 
-Xray is fixed at `v26.3.27`. The repository stores an independently reviewed SHA256 for each
+Xray is fixed at `v26.9.9`, an upstream prerelease selected because the latest
+upstream stable still uses an affected toolchain. All four archives are checked
+against official digests; the exact source and matching compiler are checked for
+vulnerable imported packages before publishing. The repository stores an independently reviewed SHA256 for each
 supported archive (`amd64`, `arm64`, `386`, and `armv7`); the installer and bundle builder do not
 trust a checksum downloaded beside the Xray archive. A custom HTTPS mirror must serve identical
 bytes or be paired with an explicit `XRAY_ZIP_SHA256`. Existing Xray files are replaced on normal
 online installs; `SKIP_XRAY_INSTALL=1` accepts only a root-owned, non-writable, regular non-symlink
-ELF for the current architecture. `xray-version.txt` claims `v26.3.27` only for the pinned official
+ELF for the current architecture. `xray-version.txt` claims `v26.9.9` only for the pinned official
 digest path. A custom archive is marked `custom-sha256:<archive digest>` and a retained binary is
 marked `existing-sha256:<binary digest>`, so an unverifiable upstream version is never invented.
 
@@ -90,7 +93,7 @@ instead of leaving partially created systemd units pointing at rolled-back or mi
 Package-manager changes and manager/systemd side effects are outside the file transaction; retry
 initialization with `proxyscene install --skip-node` after correcting the reported cause.
 
-Source builds use Go 1.26.5 or newer. The default version is checked against repository-reviewed
+Source builds use Go 1.27.1 or newer. The default version is checked against repository-reviewed
 SHA256 values and exact sizes for linux/386, amd64, arm64, and armv6l. Go does not provide dependable
 per-archive `.sha256` URLs. Any non-default `GO_VERSION` therefore requires an explicit
 `GO_TARBALL_SHA256` and otherwise fails closed. Downloads, backups, the module cache, build cache,
@@ -152,6 +155,12 @@ The service identity, `HERMES_HOME`, active profile, and gateway project root mu
 bound before the profile, operator, project, and `/etc/hermes` dotenv files are checked. Those files
 must not redeclare proxy, bypass, fallback-IP, home, or managed-directory routing variables. The
 post-write check also requires the final `TELEGRAM_PROXY` to equal the managed URL.
+Automatic management requires a single default profile, with no named profile directories or symlinks.
+Hermes 0.21.5 can multiplex automatically and retires the explicit false setting, while secondary
+profiles do not reliably inherit process-level Telegram secrets. Named active profiles and explicit
+multiplex activation are therefore rejected, including during recovery. Bypass checks cover Unicode
+whitespace, wildcard apexes, scheme-relative hosts, and IPv4 dotted netmasks/hostmasks. Dotenv key
+checks cover the Python/Node whitespace rules and reject ambiguous route declarations.
 The managed Hermes drop-in also sets `PYTHONSAFEPATH=1`, and the post-restart check requires that
 exact final value. This prevents `python -m hermes_cli.main` from prepending `WorkingDirectory` to
 the module search path; conflicting unit, manager, dotenv, or secret-source declarations fail closed.

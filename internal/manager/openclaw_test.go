@@ -39,6 +39,16 @@ func newOpenClawTestHarness(t *testing.T, initialConfig string) *openClawTestHar
 		home: t.TempDir(),
 	}
 	h.configPath = filepath.Join(h.home, ".openclaw", "openclaw.json")
+	stubTelegramServiceState(t, telegramServiceState{LoadState: "loaded", ActiveState: "active"})
+	oldRestartPolicy := telegramValidateHermesRestartPolicy
+	t.Cleanup(func() { telegramValidateHermesRestartPolicy = oldRestartPolicy })
+	telegramValidateHermesRestartPolicy = func(systemdTargetName, *persistedUserIdentity) error { return nil }
+	oldReloadState := openClawReloadUnitState
+	t.Cleanup(func() { openClawReloadUnitState = oldReloadState })
+	openClawReloadUnitState = func(systemdTargetName, *persistedUserIdentity) (string, error) {
+		return "", errors.New("fixture has no gateway RPC")
+	}
+
 	h.identity = localUserIdentity{Name: h.user, UID: 0, GID: 0, UIDText: "0", GIDText: "0", Home: h.home}
 	if err := os.MkdirAll(filepath.Dir(h.configPath), 0o700); err != nil {
 		t.Fatal(err)

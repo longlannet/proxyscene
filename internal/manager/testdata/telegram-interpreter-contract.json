@@ -1,0 +1,405 @@
+{
+  "provenance": {
+    "hermes_commit": "f97608f178d1ffeca59860195ab7da295f7c8e5f",
+    "hermes_version": "0.21.5",
+    "hermes_matcher_sha256": "05504003e1075955de2d8033c45cef1c5d24fbcb5bc7f3e326967f54e8ee5a20",
+    "python_dotenv_version": "1.2.2",
+    "node_dotenv_version": "17.4.2",
+    "targets": [
+      "api.telegram.org",
+      "149.154.166.110",
+      "8.8.8.8"
+    ],
+    "method": "Run real pure Hermes leaf matcher and actual Python/Node dotenv parsers on synthetic inputs; no application configuration, services, credentials, or network used. Snapshot is a regression contract, not a future upstream compatibility claim."
+  },
+  "dotenv": [
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u000b=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\f=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u001c=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u001d=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u001e=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u001f=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u0085=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u00a0=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u1680=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u2003=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u2028=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u2029=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u202f=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u205f=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "TELEGRAM_PROXY\u3000=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "export\u000b'TELEGRAM_PROXY'=http://fixture.invalid\n",
+      "keys": [
+        "TELEGRAM_PROXY"
+      ]
+    },
+    {
+      "parser": "python",
+      "input": "'NO_PROXY'\f=api.telegram.org\n",
+      "keys": [
+        "NO_PROXY"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\u000b=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\f=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\u00a0=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\u1680=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\u2003=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\u2028=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\u2029=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\u202f=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\u205f=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\u3000=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\ufeff=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_PROFILE\n=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_STATE_DIR:\n /tmp/fixture\n",
+      "keys": [
+        "OPENCLAW_STATE_DIR"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "OPENCLAW_STATE_DIR: \n",
+      "keys": [
+        "OPENCLAW_STATE_DIR"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "export\u2003OPENCLAW_PROFILE=blue\n",
+      "keys": [
+        "OPENCLAW_PROFILE"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "TOKEN=x\u2028OPENCLAW_PROFILE=blue\n",
+      "keys": [
+        "TOKEN"
+      ]
+    },
+    {
+      "parser": "node",
+      "input": "TOKEN=x\u2029OPENCLAW_PROFILE=blue\n",
+      "keys": [
+        "TOKEN"
+      ]
+    }
+  ],
+  "no_proxy": [
+    {
+      "input": "localhost api.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "localhost\tapi.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "localhost\u000bapi.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "localhost\fapi.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "localhost\u001capi.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "localhost\u0085api.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "localhost\u2003api.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "*.api.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "*.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": ".api.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "*api.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "//api.telegram.org",
+      "bypass": true
+    },
+    {
+      "input": "https://api.telegram.org/path",
+      "bypass": true
+    },
+    {
+      "input": "//user:pass@api.telegram.org/path",
+      "bypass": true
+    },
+    {
+      "input": "https://api.telegram.org:invalid/path",
+      "bypass": true
+    },
+    {
+      "input": "https://api.telegram.org:99999/path",
+      "bypass": true
+    },
+    {
+      "input": "api.telegram.org...",
+      "bypass": true
+    },
+    {
+      "input": "//api.telegram.org.../path",
+      "bypass": true
+    },
+    {
+      "input": "8.8.8.0/255.255.255.0",
+      "bypass": true
+    },
+    {
+      "input": "8.8.8.0/0.0.0.255",
+      "bypass": true
+    },
+    {
+      "input": "0.0.0.0/0.0.0.0",
+      "bypass": true
+    },
+    {
+      "input": "149.154.166.0/255.255.255.0",
+      "bypass": true
+    },
+    {
+      "input": "149.154.166.110",
+      "bypass": true
+    },
+    {
+      "input": "localhost",
+      "bypass": false
+    },
+    {
+      "input": "internal.example",
+      "bypass": false
+    },
+    {
+      "input": "api.telegram.org:443",
+      "bypass": false
+    },
+    {
+      "input": "api.telegram.org:99999",
+      "bypass": false
+    },
+    {
+      "input": "//api.telegram.org:443",
+      "bypass": false
+    },
+    {
+      "input": "https://api.telegram.org:0",
+      "bypass": false
+    },
+    {
+      "input": "149.154.166.110:443",
+      "bypass": false
+    },
+    {
+      "input": "10.0.0.0/255.0.0.0",
+      "bypass": false
+    },
+    {
+      "input": "10.0.0.0/0.255.255.255",
+      "bypass": false
+    },
+    {
+      "input": "127.0.0.1",
+      "bypass": false
+    },
+    {
+      "input": "::1",
+      "bypass": false
+    },
+    {
+      "input": "exampletelegram.org",
+      "bypass": false
+    },
+    {
+      "input": "api.telegram.org.evil.invalid",
+      "bypass": false
+    },
+    {
+      "input": "localhost,internal.example",
+      "bypass": false
+    }
+  ]
+}

@@ -463,6 +463,7 @@ func TestTelegramProxySystemdEnvironmentLinesDoNotInjectBroadProxy(t *testing.T)
 	for _, required := range []string{
 		`Environment="TELEGRAM_PROXY=http://127.0.0.1:7892"`,
 		`Environment="PYTHONSAFEPATH=1"`,
+		`Environment="HERMES_TELEGRAM_DISABLE_FALLBACK_IPS=1"`,
 	} {
 		if !strings.Contains(lines, required) {
 			t.Fatalf("systemd env lines missing %s in:\n%s", required, lines)

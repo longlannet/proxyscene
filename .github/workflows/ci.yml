@@ -32,21 +32,23 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Static analysis
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
       - name: Vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: Shell syntax
         run: |
-          bash -n install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
+          for script in install.sh scripts/*.sh; do bash -n "$script"; done
       - name: ShellCheck
         run: |
-          if ! command -v shellcheck >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+          if ! command -v shellcheck >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install -y shellcheck jq
+            sudo apt-get install -y shellcheck jq python3
           fi
-          shellcheck install.sh scripts/build-bundle.sh scripts/build-xray-source-archive.sh scripts/generate-xray-third-party-licenses.sh scripts/install-test.sh scripts/systemd-integration-test.sh scripts/verify-release-artifacts.sh
+          shellcheck install.sh scripts/*.sh
       - name: Installer pure-function tests
         run: sudo -- bash scripts/install-test.sh
+      - name: Documented bootstrap failure-path tests
+        run: sudo -- bash scripts/bootstrap-test.sh
       - name: Workflow validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
 
@@ -66,7 +68,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y binutils jq unzip
+          sudo apt-get install -y binutils jq python3 unzip
       - name: Build amd64 bundle (dry run)
         # 独立构建两次 amd64，端到端验证固定 Xray SHA256、可复现打包与 checksums。
         env:
