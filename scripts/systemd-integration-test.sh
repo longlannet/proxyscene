@@ -269,6 +269,8 @@ write_hermes_layout_unit() {
   install -m 0644 /dev/stdin /etc/systemd/system/hermes-gateway.service <<HERMES_LAYOUT_UNIT
 [Unit]
 Description=proxyscene integration Hermes installation layout
+# Lifecycle tests deliberately restart fixtures faster than normal gateways.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -442,6 +444,10 @@ inside_container() {
 	test_root="$(mktemp -d /root/proxyscene-systemd-integration.XXXXXX)"
 	cleanup_inside() {
 		local status=$?
+		if (( status != 0 )); then
+			systemctl --no-pager --full status hermes-gateway.service proxyscene.service >&2 || true
+			journalctl --no-pager -n 120 -u hermes-gateway.service -u proxyscene.service >&2 || true
+		fi
 		if [[ -n "${test_root:-}" && "$test_root" == /root/proxyscene-systemd-integration.* ]]; then
 			rm -rf -- "$test_root" || return 1
 		fi
@@ -848,6 +854,8 @@ HERMES_HELPER
   install -m 0644 /dev/stdin /etc/systemd/system/hermes-gateway.service <<'HERMES_UNIT'
 [Unit]
 Description=proxyscene integration Hermes gateway
+# Lifecycle tests deliberately restart fixtures faster than normal gateways.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -925,6 +933,8 @@ OPENCLAW_HELPER
     "/home/$oc_user/.config/systemd/user/openclaw-gateway.service" <<OPENCLAW_UNIT
 [Unit]
 Description=proxyscene integration OpenClaw gateway
+# Lifecycle tests deliberately restart fixtures faster than normal gateways.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
