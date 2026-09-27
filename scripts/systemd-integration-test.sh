@@ -434,6 +434,9 @@ HERMES_UNSAFE_ENV
   assert_no_path /opt/proxyscene/runtime-transition.json
   cp -p -- "$evidence_dir/hermes-layout-owned-drop-in" "$managed_drop_in"
   systemctl daemon-reload
+  # The operator changed the gateway program. Start that program explicitly,
+  # as a normal boot would, before asking proxyscene to reconcile its proxy.
+  systemctl restart -- hermes-gateway.service
   systemctl start -- proxyscene-restore.service
   wait_for "boot reconciliation after return to user Hermes" assert_hermes_layout_runtime \
     "$user_project" "$service_uid" "$config_home" http://127.0.0.1:7892
@@ -506,7 +509,7 @@ runtime_transaction_canary() {
     fi
     assert_no_path "$receipt"
     assert_eq "$before_store" "$(jq -cS 'del(.generation)' "$state")" "$fault_mode restored Store semantics"
-    (( $(jq -r .generation "$state") > before_generation )) || fail "$fault_mode did not advance compensation generation"
+    assert_eq "$before_generation" "$(jq -r .generation "$state")" "$fault_mode retained uncommitted Store generation"
     cmp -- "$state" "$state.bak" || fail "$fault_mode Store backup differs"
     assert_eq "$before_config" "$(sha256_file /opt/proxyscene/config.json)" "$fault_mode restored config"
     assert_eq "$before_profile" "$(sha256_file /etc/profile.d/proxyscene-global-proxy.sh)" "$fault_mode retained profile"
