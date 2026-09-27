@@ -1,0 +1,90 @@
+# 发布到 dl.ll.cd
+
+proxyscene 镜像位于 `https://dl.ll.cd/proxyscene`。它保存 GitHub 已公开、稳定且不可变 Release 的原始资产，不重建程序，不改写安装器。GitHub 仍是版本身份与 SHA256 的信任来源；镜像不是独立签名系统。
+
+## 发布流程
+
+1. 从 `main` 启动 `Mirror release`，输入已发布的稳定 tag。
+2. 工作流从固定 GitHub 仓库验证 tag、commit、Release ID、不可变状态和精确 11 项资产；下载并核对 GitHub digest、实际大小及 `checksums.txt`。
+3. 专用 SSH 接收端执行 `proxyscene-mirror sync vMAJOR.MINOR.PATCH`。服务器独立从 GitHub 拉取并校验相同资产，在私有暂存目录准备完整版本，以不覆盖的原子目录重命名提交。
+4. 工作流从公开 HTTPS 镜像下载全部 11 项文件，与原始 GitHub 下载逐字节比较。
+5. 仅当选中 tag 仍是 GitHub Latest，才执行 `proxyscene-mirror promote TAG`。服务器重新核对 GitHub Latest、本地完整版本及单调版本顺序，原子更新 `latest.json`；工作流再次验收。
+
+旧版本允许归档，但不能降低 Latest。已存在的版本只能以完全相同内容幂等重试，不能覆盖或修补公开的半成品目录。格式损坏或不规范的现存 `latest.json` 会阻断更新，不能被当作首次发布。已有索引用于记录本地版本高水位；同一 tag 的身份信息不能改写，新 tag 则独立按 GitHub 身份与资产重新验证。镜像故障不会删除或重建已经发布的 GitHub Release；修复后单独重跑镜像工作流。
+
+```bash
+gh workflow run 'Mirror release' --ref main -f tag=v0.9.1
+```
+
+正式 `Release` 工作流在 GitHub 发布后校验成功时，按仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true` 自动调用相同镜像流程。未配置镜像时该可选 job 跳过。手动同步也要求该变量为 true。自动与手动入口使用相同 concurrency group，并由服务器上的文件锁串行化实际写入。
+
+## 一次性部署
+
+在实际提供 `dl.ll.cd` 的服务器上单独配置 `psmirror` 账户。该账户无 sudo 权限、密码锁定；保留 `/bin/sh` 仅供 sshd 执行固定命令。不要复用 linux-temp-admin 的账号或密钥。
+
+| 路径 | 属主与权限 | 用途 |
+| --- | --- | --- |
+| `/usr/local/libexec/proxyscene-mirror/` | root:root 0755 | 可信接收端代码目录 |
+| 其中 `mirror-receiver.py`、`mirror_release.py` | root:root 0644 | 来自经过测试的同一仓库提交 |
+| `/www/wwwroot/dl.ll.cd/proxyscene/` | psmirror:www 0755 | 公开版本及 Latest 索引 |
+| `/var/lib/proxyscene-mirror/` | psmirror:psmirror 0700 | 私有暂存、持久发布锁 |
+| `/home/psmirror/.ssh/` | psmirror:psmirror 0700 | 专用公钥目录 |
+| 其中 `authorized_keys` | psmirror:psmirror 0600 | 唯一受限部署公钥 |
+
+`www` 应替换为站点实际使用的 Web 组。所有父目录由 root 拥有且不可由普通账号写入；代码目录不可由 psmirror 修改。公开目录与私有暂存目录必须位于同一文件系统，并支持 Linux `renameat2(RENAME_NOREPLACE)`。服务器需要 Python 3.10+、curl、OpenSSH，以及到 GitHub API 和公开 Release 资产的 HTTPS 访问。
+
+公钥必须配置以下限制，替换末尾为本项目专用公钥：
+
+```text
+restrict,command="/usr/bin/python3 -I /usr/local/libexec/proxyscene-mirror/mirror-receiver.py" ssh-ed25519 <dedicated-proxyscene-public-key>
+```
+
+接收端只允许 `proxyscene-mirror sync TAG` 和 `proxyscene-mirror promote TAG`，不接受调用方自定义 URL、路径、文件内容或环境配置。私钥仅放在 GitHub Environment 的部署 Secret；服务器只保存公钥。主机指纹必须经现有可信 SSH 记录或独立管理通道核验，不能在发布时临时 `ssh-keyscan` 后直接信任。
+
+先检查现存账号、目录和配置，禁止以初始化操作覆盖它们。部署脚本应明确核对 root 所有权、文件摘要、同文件系统及专用账户隔离，再把这两个 Python 文件作为同一版本安装；更新时先停用配置门禁，并避免新旧模块混用。
+
+## Web 路由
+
+将 [deploy/nginx/proxyscene.conf](../deploy/nginx/proxyscene.conf) 安装到 dl.ll.cd 现有 HTTPS server 的 include 目录。宝塔常用路径是 `/www/server/panel/vhost/nginx/extension/dl.ll.cd/proxyscene.conf`；须先核对实际站点 include、document root 与 nginx 可执行文件。
+
+该文件只增加 `/proxyscene` 路由，不改其它项目：固定 tag 文件长期 immutable 缓存；`latest.json` 禁缓存；禁止符号链接、目录索引、隐藏文件、非白名单路径和写方法。先执行实际 nginx 的 `-t`，成功后才 reload。保持原站点 TLS 和证书配置。
+
+不维护可变的根目录 `install.sh`。用户通过明确版本目录下载脚本或 bundle，并按 README 从 GitHub 验证；`latest.json` 只用于发现版本。这样只有一个稳定版提交点，不会出现独立更新脚本与索引相互错配。
+
+## GitHub 配置
+
+使用独立 Environment `release-mirror`，只允许 main 部署。配置环境变量 `MIRROR_HOST`、`MIRROR_PORT`、`MIRROR_USER`；后者为本项目的 `psmirror`。配置环境 Secret `MIRROR_SSH_KEY`、`MIRROR_KNOWN_HOSTS`。按组织策略设置部署保护；不要借用其它项目的发布 Secret。
+
+全部部署检查通过后，最后设置仓库级变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`。停用镜像发布时将其改为 false；该变量不会改动已有 GitHub Release 或镜像版本文件。工作流只有 contents:read 权限，不执行待镜像 tag 内的代码，所有验证代码来自发起工作流的 main 提交。
+
+## 验证与故障恢复
+
+本地运行：
+
+```bash
+python3 -B -m unittest discover -s scripts -p '*mirror*test.py' -v
+sudo -- bash scripts/bootstrap-test.sh
+```
+
+独立准备和验收（输出目录须不存在）：
+
+```bash
+python3 -I scripts/mirror_release.py prepare --tag v0.9.1 \
+  --directory /tmp/proxyscene-canonical --record /tmp/proxyscene-release.json
+python3 -I scripts/mirror_release.py verify --tag v0.9.1 \
+  --directory /tmp/proxyscene-canonical --output /tmp/proxyscene-public --stable
+```
+
+验收结果写入 `<output>.result.json`，不混入 11 项资产目录。工作流保留相同结果及版本记录。接收端中断、磁盘不足、现存目录冲突或公开验收失败时，先保留证据并核查错误；不可为了重试删除或覆盖一个已经公开的版本。版本同步成功而 Latest 未更新时，可重复同版本工作流，已有完整版本会通过幂等检查。
+
+生产接入前运行隔离验收。它需要 Docker 权限、已存在的 Debian 13 镜像，以及容器访问 Debian 软件源和 GitHub；不会自动拉取镜像：
+
+```bash
+PROXYSCENE_MIRROR_CONTAINER_TEST=1 \
+  PROXYSCENE_MIRROR_TEST_TAG=v0.9.1 \
+  bash scripts/mirror-integration-test.sh
+```
+
+选择的 tag 必须仍是 GitHub Latest，以便验证 promotion。脚本在单个无宿主端口映射的临时容器中运行真实 SSH forced-command 和 Nginx；测试密钥、临时 TLS 信任和域名映射只存在于容器。它验收完整发布、幂等、并发锁、命令拒绝、原样 HTTPS 校验器及 Web 路由，保留无私钥的证据后清理容器。接收端中断和原子提交故障由 Python 测试注入验证。
+
+普通单元测试及安装器夹具不操作宿主服务。公开镜像与已验证 GitHub bundle 字节相同并不替代目标机器上的真实应用或 Telegram 端到端测试。

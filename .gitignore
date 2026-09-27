@@ -8,6 +8,9 @@
 *.out
 *.prof
 
+# Python verification cache
+__pycache__/
+
 # Temporary files
 *.tmp
 *.temp
