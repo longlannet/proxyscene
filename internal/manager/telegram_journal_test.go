@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -22,6 +23,7 @@ type telegramJournalTestHarness struct {
 
 func newTelegramJournalTestHarness(t *testing.T) *telegramJournalTestHarness {
 	t.Helper()
+	stubTelegramPlanUnitsForLifecycle(t)
 	h := &telegramJournalTestHarness{app: testApp(t), dir: t.TempDir()}
 	stubTelegramServiceState(t, telegramServiceState{LoadState: "loaded", ActiveState: "active"})
 	oldRestartPolicy := telegramValidateHermesRestartPolicy
@@ -36,7 +38,7 @@ func newTelegramJournalTestHarness(t *testing.T) *telegramJournalTestHarness {
 	h.systemPath = filepath.Join(h.dir, "hermes-journal-test.service.d", telegramManagedDropInName)
 	h.legacyPath = filepath.Join(h.dir, "legacy-system.conf")
 	h.envPath = filepath.Join(h.dir, "legacy.env")
-	h.identity = localUserIdentity{Name: "root", UID: 0, GID: 0, UIDText: "0", GIDText: "0", Home: h.dir}
+	h.identity = localUserIdentity{Name: "root", UID: os.Getuid(), GID: os.Getgid(), UIDText: strconv.Itoa(os.Getuid()), GIDText: strconv.Itoa(os.Getgid()), Home: h.dir}
 	if err := os.MkdirAll(filepath.Dir(h.systemPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +191,9 @@ func TestHermesCommitRuntimeValidatorReceivesExpectedProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"validate:",
+		"validate:", // read-only plan
+		"validate:", // plan revalidation before execution
+		"validate:", // artifact preparation
 		"daemon-reload",
 		"validate:http://127.0.0.1:7892",
 		"try-restart -- hermes-journal-test.service",
@@ -226,7 +230,7 @@ func TestHermesPreRestartValidationFailureSkipsRestart(t *testing.T) {
 	if err == nil || len(applied) != 1 {
 		t.Fatalf("pre-restart validation failure must be reported: applied=%v err=%v", applied, err)
 	}
-	if validations != 2 || reloads != 1 || restarts != 0 {
+	if validations != 4 || reloads != 1 || restarts != 0 {
 		t.Fatalf("validation/reload/restart counts=%d/%d/%d", validations, reloads, restarts)
 	}
 	entry := h.journal(t).Targets[canonicalTelegramTargetName(h.target())]

@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func TestInstallWithStoreCreatesUnitsBeforeFirstNodeCommit(t *testing.T) {
+func TestInstallWithStoreBootstrapsMainThenCommitsBeforeRestoreUnit(t *testing.T) {
 	a := testApp(t)
 	st := newStore()
 	events := []string{}
@@ -24,7 +24,7 @@ func TestInstallWithStoreCreatesUnitsBeforeFirstNodeCommit(t *testing.T) {
 	}
 	commit := func(state *Store, mutate func(*Store) error, mode storeRuntimeSyncMode) error {
 		events = append(events, "commit")
-		if !reflect.DeepEqual(events, []string{"xray", "main-unit", "restore-unit", "commit"}) {
+		if !reflect.DeepEqual(events, []string{"xray", "main-unit", "commit"}) {
 			t.Fatalf("unsafe install order: %v", events)
 		}
 		if mode != storeRuntimeSyncXray {
@@ -38,6 +38,9 @@ func TestInstallWithStoreCreatesUnitsBeforeFirstNodeCommit(t *testing.T) {
 	}
 	if len(st.Nodes) != 1 || st.Nodes[0].RawURL != raw {
 		t.Fatalf("first node was not committed: %+v", st.Nodes)
+	}
+	if !reflect.DeepEqual(events, []string{"xray", "main-unit", "commit", "restore-unit"}) {
+		t.Fatalf("boot restore was not installed after first commit: %v", events)
 	}
 }
 
@@ -539,46 +542,112 @@ func TestRemoveSystemdUnitsForUninstallRetriesAfterRestoreWasRemoved(t *testing.
 }
 
 func TestBootRestoreWithStoreRollsBackAfterPersistenceFailure(t *testing.T) {
+	stubStoreTransitionCore(t)
 	a := testApp(t)
+	profile, apt := withGlobalProxyTestPaths(t, a)
 	before := newStore()
 	before.RuntimeConfig = a.cfg.runtimeConfig()
+	before.Nodes = []Node{{ID: "node-one", Name: "one", Protocol: "trojan", RawURL: "trojan://secret@example.com:443"}}
+	before.DefaultNodeID = "node-one"
 	before.SceneEnabled[SceneGlobal] = true
+	if err := a.saveStore(before); err != nil {
+		t.Fatal(err)
+	}
 	st := cloneStore(before)
-
-	syncCalls := 0
-	persistCalls := 0
-	commit := func(state *Store, mutate func(*Store) error, mode storeRuntimeSyncMode) error {
-		if mode != storeRuntimeSyncAll {
-			t.Fatalf("boot restore mode=%d, want full reconciliation", mode)
+	failure := errors.New("injected boot state save failure")
+	runtimePersistStore = func(*App, *Store) error { return failure }
+	if err := a.bootRestoreWithStore(st, a.commitStoreMutation); !errors.Is(err, failure) {
+		t.Fatalf("boot persistence failure lost: %v", err)
+	}
+	for _, path := range []string{profile, apt, a.globalProxyJournalPath(), a.globalProxyJournalBackupPath(), a.runtimeTransitionPath()} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed boot acquired residue: %s %v", path, err)
 		}
-		return a.commitStoreMutationWithRuntimeOps(state, mutate, mode,
-			func(_ *App, candidate *Store, gotMode storeRuntimeSyncMode) error {
-				syncCalls++
-				if gotMode != storeRuntimeSyncAll || !candidate.SceneEnabled[SceneGlobal] {
-					t.Fatalf("boot sync call %d got mode=%d state=%+v", syncCalls, gotMode, candidate)
-				}
-				return nil
-			},
-			func(*App, *Store) error { return nil },
-			func(_ *App, candidate *Store) error {
-				persistCalls++
-				if persistCalls == 1 {
-					return errors.New("injected boot state save failure")
-				}
-				if !reflect.DeepEqual(candidate, before) {
-					t.Fatalf("boot rollback persisted wrong state: got=%+v want=%+v", candidate, before)
-				}
-				return nil
-			})
 	}
-	err := a.bootRestoreWithStore(st, commit)
-	if err == nil || !strings.Contains(err.Error(), "injected boot state save failure") {
-		t.Fatalf("boot persistence failure was not returned: %v", err)
+	loaded, err := a.loadStore()
+	if err != nil || !reflect.DeepEqual(loaded, before) || !reflect.DeepEqual(st, before) {
+		t.Fatalf("boot compensation changed prior Store: %+v %v", loaded, err)
 	}
-	if syncCalls != 2 || persistCalls != 2 {
-		t.Fatalf("boot transaction calls sync=%d persist=%d, want 2/2", syncCalls, persistCalls)
+}
+
+func TestExistingInstallCompensatesOriginalCoreBeforeBootstrap(t *testing.T) {
+	fixture := newCoreRuntimeFixture(t)
+	a, before := fixture.app, fixture.store
+	before.SceneEnabled[SceneGlobal] = false
+	if err := a.saveStore(before); err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(st, before) {
-		t.Fatalf("boot persistence failure left candidate state: got=%+v want=%+v", st, before)
+	priorUnit := append(a.xrayUnitContent(), []byte("# installation before transaction\n")...)
+	if err := os.WriteFile(fixture.unit, priorUnit, 0644); err != nil {
+		t.Fatal(err)
+	}
+	beforeUnit, beforeConfig := fixture.file(fixture.unit), fixture.file(a.cfg.XrayConfig())
+	beforeDir, err := readCoreMetadata(a.cfg.CoreDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBinary, err := readCoreMetadata(a.cfg.XrayBin())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.identity = localUserIdentity{Name: "proxyscene-test", UID: 12345, GID: 12345, UIDText: "12345", GIDText: "12345", Home: t.TempDir()}
+	a.cfg.XrayServiceUser = fixture.identity.Name
+	if err := a.preflightInstallation(before, ""); err != nil {
+		t.Fatal(err)
+	}
+	oldWrite := runtimeWriteStoreCAS
+	t.Cleanup(func() { runtimeWriteStoreCAS = oldWrite })
+	failure := errors.New("installation main Store write failed")
+	failed := false
+	runtimeWriteStoreCAS = func(path string, expected runtimeStoreEvidence, data []byte) error {
+		if path == a.cfg.StorePath() && !failed {
+			failed = true
+			if coreFilesEqual(fixture.file(fixture.unit), beforeUnit) {
+				t.Fatal("fixture never changed core unit inside transaction")
+			}
+			duringDir, err := readCoreMetadata(a.cfg.CoreDir)
+			if err != nil || duringDir == beforeDir {
+				t.Fatalf("fixture never changed core permissions inside transaction: %v", err)
+			}
+			return failure
+		}
+		return oldWrite(path, expected, data)
+	}
+	st := cloneStore(before)
+	err = a.installWithStore(st, "", a.ensureXrayInstalled,
+		func() error { t.Fatal("existing installation bootstrapped core before transaction"); return nil },
+		func() error { t.Fatal("failed runtime transaction installed boot restore"); return nil },
+		a.commitStoreMutation)
+	if !errors.Is(err, failure) || !failed {
+		t.Fatalf("installation failure was not exercised: %v", err)
+	}
+	afterDir, dirErr := readCoreMetadata(a.cfg.CoreDir)
+	afterBinary, binErr := readCoreMetadata(a.cfg.XrayBin())
+	if !coreFilesEqual(fixture.file(fixture.unit), beforeUnit) || !coreFilesEqual(fixture.file(a.cfg.XrayConfig()), beforeConfig) || dirErr != nil || binErr != nil || afterDir != beforeDir || afterBinary != beforeBinary {
+		t.Fatalf("installation compensation lost original core unit/config/permissions: dir=%v bin=%v", dirErr, binErr)
+	}
+	loaded, err := a.loadStore()
+	if err != nil || loaded.RuntimeConfig.XrayServiceUser != before.RuntimeConfig.XrayServiceUser || loaded.Generation <= before.Generation+1 {
+		t.Fatalf("installation did not compensate prior configuration in new generation: %+v %v", loaded, err)
+	}
+}
+
+func TestExistingInstallReportsRestoreUnitFailureAfterRuntimeCommit(t *testing.T) {
+	a, before := storeTransitionFixture(t)
+	st := cloneStore(before)
+	failure := errors.New("restore unit enable failed")
+	raw := "trojan://secret@install.example:443"
+	err := a.installWithStore(st, raw, func() error { return nil },
+		func() error { t.Fatal("existing installation bootstrapped core"); return nil },
+		func() error { return failure }, a.commitStoreMutation)
+	if !errors.Is(err, failure) || !strings.Contains(err.Error(), "运行配置已提交") {
+		t.Fatalf("restore failure did not report committed runtime: %v", err)
+	}
+	loaded, err := a.loadStore()
+	if err != nil || len(loaded.Nodes) != len(before.Nodes)+1 || loaded.Generation <= before.Generation || loaded.Nodes[len(loaded.Nodes)-1].RawURL != raw {
+		t.Fatalf("restore install failure rolled back committed runtime: %+v %v", loaded, err)
+	}
+	if pending, err := a.hasRuntimeTransition(); err != nil || pending {
+		t.Fatalf("committed installation retained runtime receipt: %v", err)
 	}
 }

@@ -1,10 +1,10 @@
 package manager
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -147,6 +146,8 @@ func (a *App) addPreparedNodeIndexed(st *Store, prepared preparedNode, name, sco
 		old = st.findNodeByURL(raw)
 	}
 	if old != nil {
+		// Explicit node additions also protect a previously subscription-managed node.
+		old.SubscriptionManaged = false
 		if name != "" {
 			old.Name = name
 			old.UpdatedAt = time.Now()
@@ -1173,179 +1174,13 @@ const (
 	storeRuntimeSyncNone storeRuntimeSyncMode = iota
 	storeRuntimeSyncXray
 	storeRuntimeSyncAll
-	storeRuntimeSyncTransition
+	storeRuntimeSyncGlobal
+	storeRuntimeSyncDev
+	storeRuntimeSyncTelegram
 )
 
-type storeRuntimeSyncOp func(*App, *Store, storeRuntimeSyncMode) error
-type storeRuntimePersistOp func(*App, *Store) error
-type storeRuntimeCleanupOp func(*App, *Store) error
-
-func (a *App) syncNodeRuntime(st *Store) error {
-	return a.syncXrayServiceForStore(st)
-}
-
-func (a *App) syncNodeRuntimeAndScenes(st *Store) error {
-	return a.syncNodeRuntimeAndScenesWithCleanup(st, true)
-}
-
-func (a *App) syncNodeRuntimeAndScenesWithCleanup(st *Store, cleanupDisabled bool) error {
-	// RuntimeConfig 包含 Xray 服务用户。即使当前没有启用场景，也必须重写 unit 并
-	// 协调目录/文件属组，不能把新配置落盘后仍让 systemd 使用旧 User=。
-	if err := a.installXrayService(); err != nil {
-		return err
-	}
-	if hasEnabledScene(st) {
-		if err := a.reloadIfEnabled(st); err != nil {
-			return err
-		}
-		return a.applySavedScenesWithCleanup(st, cleanupDisabled)
-	}
-	if err := a.applySavedScenesWithCleanup(st, cleanupDisabled); err != nil {
-		return err
-	}
-	if err := a.stopXrayService(); err != nil {
-		return err
-	}
-	return a.clearXrayConfig()
-}
-
-func syncStoreRuntime(app *App, st *Store, mode storeRuntimeSyncMode) error {
-	switch mode {
-	case storeRuntimeSyncNone:
-		return nil
-	case storeRuntimeSyncXray:
-		return app.syncNodeRuntime(st)
-	case storeRuntimeSyncAll:
-		return app.syncNodeRuntimeAndScenes(st)
-	case storeRuntimeSyncTransition:
-		return app.syncNodeRuntimeAndScenesWithCleanup(st, false)
-	default:
-		return fmt.Errorf("未知运行态同步模式：%d", mode)
-	}
-}
-
-func persistStoreRuntime(app *App, st *Store) error {
-	return app.saveStore(st)
-}
-
-func cleanupStoreRuntimeScenes(app *App, st *Store) error {
-	var errs []error
-	for _, scene := range []Scene{SceneTelegram, SceneDev, SceneGlobal} {
-		// Global and Telegram cleanup is journal-driven and safe even when the
-		// Store says disabled. Always reconcile both so a crash after an artifact
-		// write but before Store commit cannot strand managed residue.
-		if scene == SceneDev && !st.SceneEnabled[scene] {
-			continue
-		}
-		if scene == SceneGlobal && st.SceneEnabled[scene] && st.RuntimeConfig == nil {
-			if err := app.migrateLegacyGlobalProxyOwnership(); err != nil {
-				errs = append(errs, fmt.Errorf("迁移旧全局代理 ownership 失败：%w", err))
-				continue
-			}
-		}
-		if err := app.restoreScene(st, scene); err != nil {
-			errs = append(errs, fmt.Errorf("清理旧%s运行配置失败：%w", sceneName(scene), err))
-		}
-	}
-	return errors.Join(errs...)
-}
-
 func (a *App) commitStoreMutation(st *Store, mutate func(*Store) error, mode storeRuntimeSyncMode) error {
-	return a.commitStoreMutationWithRuntimeOps(st, mutate, mode, syncStoreRuntime, cleanupStoreRuntimeScenes, persistStoreRuntime)
-}
-
-func (a *App) commitStoreMutationWithRuntimeOps(st *Store, mutate func(*Store) error, mode storeRuntimeSyncMode, syncRuntime storeRuntimeSyncOp, cleanupRuntime storeRuntimeCleanupOp, persist storeRuntimePersistOp) error {
-	before := cloneStore(st)
-	if err := mutate(st); err != nil {
-		restoreStore(st, before)
-		return err
-	}
-	if st.SceneEnabled[SceneDev] && a.cfg.DevTargetUser == "" {
-		user, err := a.devTargetUser()
-		if err != nil {
-			restoreStore(st, before)
-			return fmt.Errorf("确定开发代理持久目标用户失败：%w", err)
-		}
-		a.cfg.DevTargetUser = user
-	}
-	configChanged := a.stageRuntimeConfig(st)
-	if configChanged {
-		mode = storeRuntimeSyncTransition
-		oldApp, appErr := a.appForStoreRuntime(before)
-		if appErr != nil {
-			restoreStore(st, before)
-			return appErr
-		}
-		cleanupState := cloneStore(before)
-		if err := cleanupRuntime(oldApp, cleanupState); err != nil {
-			rollbackState := cloneStore(before)
-			rollbackErr := syncRuntime(oldApp, rollbackState, storeRuntimeSyncAll)
-			restoreStore(st, rollbackState)
-			return errors.Join(err, wrapRollbackError("重建旧运行状态", rollbackErr))
-		}
-		// TelegramTargets 仅承载旧版 drop-in 的迁移证据；旧配置清理后只保留
-		// 尚未能安全协调的记录。新 Hermes/OpenClaw ownership 位于独立 journal。
-		st.TelegramTargets = append([]string(nil), cleanupState.TelegramTargets...)
-	}
-	if err := syncRuntime(a, st, mode); err != nil {
-		rollbackState, rollbackApp, rollbackErr := a.rollbackStoreRuntime(before, st, mode, configChanged, syncRuntime, cleanupRuntime)
-		restoreStore(st, rollbackState)
-		var journalErr error
-		if !slices.Equal(before.TelegramTargets, rollbackState.TelegramTargets) {
-			journalErr = persist(rollbackApp, st)
-		}
-		return errors.Join(err, wrapRollbackError("恢复旧运行状态", rollbackErr), wrapRollbackError("保存待重试清理状态", journalErr))
-	}
-	if err := persist(a, st); err != nil {
-		rollbackState, rollbackApp, rollbackErr := a.rollbackStoreRuntime(before, st, mode, configChanged, syncRuntime, cleanupRuntime)
-		persistErr := persist(rollbackApp, rollbackState)
-		restoreStore(st, rollbackState)
-		return errors.Join(err, wrapRollbackError("恢复旧运行状态", rollbackErr), wrapRollbackError("恢复旧状态文件", persistErr))
-	}
-	return nil
-}
-
-func (a *App) rollbackStoreRuntime(before, candidate *Store, mode storeRuntimeSyncMode, configChanged bool, syncRuntime storeRuntimeSyncOp, cleanupRuntime storeRuntimeCleanupOp) (*Store, *App, error) {
-	partialTelegramTargets := append([]string(nil), candidate.TelegramTargets...)
-	var cleanupErr error
-	if configChanged {
-		cleanupState := a.candidateRuntimeCleanupState(candidate)
-		cleanupErr = cleanupRuntime(a, cleanupState)
-		partialTelegramTargets = append([]string(nil), cleanupState.TelegramTargets...)
-	}
-	rollbackState := cloneStore(before)
-	// TelegramTargets only carries legacy migration evidence. Retain unresolved
-	// candidate records so rollback can retry them under the configuration that
-	// originally generated their exact bytes.
-	if len(partialTelegramTargets) > 0 {
-		rollbackState.TelegramTargets = mergeStringSlices(rollbackState.TelegramTargets, partialTelegramTargets)
-	}
-	rollbackApp, err := a.appForStoreRuntime(before)
-	if err != nil {
-		return rollbackState, a, err
-	}
-	rollbackMode := mode
-	if configChanged {
-		rollbackMode = storeRuntimeSyncAll
-	}
-	return rollbackState, rollbackApp, errors.Join(cleanupErr, syncRuntime(rollbackApp, rollbackState, rollbackMode))
-}
-
-func (a *App) candidateRuntimeCleanupState(candidate *Store) *Store {
-	state := cloneStore(candidate)
-	// New Telegram ownership lives in dedicated Hermes/OpenClaw journals. Setting
-	// the scene false makes cleanup use those journals plus any legacy evidence;
-	// it must never discover paths and infer ownership from the candidate config.
-	state.SceneEnabled[SceneTelegram] = false
-	// applyDev writes its backup before changing git/npm. If that backup does not
-	// exist, candidate Dev ownership was never established and value-only cleanup
-	// could delete an operator's coincidentally identical manual proxy setting.
-	if state.SceneEnabled[SceneDev] {
-		if _, err := a.loadDevBackup(); errors.Is(err, os.ErrNotExist) {
-			state.SceneEnabled[SceneDev] = false
-		}
-	}
-	return state
+	return a.commitPlannedStoreMutation(st, mutate, mode)
 }
 
 // commitNodeStoreMutation applies a candidate mutation to st, synchronizes the
@@ -1492,100 +1327,6 @@ func resolveNodeSecretArg(value string, fromStdin bool, prompt, label string) (s
 	return value, nil
 }
 
-func (a *App) nodeMenu() error {
-	for {
-		st, err := a.loadStore()
-		if err != nil {
-			return err
-		}
-		fmt.Println("\n========== 节点管理 ==========")
-		_ = a.listNodes(st)
-		fmt.Println("1. 查看多节点列表")
-		fmt.Println("2. 添加节点")
-		fmt.Println("3. 导入订阅链接")
-		fmt.Println("4. 节点测速")
-		fmt.Println("5. 测速后自动选择默认节点")
-		fmt.Println("6. 选择默认节点")
-		fmt.Println("7. 为全局代理选择节点")
-		fmt.Println("8. 为开发代理选择节点")
-		fmt.Println("9. 为电报服务代理选择节点")
-		fmt.Println("10. 修改节点备注")
-		fmt.Println("11. 删除节点")
-		fmt.Println("12. 返回")
-		choice, ok := ask("请输入选项 [1-12]: ")
-		if !ok {
-			fmt.Println()
-			return nil
-		}
-		switch choice {
-		case "1":
-			_ = a.listNodes(st)
-		case "2":
-			raw, _ := ask("节点链接: ")
-			name, _ := ask("备注名: ")
-			prepared, err := prepareNode(raw)
-			if err != nil {
-				fmt.Println(err)
-				continue
-			}
-			if err := a.withLockedStoreRoot(func(st *Store) error {
-				return a.commitNodeStoreMutation(st, func(candidate *Store) error {
-					_, err := a.addPreparedNodeIndexed(candidate, prepared, name, "default", nil)
-					return err
-				})
-			}); err != nil {
-				fmt.Println(err)
-			}
-		case "3":
-			sub, _ := ask("订阅链接: ")
-			if err := a.importSubscriptionWithLock(sub); err != nil {
-				fmt.Println(err)
-			}
-		case "4":
-			if err := a.speedTestWithLock(); err != nil {
-				fmt.Println(err)
-			}
-		case "5":
-			if err := a.autoSelectWithLock("default"); err != nil {
-				fmt.Println(err)
-			}
-		case "6":
-			id, _ := ask("节点 ID: ")
-			if err := a.useNodeWithLock(id, "default"); err != nil {
-				fmt.Println(err)
-			}
-		case "7":
-			id, _ := ask("节点 ID: ")
-			if err := a.useNodeWithLock(id, string(SceneGlobal)); err != nil {
-				fmt.Println(err)
-			}
-		case "8":
-			id, _ := ask("节点 ID: ")
-			if err := a.useNodeWithLock(id, string(SceneDev)); err != nil {
-				fmt.Println(err)
-			}
-		case "9":
-			id, _ := ask("节点 ID: ")
-			if err := a.useNodeWithLock(id, string(SceneTelegram)); err != nil {
-				fmt.Println(err)
-			}
-		case "10":
-			id, _ := ask("节点 ID: ")
-			name, _ := ask("新备注: ")
-			if err := a.withLockedStoreRoot(func(st *Store) error { return a.renameNode(st, id, name) }); err != nil {
-				fmt.Println(err)
-			}
-		case "11":
-			id, _ := ask("节点 ID: ")
-			if err := a.withLockedStoreRoot(func(st *Store) error { return a.removeNode(st, id) }); err != nil {
-				fmt.Println(err)
-			}
-		case "12":
-			return nil
-		}
-	}
-}
-
 func (a *App) listNodes(st *Store) error {
 	if st == nil || len(st.Nodes) == 0 {
 		fmt.Println("节点列表为空")
@@ -1601,6 +1342,9 @@ func (a *App) listNodes(st *Store) error {
 				usage = append(usage, sceneName(sc))
 			}
 		}
+		if n.SubscriptionManaged && len(n.SubscriptionIDs) == 0 {
+			usage = append(usage, "订阅已移除，保留待切换")
+		}
 		usageText := strings.Join(usage, "、")
 		if usageText == "" {
 			usageText = "未指定"
@@ -1611,41 +1355,46 @@ func (a *App) listNodes(st *Store) error {
 }
 
 func (a *App) removeNode(st *Store, id string) error {
-	lastEnabledNode := len(st.Nodes) == 1 && hasEnabledScene(st)
 	mode := storeRuntimeSyncXray
-	if lastEnabledNode {
+	if len(st.Nodes) == 1 && hasEnabledScene(st) {
 		mode = storeRuntimeSyncAll
 	}
 	return a.commitStoreMutation(st, func(candidate *Store) error {
-		if id == "" {
-			return fmt.Errorf("节点 ID 不能为空")
-		}
-		if candidate.findNode(id) == nil {
-			return fmt.Errorf("节点不存在：%s", id)
-		}
-		out := make([]Node, 0, len(candidate.Nodes)-1)
-		for _, n := range candidate.Nodes {
-			if n.ID != id {
-				out = append(out, n)
-			}
-		}
-		candidate.Nodes = out
-		if candidate.DefaultNodeID == id {
-			candidate.DefaultNodeID = candidate.firstNodeID()
-		}
-		for sc, nid := range candidate.SceneNodes {
-			if nid == id {
-				delete(candidate.SceneNodes, sc)
-			}
-		}
-		delete(candidate.SpeedResults, id)
-		if len(candidate.Nodes) == 0 && hasEnabledScene(candidate) {
-			candidate.SceneEnabled[SceneGlobal] = false
-			candidate.SceneEnabled[SceneDev] = false
-			candidate.SceneEnabled[SceneTelegram] = false
-		}
-		return nil
+		return removeNodeFromStore(candidate, id)
 	}, mode)
+}
+
+// removeNodeFromStore is shared with the menu preview so the confirmed fallback
+// and the committed result follow the same policy.
+func removeNodeFromStore(st *Store, id string) error {
+	if id == "" {
+		return fmt.Errorf("节点 ID 不能为空")
+	}
+	if st.findNode(id) == nil {
+		return fmt.Errorf("节点不存在：%s", id)
+	}
+	out := make([]Node, 0, len(st.Nodes)-1)
+	for _, n := range st.Nodes {
+		if n.ID != id {
+			out = append(out, n)
+		}
+	}
+	st.Nodes = out
+	if st.DefaultNodeID == id {
+		st.DefaultNodeID = st.firstNodeID()
+	}
+	for sc, nid := range st.SceneNodes {
+		if nid == id {
+			delete(st.SceneNodes, sc)
+		}
+	}
+	delete(st.SpeedResults, id)
+	if len(st.Nodes) == 0 && hasEnabledScene(st) {
+		st.SceneEnabled[SceneGlobal] = false
+		st.SceneEnabled[SceneDev] = false
+		st.SceneEnabled[SceneTelegram] = false
+	}
+	return nil
 }
 
 func (a *App) renameNode(st *Store, id, name string) error {
@@ -1710,13 +1459,18 @@ func (a *App) useNodeInStore(st *Store, id, scope string) error {
 }
 
 type preparedSubscription struct {
-	URL     string
-	Nodes   []preparedNode
-	Invalid int
+	URL        string
+	Nodes      []preparedNode
+	Invalid    int
+	Incomplete bool // Loose first imports are allowed; destructive refresh requires a complete URI list.
 }
 
 func (a *App) importSubscriptionWithLock(sub string) error {
 	if err := requireRoot(); err != nil {
+		return err
+	}
+	snapshot, err := a.loadStore()
+	if err != nil {
 		return err
 	}
 	prepared, err := a.downloadAndPrepareSubscription(sub)
@@ -1727,6 +1481,9 @@ func (a *App) importSubscriptionWithLock(sub string) error {
 		st, err := a.loadStore()
 		if err != nil {
 			return err
+		}
+		if st.Generation != snapshot.Generation || !slices.Equal(st.Subscriptions, snapshot.Subscriptions) {
+			return fmt.Errorf("下载期间状态发生变化，本次导入未提交，请重试")
 		}
 		return a.mergePreparedSubscription(st, prepared)
 	})
@@ -1741,6 +1498,10 @@ func (a *App) downloadAndPrepareSubscription(sub string) (preparedSubscription, 
 }
 
 func downloadAndPrepareSubscriptionWithClient(sub string, allowHTTP bool, client *http.Client) (preparedSubscription, error) {
+	return downloadAndPrepareSubscriptionWithContext(context.Background(), sub, allowHTTP, client)
+}
+
+func downloadAndPrepareSubscriptionWithContext(ctx context.Context, sub string, allowHTTP bool, client *http.Client) (preparedSubscription, error) {
 	sub = strings.TrimSpace(sub)
 	if sub == "" {
 		return preparedSubscription{}, fmt.Errorf("订阅链接不能为空")
@@ -1764,15 +1525,22 @@ func downloadAndPrepareSubscriptionWithClient(sub string, allowHTTP bool, client
 		return preparedSubscription{}, fmt.Errorf("订阅链接必须是 https 地址")
 	}
 	canonicalURL := subURL.String()
-	resp, err := client.Get(canonicalURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, canonicalURL, nil)
+	if err != nil {
+		return preparedSubscription{}, fmt.Errorf("订阅链接无效")
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		// net/http errors normally include the complete URL. Subscription URLs
 		// commonly carry bearer tokens, so never wrap or return the transport error.
 		return preparedSubscription{}, fmt.Errorf("订阅下载失败（目标主机 %s）", safeSubscriptionHost(subURL))
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || resp.StatusCode == http.StatusPartialContent {
 		return preparedSubscription{}, fmt.Errorf("订阅下载失败：HTTP 状态码 %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Content-Range") != "" {
+		return preparedSubscription{}, fmt.Errorf("订阅响应不完整，拒绝导入或更新")
 	}
 	if resp.ContentLength > maxSubscriptionBytes {
 		return preparedSubscription{}, fmt.Errorf("订阅内容过大，超过 %d 字节", maxSubscriptionBytes)
@@ -1797,7 +1565,8 @@ func safeSubscriptionHost(u *url.URL) string {
 
 func prepareSubscriptionBody(sub string, body []byte) (preparedSubscription, error) {
 	deadline := time.Now().Add(maxSubscriptionProcessingTime)
-	urls, tooMany := extractNodeURLsLimited(string(body), maxSubscriptionNodes)
+	text := string(body)
+	urls, tooMany := extractNodeURLsLimited(text, maxSubscriptionNodes)
 	if tooMany {
 		return preparedSubscription{}, fmt.Errorf("订阅节点数超过上限 %d", maxSubscriptionNodes)
 	}
@@ -1806,13 +1575,14 @@ func prepareSubscriptionBody(sub string, body []byte) (preparedSubscription, err
 			return preparedSubscription{}, fmt.Errorf("订阅处理超时")
 		}
 		if decoded, err := decodeBase64URL(strings.TrimSpace(string(body))); err == nil {
-			urls, tooMany = extractNodeURLsLimited(string(decoded), maxSubscriptionNodes)
+			text = string(decoded)
+			urls, tooMany = extractNodeURLsLimited(text, maxSubscriptionNodes)
 			if tooMany {
 				return preparedSubscription{}, fmt.Errorf("订阅节点数超过上限 %d", maxSubscriptionNodes)
 			}
 		}
 	}
-	prepared := preparedSubscription{URL: sub, Nodes: make([]preparedNode, 0, len(urls))}
+	prepared := preparedSubscription{URL: sub, Nodes: make([]preparedNode, 0, len(urls)), Incomplete: !slices.Equal(strings.Fields(text), urls)}
 	for _, raw := range urls {
 		if time.Now().After(deadline) {
 			return preparedSubscription{}, fmt.Errorf("订阅处理超时")
@@ -1831,42 +1601,7 @@ func prepareSubscriptionBody(sub string, body []byte) (preparedSubscription, err
 }
 
 func (a *App) mergePreparedSubscription(st *Store, prepared preparedSubscription) error {
-	urlIndex := make(map[string]int, len(st.Nodes)+len(prepared.Nodes))
-	for i := range st.Nodes {
-		if _, exists := urlIndex[st.Nodes[i].RawURL]; !exists {
-			urlIndex[st.Nodes[i].RawURL] = i
-		}
-	}
-	added, existing, failed := 0, 0, prepared.Invalid
-	err := a.commitNodeStoreMutation(st, func(candidate *Store) error {
-		for _, node := range prepared.Nodes {
-			before := len(candidate.Nodes)
-			if _, err := a.addPreparedNodeIndexed(candidate, node, "", "", urlIndex); err != nil {
-				failed++
-				continue
-			}
-			if len(candidate.Nodes) > before {
-				added++
-			} else {
-				existing++
-			}
-		}
-		if added == 0 && existing == 0 {
-			return fmt.Errorf("订阅中没有可导入节点")
-		}
-		if !containsString(candidate.Subscriptions, prepared.URL) {
-			if len(candidate.Subscriptions) >= maxSubscriptions {
-				return fmt.Errorf("订阅记录数已达到上限 %d", maxSubscriptions)
-			}
-			candidate.Subscriptions = append(candidate.Subscriptions, prepared.URL)
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	fmt.Printf("订阅导入完成：新增 %d 个，已存在/重复 %d 个，跳过无效 %d 个\n", added, existing, failed)
-	return nil
+	return a.commitPreparedSubscriptions(st, []preparedSubscription{prepared})
 }
 
 // extractNodeURLs 从订阅文本中提取节点链接。协议 scheme 前要求一个边界（行首或
@@ -2066,9 +1801,9 @@ func printSpeedResults(nodes []Node, results []SpeedResult) {
 			break
 		}
 		if results[i].Success {
-			fmt.Printf("%s %dms\n", node.Name, results[i].LatencyMS)
+			fmt.Printf("%s [%s] %dms\n", node.Name, node.ID, results[i].LatencyMS)
 		} else {
-			fmt.Printf("%s 失败：%s\n", node.Name, results[i].Error)
+			fmt.Printf("%s [%s] 失败：%s\n", node.Name, node.ID, results[i].Error)
 		}
 	}
 }
@@ -2158,14 +1893,6 @@ func (a *App) withLockedStoreRoot(fn func(*Store) error) error {
 			return err
 		}
 		return fn(st)
-	})
-}
-
-func (a *App) useNodeWithLock(id, scope string) error {
-	return a.withLockedStoreRoot(func(st *Store) error {
-		return a.commitNodeStoreMutation(st, func(candidate *Store) error {
-			return a.useNodeInStore(candidate, id, scope)
-		})
 	})
 }
 

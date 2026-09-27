@@ -23,6 +23,9 @@ func testApp(t *testing.T) *App {
 
 func claimTestApp(t *testing.T, a *App) *App {
 	t.Helper()
+	previousValidator := runtimeValidateConfig
+	t.Cleanup(func() { runtimeValidateConfig = previousValidator })
+	runtimeValidateConfig = func(cfg Config) error { return cfg.ValidateRuntime() }
 	if err := a.ensureCoreDirs(); err != nil {
 		t.Fatal(err)
 	}
@@ -217,16 +220,40 @@ func TestBootAcceptsPersistedPublicBindPermission(t *testing.T) {
 }
 
 func TestEnabledDevAutoUserIsResolvedAndPersistedForBoot(t *testing.T) {
-	if _, err := lookupLocalUserIdentity("nobody"); err != nil {
-		t.Skipf("nobody user unavailable: %v", err)
+	stubStoreTransitionCore(t)
+	stubDevCommands(t)
+	devCommandExists = func(name string) bool { return name == "npm" }
+	values := map[string]*string{}
+	devReadNPMConfig = func(_ string, _ *persistedUserIdentity, key string) (*string, error) {
+		return cloneStringPointer(values[key]), nil
 	}
-	cfg := DefaultConfig()
-	cfg.CoreDir = t.TempDir()
-	cfg.DevTargetUser = ""
-	cfg.runtimeOverrides.DevTargetUser = false
-	a := claimTestApp(t, NewApp(cfg))
+	devMutateNPMConfig = func(_ string, _ *persistedUserIdentity, key string, expected, desired *string) error {
+		if !optionalStringsEqual(values[key], expected) {
+			return errors.New("fixture npm compare-and-swap mismatch")
+		}
+		values[key] = cloneStringPointer(desired)
+		return nil
+	}
+	devOutputAsUser = func(string, *persistedUserIdentity, string, ...string) (string, error) {
+		t.Fatal("fixture must not query external tools")
+		return "", nil
+	}
+	devRunAsUser = func(string, *persistedUserIdentity, string, ...string) error {
+		t.Fatal("fixture must not mutate external tools")
+		return nil
+	}
+	taskHome := t.TempDir()
+	devLookupUserIdentity = func(name string) (localUserIdentity, error) {
+		if name != "nobody" {
+			return localUserIdentity{}, errors.New("unexpected user")
+		}
+		return localUserIdentity{Name: name, UID: os.Getuid(), GID: os.Getgid(), Home: taskHome}, nil
+	}
+	a := testApp(t)
+	a.cfg.DevTargetUser = ""
+	a.cfg.runtimeOverrides.DevTargetUser = false
 	st := newStore()
-	st.RuntimeConfig = cfg.runtimeConfig()
+	st.RuntimeConfig = a.cfg.runtimeConfig()
 	st.Nodes = []Node{{ID: "node-one", Name: "one", Protocol: "trojan", RawURL: "trojan://secret@example.com:443"}}
 	st.DefaultNodeID = "node-one"
 	if err := a.saveStore(st); err != nil {
@@ -234,29 +261,21 @@ func TestEnabledDevAutoUserIsResolvedAndPersistedForBoot(t *testing.T) {
 	}
 	t.Setenv("SUDO_USER", "nobody")
 	t.Setenv("USER", "root")
-	if err := a.commitStoreMutationWithRuntimeOps(st, func(candidate *Store) error {
-		candidate.SceneEnabled[SceneDev] = true
-		return nil
-	}, storeRuntimeSyncAll,
-		func(*App, *Store, storeRuntimeSyncMode) error { return nil },
-		func(*App, *Store) error { return nil },
-		func(app *App, state *Store) error { return app.saveStore(state) }); err != nil {
+	if err := a.commitStoreMutation(st, func(candidate *Store) error { candidate.SceneEnabled[SceneDev] = true; return nil }, storeRuntimeSyncAll); err != nil {
 		t.Fatal(err)
 	}
 	if st.RuntimeConfig == nil || st.RuntimeConfig.DevTargetUser != "nobody" {
-		t.Fatalf("automatic dev user was not persisted: %+v", st.RuntimeConfig)
+		t.Fatalf("automatic dev user not persisted: %+v", st.RuntimeConfig)
 	}
-
 	t.Setenv("SUDO_USER", "")
-	processCfg := DefaultConfig()
-	processCfg.CoreDir = cfg.CoreDir
+	processCfg := a.cfg
 	processCfg.DevTargetUser = ""
 	boot := NewApp(processCfg)
 	if _, err := boot.loadStoreForBoot(); err != nil {
 		t.Fatal(err)
 	}
 	if boot.cfg.DevTargetUser != "nobody" {
-		t.Fatalf("boot re-selected a different dev user: %+v", boot.cfg)
+		t.Fatalf("boot re-selected another dev user: %+v", boot.cfg)
 	}
 }
 
@@ -397,427 +416,213 @@ func TestLoadStoreRejectsNonRegularFiles(t *testing.T) {
 	})
 }
 
-func TestCommitNodeStoreMutationSyncFailureRollsBack(t *testing.T) {
-	a := testApp(t)
-	before := newStore()
-	before.RuntimeConfig = a.cfg.runtimeConfig()
-	before.Nodes = []Node{{ID: "old", Name: "old", Protocol: "trojan", RawURL: "trojan://secret@old:443"}}
-	before.DefaultNodeID = "old"
-	if err := a.saveStore(before); err != nil {
-		t.Fatal(err)
-	}
-	st := cloneStore(before)
-	syncCalls := 0
-	err := a.commitStoreMutationWithRuntimeOps(st, func(candidate *Store) error {
-		candidate.Nodes[0].Name = "new"
-		return nil
-	}, storeRuntimeSyncXray, func(_ *App, candidate *Store, _ storeRuntimeSyncMode) error {
-		syncCalls++
-		if syncCalls == 1 {
-			return errors.New("xray rejected candidate")
-		}
-		if candidate.Nodes[0].Name != "old" {
-			t.Fatalf("rollback runtime got %+v", candidate.Nodes[0])
-		}
-		return nil
-	}, func(*App, *Store) error { return nil }, func(*App, *Store) error {
-		t.Fatalf("persist must not run after sync failure")
-		return nil
+func stubStoreTransitionCore(t *testing.T) {
+	t.Helper()
+	oldPlan, oldPersist := runtimePlanCore, runtimePersistStore
+	oldSystem, oldUser := systemctlRun, userSystemctlRun
+	t.Cleanup(func() {
+		runtimePlanCore, runtimePersistStore = oldPlan, oldPersist
+		systemctlRun, userSystemctlRun = oldSystem, oldUser
 	})
-	if err == nil {
-		t.Fatalf("expected sync failure")
-	}
-	if !reflect.DeepEqual(st, before) {
-		t.Fatalf("memory not rolled back: got %+v want %+v", st, before)
-	}
-	got, loadErr := a.loadStore()
-	if loadErr != nil || !reflect.DeepEqual(got, before) {
-		t.Fatalf("disk changed after sync failure: got=%+v err=%v", got, loadErr)
+	runtimePlanCore = func(*App, *Store) (*runtimeCorePlan, error) { return nil, nil }
+	runtimePersistStore = func(app *App, st *Store) error { return app.saveStore(st) }
+	systemctlRun = func(string, ...string) error { t.Fatal("isolated Store transition called systemctl"); return nil }
+	userSystemctlRun = func(string, *persistedUserIdentity, string, ...string) error {
+		t.Fatal("isolated Store transition called user systemctl")
+		return nil
 	}
 }
 
-func TestCommitNodeStoreMutationSaveFailureRestoresDisk(t *testing.T) {
+func storeTransitionFixture(t *testing.T) (*App, *Store) {
+	t.Helper()
+	stubStoreTransitionCore(t)
 	a := testApp(t)
-	before := newStore()
-	before.RuntimeConfig = a.cfg.runtimeConfig()
-	before.Nodes = []Node{{ID: "old", Name: "old", Protocol: "trojan", RawURL: "trojan://secret@old:443"}}
-	before.DefaultNodeID = "old"
+	st := newStore()
+	st.RuntimeConfig = a.cfg.runtimeConfig()
+	st.Nodes = []Node{{ID: "old", Name: "old", Protocol: "trojan", RawURL: "trojan://secret@example.com:443"}}
+	st.DefaultNodeID = "old"
+	if err := a.saveStore(st); err != nil {
+		t.Fatal(err)
+	}
+	return a, st
+}
+
+func TestCommitNodeStoreMutationPreflightFailureHasNoEffects(t *testing.T) {
+	a, before := storeTransitionFixture(t)
+	st := cloneStore(before)
+	mainBefore, _ := os.ReadFile(a.cfg.StorePath())
+	backupBefore, _ := os.ReadFile(a.cfg.StoreBackupPath())
+	failure := errors.New("candidate core validation failed")
+	runtimePlanCore = func(*App, *Store) (*runtimeCorePlan, error) { return nil, failure }
+	err := a.commitStoreMutation(st, func(candidate *Store) error { candidate.Nodes[0].Name = "candidate"; return nil }, storeRuntimeSyncXray)
+	if !errors.Is(err, failure) || !reflect.DeepEqual(st, before) {
+		t.Fatalf("preflight changed in-memory state: %v", err)
+	}
+	mainAfter, _ := os.ReadFile(a.cfg.StorePath())
+	backupAfter, _ := os.ReadFile(a.cfg.StoreBackupPath())
+	if !bytes.Equal(mainBefore, mainAfter) || !bytes.Equal(backupBefore, backupAfter) {
+		t.Fatal("preflight changed Store bytes")
+	}
+	if pending, err := a.hasRuntimeTransition(); err != nil || pending {
+		t.Fatalf("preflight created a runtime receipt: %v", err)
+	}
+}
+
+func TestMetadataCommitDoesNotMigrateLegacyRuntime(t *testing.T) {
+	a, before := storeTransitionFixture(t)
+	before.RuntimeConfig = nil
+	before.SceneEnabled[SceneGlobal] = true
+	if err := a.saveStore(before); err != nil {
+		t.Fatal(err)
+	}
+	a.cfg.DevHTTPPort = 28091
+	a.cfg.runtimeOverrides.DevHTTPPort = true
+	runtimePlanCore = func(*App, *Store) (*runtimeCorePlan, error) {
+		t.Fatal("metadata edit planned runtime")
+		return nil, nil
+	}
+	if err := a.commitStoreMutation(before, func(candidate *Store) error { candidate.Nodes[0].Name = "metadata"; return nil }, storeRuntimeSyncNone); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := a.loadStore()
+	if err != nil || loaded.RuntimeConfig != nil || loaded.Nodes[0].Name != "metadata" || !loaded.SceneEnabled[SceneGlobal] {
+		t.Fatalf("metadata edit invented historical runtime: %+v %v", loaded, err)
+	}
+	if pending, err := a.hasRuntimeTransition(); err != nil || pending {
+		t.Fatalf("metadata edit created receipt: %v", err)
+	}
+}
+
+func TestLegacyActiveRuntimeMutationFailsBeforeAnyCoordination(t *testing.T) {
+	a, before := storeTransitionFixture(t)
+	before.RuntimeConfig = nil
+	before.SceneEnabled[SceneGlobal] = true
 	if err := a.saveStore(before); err != nil {
 		t.Fatal(err)
 	}
 	st := cloneStore(before)
-	persistCalls := 0
-	err := a.commitStoreMutationWithRuntimeOps(st, func(candidate *Store) error {
-		candidate.Nodes[0].Name = "new"
-		return nil
-	}, storeRuntimeSyncXray, func(*App, *Store, storeRuntimeSyncMode) error { return nil }, func(*App, *Store) error { return nil }, func(app *App, candidate *Store) error {
-		persistCalls++
-		if persistCalls == 1 {
-			if err := app.saveStore(candidate); err != nil {
-				return err
-			}
-			return errors.New("simulated fsync failure after rename")
+	raw, _ := os.ReadFile(a.cfg.StorePath())
+	runtimePlanCore = func(*App, *Store) (*runtimeCorePlan, error) {
+		t.Fatal("unknown history reached core planning")
+		return nil, nil
+	}
+	if err := a.commitStoreMutation(st, func(candidate *Store) error { candidate.Nodes[0].Name = "candidate"; return nil }, storeRuntimeSyncXray); err == nil {
+		t.Fatal("unknown active history accepted")
+	}
+	after, _ := os.ReadFile(a.cfg.StorePath())
+	if !bytes.Equal(raw, after) || !reflect.DeepEqual(st, before) {
+		t.Fatal("rejected legacy migration changed state")
+	}
+}
+
+func TestStoreTransitionBackupFailureKeepsPriorBytes(t *testing.T) {
+	a, before := storeTransitionFixture(t)
+	st := cloneStore(before)
+	oldWrite := runtimeWriteStoreCAS
+	t.Cleanup(func() { runtimeWriteStoreCAS = oldWrite })
+	failure := errors.New("backup persistence failure")
+	runtimeWriteStoreCAS = func(path string, expected runtimeStoreEvidence, data []byte) error {
+		if path == a.cfg.StoreBackupPath() {
+			return failure
 		}
-		return app.saveStore(candidate)
-	})
-	if err == nil {
-		t.Fatalf("expected save failure")
+		return oldWrite(path, expected, data)
 	}
-	if persistCalls != 2 {
-		t.Fatalf("persist calls=%d, want candidate + rollback", persistCalls)
+	err := a.commitStoreMutation(st, func(candidate *Store) error { candidate.Nodes[0].Name = "candidate"; return nil }, storeRuntimeSyncXray)
+	if !errors.Is(err, failure) {
+		t.Fatalf("backup failure lost: %v", err)
 	}
-	want := cloneStore(before)
-	want.Generation++
-	if !reflect.DeepEqual(st, want) {
-		t.Fatalf("memory not rolled back: got %+v want %+v", st, want)
+	loaded, loadErr := a.loadStore()
+	if loadErr != nil || !reflect.DeepEqual(loaded, before) || !reflect.DeepEqual(st, before) {
+		t.Fatalf("backup failure changed prior state: %+v %v", loaded, loadErr)
 	}
-	got, loadErr := a.loadStore()
-	if loadErr != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("disk not rolled back: got=%+v want=%+v err=%v", got, want, loadErr)
+	if pending, err := a.hasRuntimeTransition(); err != nil || pending {
+		t.Fatalf("unmodified Store retained receipt: %v", err)
 	}
 }
 
-func TestRuntimeConfigChangeUsesFullTransitionAndOldConfigRollback(t *testing.T) {
-	oldCfg := DefaultConfig()
-	oldCfg.CoreDir = t.TempDir()
-	oldCfg.DevTargetUser = "olduser"
-	oldCfg.DevHTTPPort = 18091
-	newCfg := oldCfg
-	newCfg.DevTargetUser = "newuser"
-	newCfg.DevHTTPPort = 28091
-	a := NewApp(newCfg)
-	before := newStore()
-	before.RuntimeConfig = oldCfg.runtimeConfig()
-	before.SceneEnabled[SceneDev] = true
+func TestStoreTransitionMainFailureCompensatesWithNewGeneration(t *testing.T) {
+	a, before := storeTransitionFixture(t)
 	st := cloneStore(before)
-	events := []string{}
-	syncCalls := 0
-	err := a.commitStoreMutationWithRuntimeOps(st, func(*Store) error { return nil }, storeRuntimeSyncNone,
-		func(app *App, state *Store, mode storeRuntimeSyncMode) error {
-			syncCalls++
-			events = append(events, "sync:"+app.cfg.DevTargetUser)
-			wantMode := storeRuntimeSyncTransition
-			if syncCalls > 1 {
-				wantMode = storeRuntimeSyncAll
-			}
-			if mode != wantMode {
-				t.Fatalf("runtime transition call %d used mode %d, want %d", syncCalls, mode, wantMode)
-			}
-			if syncCalls == 1 {
-				if app.cfg.DevTargetUser != "newuser" || state.RuntimeConfig.DevTargetUser != "newuser" {
-					t.Fatalf("candidate sync used wrong config: app=%+v state=%+v", app.cfg, state.RuntimeConfig)
-				}
-				return errors.New("candidate sync failed")
-			}
-			if app.cfg.DevTargetUser != "olduser" || state.RuntimeConfig.DevTargetUser != "olduser" {
-				t.Fatalf("rollback sync did not use old config: app=%+v state=%+v", app.cfg, state.RuntimeConfig)
-			}
-			return nil
-		},
-		func(app *App, _ *Store) error {
-			events = append(events, "cleanup:"+app.cfg.DevTargetUser)
-			return nil
-		},
-		func(*App, *Store) error {
-			t.Fatal("failed sync without cleanup journal must not persist")
-			return nil
-		})
-	if err == nil {
-		t.Fatal("candidate sync failure was lost")
+	oldWrite := runtimeWriteStoreCAS
+	t.Cleanup(func() { runtimeWriteStoreCAS = oldWrite })
+	failure := errors.New("main persistence failure")
+	failed := false
+	runtimeWriteStoreCAS = func(path string, expected runtimeStoreEvidence, data []byte) error {
+		if path == a.cfg.StorePath() && !failed {
+			failed = true
+			return failure
+		}
+		return oldWrite(path, expected, data)
 	}
-	wantEvents := []string{"cleanup:olduser", "sync:newuser", "cleanup:newuser", "sync:olduser"}
-	if !reflect.DeepEqual(events, wantEvents) {
-		t.Fatalf("transition order = %v, want %v", events, wantEvents)
+	err := a.commitStoreMutation(st, func(candidate *Store) error { candidate.Nodes[0].Name = "candidate"; return nil }, storeRuntimeSyncXray)
+	if !errors.Is(err, failure) {
+		t.Fatalf("main failure lost: %v", err)
 	}
-	if !reflect.DeepEqual(st, before) {
-		t.Fatalf("old Store was not restored: got=%+v want=%+v", st, before)
+	loaded, loadErr := a.loadStore()
+	if loadErr != nil || loaded.Nodes[0].Name != "old" || loaded.Generation <= before.Generation+1 {
+		t.Fatalf("compensation did not supersede ahead backup: %+v %v", loaded, loadErr)
+	}
+	backup, backupErr := a.loadStoreBackup()
+	if backupErr != nil || !reflect.DeepEqual(backup, loaded) {
+		t.Fatalf("compensation copies mismatch: %+v %v", backup, backupErr)
+	}
+	if pending, err := a.hasRuntimeTransition(); err != nil || pending {
+		t.Fatalf("completed compensation retained receipt: %v", err)
 	}
 }
 
-func TestRuntimeConfigSaveFailurePersistsOldConfig(t *testing.T) {
-	oldCfg := DefaultConfig()
-	oldCfg.CoreDir = t.TempDir()
-	oldCfg.DevTargetUser = "olduser"
-	newCfg := oldCfg
-	newCfg.DevTargetUser = "newuser"
-	a := NewApp(newCfg)
-	before := newStore()
-	before.RuntimeConfig = oldCfg.runtimeConfig()
+func TestStoreTransitionPostCommitErrorRecoversFixedCommit(t *testing.T) {
+	a, before := storeTransitionFixture(t)
 	st := cloneStore(before)
-	persistCalls := 0
-	err := a.commitStoreMutationWithRuntimeOps(st, func(*Store) error { return nil }, storeRuntimeSyncNone,
-		func(*App, *Store, storeRuntimeSyncMode) error { return nil },
-		func(*App, *Store) error { return nil },
-		func(app *App, state *Store) error {
-			persistCalls++
-			if persistCalls == 1 {
-				if app.cfg.DevTargetUser != "newuser" || state.RuntimeConfig.DevTargetUser != "newuser" {
-					t.Fatalf("candidate persistence used wrong config")
-				}
-				return errors.New("candidate save failed")
-			}
-			if app.cfg.DevTargetUser != "olduser" || state.RuntimeConfig.DevTargetUser != "olduser" {
-				t.Fatalf("rollback persistence used candidate config: app=%+v state=%+v", app.cfg, state.RuntimeConfig)
-			}
-			return nil
-		})
-	if err == nil || persistCalls != 2 {
-		t.Fatalf("save failure transaction mismatch: calls=%d err=%v", persistCalls, err)
+	failure := errors.New("fsync failed after main commit")
+	runtimePersistStore = func(app *App, candidate *Store) error {
+		if err := app.saveStore(candidate); err != nil {
+			return err
+		}
+		return failure
 	}
-	if !reflect.DeepEqual(st, before) {
-		t.Fatalf("save failure did not restore old config: got=%+v want=%+v", st, before)
+	err := a.commitStoreMutation(st, func(candidate *Store) error { candidate.Nodes[0].Name = "committed"; return nil }, storeRuntimeSyncXray)
+	if !errors.Is(err, failure) {
+		t.Fatalf("post-commit failure lost: %v", err)
 	}
-}
-
-func TestLegacyActiveStoreWithExplicitRuntimeOverrideUsesFullReconcile(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.CoreDir = t.TempDir()
-	cfg.DevHTTPPort = 28091
-	cfg.runtimeOverrides.DevHTTPPort = true
-	a := NewApp(cfg)
-	st := newStore()
-	st.SceneEnabled[SceneGlobal] = true
-	st.Nodes = []Node{{ID: "node-one", Name: "one", Protocol: "trojan", RawURL: "trojan://secret@example.com:443"}}
-	st.DefaultNodeID = "node-one"
-	seenMode := storeRuntimeSyncNone
-	if err := a.commitStoreMutationWithRuntimeOps(st, func(*Store) error { return nil }, storeRuntimeSyncNone,
-		func(_ *App, _ *Store, mode storeRuntimeSyncMode) error {
-			seenMode = mode
-			return nil
-		},
-		func(*App, *Store) error { return nil },
-		func(*App, *Store) error { return nil }); err != nil {
-		t.Fatal(err)
+	loaded, loadErr := a.loadStore()
+	if loadErr != nil || loaded.Nodes[0].Name != "committed" || loaded.Generation != before.Generation+1 {
+		t.Fatalf("committed main was rolled back: %+v %v", loaded, loadErr)
 	}
-	if seenMode != storeRuntimeSyncTransition || st.RuntimeConfig == nil || st.RuntimeConfig.DevHTTPPort != 28091 {
-		t.Fatalf("legacy active migration skipped full reconcile: mode=%d state=%+v", seenMode, st.RuntimeConfig)
+	if pending, err := a.hasRuntimeTransition(); err != nil || !pending {
+		t.Fatalf("uncertain commit did not retain receipt: %v", err)
 	}
-}
-
-func TestRuntimeConfigRollbackRetainsCandidateTelegramCleanupWhileOldSceneEnabled(t *testing.T) {
-	oldCfg := DefaultConfig()
-	oldCfg.CoreDir = t.TempDir()
-	oldCfg.TGHTTPPort = 18092
-	newCfg := oldCfg
-	newCfg.TGHTTPPort = 28092
-	a := NewApp(newCfg)
-
-	before := newStore()
-	before.RuntimeConfig = oldCfg.runtimeConfig()
-	before.SceneEnabled[SceneTelegram] = true
-	before.TelegramTargets = []string{"old-telegram.service"}
-	st := cloneStore(before)
-
-	syncCalls := 0
-	cleanupCalls := 0
-	persistCalls := 0
-	err := a.commitStoreMutationWithRuntimeOps(st, func(*Store) error { return nil }, storeRuntimeSyncAll,
-		func(app *App, state *Store, mode storeRuntimeSyncMode) error {
-			syncCalls++
-			switch syncCalls {
-			case 1:
-				if mode != storeRuntimeSyncTransition || app.cfg.TGHTTPPort != newCfg.TGHTTPPort {
-					t.Fatalf("candidate sync used app=%+v mode=%d", app.cfg, mode)
-				}
-				state.TelegramTargets = []string{"new-telegram.service"}
-				return errors.New("candidate reload failed")
-			case 2:
-				if mode != storeRuntimeSyncAll || app.cfg.TGHTTPPort != oldCfg.TGHTTPPort {
-					t.Fatalf("rollback sync used app=%+v mode=%d", app.cfg, mode)
-				}
-				want := []string{"old-telegram.service", "new-telegram.service"}
-				if !reflect.DeepEqual(state.TelegramTargets, want) {
-					t.Fatalf("rollback lost candidate cleanup target: got=%v want=%v", state.TelegramTargets, want)
-				}
-				return nil
-			default:
-				t.Fatalf("unexpected sync call %d", syncCalls)
-				return nil
-			}
-		},
-		func(app *App, state *Store) error {
-			cleanupCalls++
-			if cleanupCalls == 1 {
-				if app.cfg.TGHTTPPort != oldCfg.TGHTTPPort {
-					t.Fatalf("old cleanup used candidate config: %+v", app.cfg)
-				}
-				state.TelegramTargets = nil
-				return nil
-			}
-			if state.SceneEnabled[SceneTelegram] {
-				t.Fatal("candidate rollback cleanup must be ownership-driven, not discovery-driven")
-			}
-			if !reflect.DeepEqual(state.TelegramTargets, []string{"new-telegram.service"}) {
-				t.Fatalf("candidate cleanup state=%+v", state)
-			}
-			return errors.New("candidate cleanup failed")
-		},
-		func(app *App, state *Store) error {
-			persistCalls++
-			if app.cfg.TGHTTPPort != oldCfg.TGHTTPPort {
-				t.Fatalf("cleanup journal used candidate config: %+v", app.cfg)
-			}
-			want := []string{"old-telegram.service", "new-telegram.service"}
-			if !reflect.DeepEqual(state.TelegramTargets, want) {
-				t.Fatalf("persisted cleanup journal=%v want=%v", state.TelegramTargets, want)
-			}
-			return nil
-		})
-	if err == nil || syncCalls != 2 || cleanupCalls != 2 || persistCalls != 1 {
-		t.Fatalf("transaction calls sync=%d cleanup=%d persist=%d err=%v", syncCalls, cleanupCalls, persistCalls, err)
+	runtimePlanCore = func(*App, *Store) (*runtimeCorePlan, error) { t.Fatal("recovery replanned core"); return nil, nil }
+	runtimePersistStore = func(*App, *Store) error { t.Fatal("confirmed commit was persisted again"); return nil }
+	oldInspect := telegramInspectPlanUnit
+	t.Cleanup(func() { telegramInspectPlanUnit = oldInspect })
+	telegramInspectPlanUnit = func(systemdTargetName, *persistedUserIdentity) (telegramPlanUnit, error) {
+		t.Fatal("fixed recovery rediscovered a gateway")
+		return telegramPlanUnit{}, nil
 	}
-	wantTargets := []string{"old-telegram.service", "new-telegram.service"}
-	if !st.SceneEnabled[SceneTelegram] || !reflect.DeepEqual(st.TelegramTargets, wantTargets) {
-		t.Fatalf("in-memory cleanup journal was lost: %+v", st)
-	}
-}
-
-func TestRuntimeConfigRollbackSkipsUnownedCandidateDevCleanup(t *testing.T) {
-	oldCfg := DefaultConfig()
-	oldCfg.CoreDir = t.TempDir()
-	oldCfg.DevTargetUser = "root"
-	newCfg := oldCfg
-	newCfg.DevTargetUser = "nobody"
-	a := NewApp(newCfg)
-
-	before := newStore()
-	before.RuntimeConfig = oldCfg.runtimeConfig()
-	before.SceneEnabled[SceneDev] = true
-	st := cloneStore(before)
-	cleanupCalls := 0
-	syncCalls := 0
-	err := a.commitStoreMutationWithRuntimeOps(st, func(*Store) error { return nil }, storeRuntimeSyncAll,
-		func(_ *App, _ *Store, mode storeRuntimeSyncMode) error {
-			syncCalls++
-			if syncCalls == 1 {
-				if mode != storeRuntimeSyncTransition {
-					t.Fatalf("candidate mode=%d", mode)
-				}
-				return errors.New("failed before candidate scenes were applied")
-			}
-			if mode != storeRuntimeSyncAll {
-				t.Fatalf("rollback mode=%d", mode)
-			}
-			return nil
-		},
-		func(_ *App, state *Store) error {
-			cleanupCalls++
-			if cleanupCalls == 2 && state.SceneEnabled[SceneDev] {
-				t.Fatal("candidate Dev cleanup ran without a backup ownership record")
-			}
-			return nil
-		},
-		func(*App, *Store) error { return nil })
-	if err == nil || cleanupCalls != 2 || syncCalls != 2 {
-		t.Fatalf("transaction calls sync=%d cleanup=%d err=%v", syncCalls, cleanupCalls, err)
-	}
-	if !reflect.DeepEqual(st, before) {
-		t.Fatalf("rollback state mismatch: got=%+v want=%+v", st, before)
-	}
-}
-
-func TestLegacyRollbackDoesNotInventCandidateRuntimeConfig(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.CoreDir = t.TempDir()
-	cfg.DevHTTPPort = 28091
-	cfg.runtimeOverrides.DevHTTPPort = true
-	a := NewApp(cfg)
-	st := newStore()
-	persistCalls := 0
-	err := a.commitStoreMutationWithRuntimeOps(st, func(*Store) error { return nil }, storeRuntimeSyncNone,
-		func(*App, *Store, storeRuntimeSyncMode) error { return nil },
-		func(*App, *Store) error { return nil },
-		func(_ *App, state *Store) error {
-			persistCalls++
-			if persistCalls == 1 {
-				return errors.New("candidate save failed")
-			}
-			if state.RuntimeConfig != nil {
-				t.Fatalf("legacy rollback invented candidate runtime: %+v", state.RuntimeConfig)
-			}
-			return nil
-		})
-	if err == nil || persistCalls != 2 {
-		t.Fatalf("legacy rollback mismatch: calls=%d err=%v", persistCalls, err)
-	}
-	if st.RuntimeConfig != nil {
-		t.Fatalf("legacy in-memory rollback invented runtime: %+v", st.RuntimeConfig)
-	}
-}
-
-func TestTelegramRollbackCleanupJournalSurvivesNewAppAndReplays(t *testing.T) {
-	a := testApp(t)
-	before := newStore()
-	before.RuntimeConfig = a.cfg.runtimeConfig()
-	if err := a.saveStore(before); err != nil {
-		t.Fatal(err)
-	}
-	st := cloneStore(before)
-	syncCalls := 0
-	err := a.commitStoreMutationWithRuntimeOps(st, func(candidate *Store) error {
-		candidate.SceneEnabled[SceneTelegram] = true
-		return nil
-	}, storeRuntimeSyncAll,
-		func(_ *App, state *Store, _ storeRuntimeSyncMode) error {
-			syncCalls++
-			if syncCalls == 1 {
-				state.TelegramTargets = []string{"hermes-journal-replay.service"}
-				return errors.New("candidate daemon-reload failed")
-			}
-			if state.SceneEnabled[SceneTelegram] {
-				t.Fatal("rollback cleanup did not restore scene-off state")
-			}
-			return errors.New("rollback daemon-reload failed")
-		},
-		func(*App, *Store) error { return nil },
-		func(app *App, state *Store) error { return app.saveStore(state) })
-	if err == nil || syncCalls != 2 {
-		t.Fatalf("expected apply+rollback reload failures: calls=%d err=%v", syncCalls, err)
-	}
-	if st.SceneEnabled[SceneTelegram] || !reflect.DeepEqual(st.TelegramTargets, []string{"hermes-journal-replay.service"}) {
-		t.Fatalf("pending cleanup ownership was lost in memory: %+v", st)
-	}
-
 	restarted := NewApp(a.cfg)
-	loaded, err := restarted.loadStoreForBoot()
-	if err != nil {
-		t.Fatal(err)
+	if recovered, err := restarted.recoverRuntimeTransition(); err != nil || !recovered {
+		t.Fatalf("fixed committed recovery failed: %v", err)
 	}
-	if loaded.SceneEnabled[SceneTelegram] || !reflect.DeepEqual(loaded.TelegramTargets, st.TelegramTargets) {
-		t.Fatalf("pending cleanup ownership was lost across process restart: %+v", loaded)
+	if pending, err := restarted.hasRuntimeTransition(); err != nil || pending {
+		t.Fatalf("recovery did not retire receipt: %v", err)
 	}
-	if err := restarted.commitStoreMutationWithRuntimeOps(loaded, func(*Store) error { return nil }, storeRuntimeSyncAll,
-		func(_ *App, state *Store, _ storeRuntimeSyncMode) error {
-			if state.SceneEnabled[SceneTelegram] || !reflect.DeepEqual(state.TelegramTargets, []string{"hermes-journal-replay.service"}) {
-				t.Fatalf("retry did not receive persisted scene-off ownership: %+v", state)
-			}
-			state.TelegramTargets = nil
-			return nil
-		},
-		func(*App, *Store) error { return nil },
-		func(app *App, state *Store) error { return app.saveStore(state) }); err != nil {
-		t.Fatal(err)
-	}
-	verified, err := NewApp(a.cfg).loadStoreForBoot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(verified.TelegramTargets) != 0 {
-		t.Fatalf("successful replay did not clear ownership: %+v", verified.TelegramTargets)
+	current, err := restarted.loadStore()
+	if err != nil || !reflect.DeepEqual(current, loaded) {
+		t.Fatalf("recovery changed committed Store: %+v %v", current, err)
 	}
 }
 
 func TestNodeCommitWithoutScenesRemovesStaleXrayConfig(t *testing.T) {
-	a := testApp(t)
-	st := newStore()
-	oldRun := systemctlRun
-	oldOutput := systemctlOutput
-	t.Cleanup(func() {
-		systemctlRun = oldRun
-		systemctlOutput = oldOutput
-	})
-	systemctlRun = func(string, ...string) error { return nil }
-	systemctlOutput = func(string, ...string) (string, error) { return "inactive\n", nil }
+	fixture := newCoreRuntimeFixture(t)
+	a := fixture.app
+	st := fixture.store
+	st.SceneEnabled[SceneGlobal] = false
+	fixture.service.Active, fixture.service.Sub = "inactive", "dead"
+	fixture.service.PID, fixture.service.Invocation = 0, ""
+	if err := a.saveStore(st); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(a.cfg.XrayConfig(), []byte(`{"password":"deleted-secret"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -831,13 +636,16 @@ func TestNodeCommitWithoutScenesRemovesStaleXrayConfig(t *testing.T) {
 	if _, err := os.Stat(a.cfg.XrayConfig()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale config still exists or stat failed: %v", err)
 	}
+	if fixture.service.Active != "inactive" || fixture.service.Enabled != "disabled" {
+		t.Fatalf("disabled scene left core enabled: %+v", fixture.service)
+	}
 }
 
 func TestNodeCommitWithoutScenesStopFailurePreservesConfigAndRollsBack(t *testing.T) {
-	a := testApp(t)
-	before := newStore()
-	before.Nodes = []Node{{ID: "old", Name: "old", Protocol: "trojan", RawURL: "trojan://secret@old:443"}}
-	before.DefaultNodeID = "old"
+	fixture := newCoreRuntimeFixture(t)
+	a := fixture.app
+	before := fixture.store
+	before.SceneEnabled[SceneGlobal] = false
 	if err := a.saveStore(before); err != nil {
 		t.Fatal(err)
 	}
@@ -846,21 +654,22 @@ func TestNodeCommitWithoutScenesStopFailurePreservesConfigAndRollsBack(t *testin
 	if err := os.WriteFile(a.cfg.XrayConfig(), credentialConfig, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	oldRun := systemctlRun
-	oldOutput := systemctlOutput
-	t.Cleanup(func() {
-		systemctlRun = oldRun
-		systemctlOutput = oldOutput
-	})
-	systemctlRun = func(string, ...string) error { return errors.New("stop failed") }
-	systemctlOutput = func(string, ...string) (string, error) { return "active\n", nil }
-
+	fixtureRun := systemctlRun
+	failure := errors.New("stop failed")
+	stopCalls := 0
+	systemctlRun = func(action string, args ...string) error {
+		if len(args) != 0 && args[0] == "stop" {
+			stopCalls++
+			return failure
+		}
+		return fixtureRun(action, args...)
+	}
 	err := a.commitNodeStoreMutation(st, func(candidate *Store) error {
 		candidate.Nodes[0].Name = "new"
 		return nil
 	})
-	if err == nil {
-		t.Fatal("stop failure must reject the node mutation")
+	if !errors.Is(err, failure) || stopCalls == 0 {
+		t.Fatalf("core stop failure was not exercised: calls=%d err=%v", stopCalls, err)
 	}
 	if !reflect.DeepEqual(st, before) {
 		t.Fatalf("memory not rolled back: got=%+v want=%+v", st, before)

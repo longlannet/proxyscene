@@ -49,34 +49,6 @@ func TestApplyTelegramRejectsZeroActualCandidates(t *testing.T) {
 	}
 }
 
-func TestSyncXrayWithoutScenesPreservesConfigWhenStopFails(t *testing.T) {
-	a := testApp(t)
-	credentialConfig := []byte(`{"outbounds":[{"password":"credential-must-survive"}]}`)
-	if err := os.WriteFile(a.cfg.XrayConfig(), credentialConfig, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	oldRun := systemctlRun
-	oldOutput := systemctlOutput
-	t.Cleanup(func() {
-		systemctlRun = oldRun
-		systemctlOutput = oldOutput
-	})
-	systemctlRun = func(string, ...string) error { return errors.New("stop or disable failed") }
-	systemctlOutput = func(string, ...string) (string, error) { return "active\n", nil }
-
-	if err := a.syncXrayServiceForStore(newStore()); err == nil {
-		t.Fatal("stop failure must abort no-scene synchronization")
-	}
-	got, err := os.ReadFile(a.cfg.XrayConfig())
-	if err != nil {
-		t.Fatalf("credential config must remain while Xray may still be active: %v", err)
-	}
-	if !bytes.Equal(got, credentialConfig) {
-		t.Fatalf("credential config changed after failed stop: %q", got)
-	}
-}
-
 func TestLegacyTelegramMigrationRetainsInvalidRecord(t *testing.T) {
 	a := testApp(t)
 	st := newStore()
@@ -474,7 +446,8 @@ func TestTelegramProxySystemdEnvironmentLinesDoNotInjectBroadProxy(t *testing.T)
 func TestRuntimeTransitionDoesNotCleanDisabledUnownedScenes(t *testing.T) {
 	a := testApp(t)
 	st := newStore()
-	if err := a.applySavedScenesWithCleanup(st, false); err != nil {
+	stubStoreTransitionCore(t)
+	if err := a.commitStoreMutation(st, func(*Store) error { return nil }, storeRuntimeSyncAll); err != nil {
 		t.Fatalf("disabled unowned scenes should be skipped during a runtime transition: %v", err)
 	}
 }

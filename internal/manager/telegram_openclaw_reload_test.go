@@ -135,7 +135,7 @@ func setupOpenClawReloadFixture(t *testing.T, initial string) (*openClawTestHarn
 	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(unitPath, []byte("[Service]\nExecStart=/usr/bin/node /opt/openclaw/dist/index.js gateway --port 18789\n"), 0o600); err != nil {
+	if err := os.WriteFile(unitPath, []byte("[Service]\nEnvironment=OPENCLAW_SERVICE_MARKER=openclaw OPENCLAW_SERVICE_KIND=gateway\nExecStart=/usr/bin/node /opt/openclaw/dist/index.js gateway --port 18789\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	oldState, oldRPC, oldTimeout, oldPoll := openClawReloadUnitState, openClawReloadRPC, openClawReloadTimeout, openClawReloadPollInterval

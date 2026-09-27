@@ -40,48 +40,6 @@ func hasEnabledScene(st *Store) bool {
 	return st.SceneEnabled[SceneGlobal] || st.SceneEnabled[SceneDev] || st.SceneEnabled[SceneTelegram]
 }
 
-// applySavedScenesWithCleanup applies every enabled scene. During an ordinary
-// boot/reconcile it also removes disabled-scene residue. A runtime-config
-// transition sets cleanupDisabled=false because the old configuration was
-// already cleaned before the candidate is applied; cleaning disabled scenes
-// again under the candidate configuration could touch a new user or service
-// that proxyscene has never owned.
-func (a *App) applySavedScenesWithCleanup(st *Store, cleanupDisabled bool) error {
-	var errs []error
-	for _, scene := range []Scene{SceneGlobal, SceneDev, SceneTelegram} {
-		if st.SceneEnabled[scene] {
-			if scene == SceneTelegram {
-				// Discover once so apply and ownership reconciliation use the same set.
-				targets, err := a.telegramTargets(st, false)
-				if err != nil {
-					errs = append(errs, fmt.Errorf("%s目标解析失败：%w", sceneName(scene), err))
-					continue
-				}
-				_, err = a.applyTelegram(st, targets)
-				if err != nil {
-					errs = append(errs, fmt.Errorf("%s应用失败：%w", sceneName(scene), err))
-				}
-			} else if err := a.applyScene(st, scene); err != nil {
-				errs = append(errs, fmt.Errorf("%s应用失败：%w", sceneName(scene), err))
-				continue
-			}
-		} else if cleanupDisabled || (scene == SceneTelegram && len(st.TelegramTargets) > 0) {
-			if err := a.restoreScene(st, scene); err != nil {
-				errs = append(errs, fmt.Errorf("%s恢复失败：%w", sceneName(scene), err))
-				continue
-			}
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func (a *App) reloadIfEnabled(st *Store) error {
-	if !hasEnabledScene(st) {
-		return nil
-	}
-	return a.syncXrayServiceForStore(st)
-}
-
 func (a *App) setScene(scene Scene, enabled bool) error {
 	if err := requireRoot(); err != nil {
 		return err
@@ -96,61 +54,18 @@ func (a *App) setScene(scene Scene, enabled bool) error {
 }
 
 func (a *App) setSceneWithStore(st *Store, scene Scene, enabled bool) error {
-	if enabled && scene == SceneDev && a.cfg.DevTargetUser == "" {
-		user, err := a.devTargetUser()
-		if err != nil {
-			return fmt.Errorf("确定开发代理持久目标用户失败：%w", err)
-		}
-		a.cfg.DevTargetUser = user
+	mode := storeRuntimeSyncGlobal
+	switch scene {
+	case SceneGlobal:
+	case SceneDev:
+		mode = storeRuntimeSyncDev
+	case SceneTelegram:
+		mode = storeRuntimeSyncTelegram
+	default:
+		return fmt.Errorf("未知场景：%s", scene)
 	}
-	before := cloneStore(st)
-	// Telegram 的 apply/cleanup 具有跨 reload/restart 的 durable ownership 状态，
-	// 始终走统一 Store 事务，确保候选应用和回滚都能保留待重试目标。
-	if scene == SceneTelegram || a.runtimeConfigDiffers(st) {
-		if err := a.commitStoreMutation(st, func(candidate *Store) error {
-			candidate.SceneEnabled[scene] = enabled
-			return nil
-		}, storeRuntimeSyncAll); err != nil {
-			return err
-		}
-		a.printSceneChange(scene, enabled)
-		return nil
-	}
-	a.stageRuntimeConfig(st)
-	if enabled {
-		st.SceneEnabled[scene] = true
-		// syncXrayServiceForStore 已写配置、校验并启动核心服务，无需再次 startXrayService。
-		if err := a.syncXrayServiceForStore(st); err != nil {
-			rollbackErr := a.rollbackSceneState(st, before, scene)
-			journalErr := a.persistSceneRollbackIfNeeded(st, before)
-			return errors.Join(err, rollbackErr, journalErr)
-		}
-		applyErr := a.applyScene(st, scene)
-		if applyErr != nil {
-			rollbackErr := a.rollbackSceneState(st, before, scene)
-			journalErr := a.persistSceneRollbackIfNeeded(st, before)
-			return errors.Join(applyErr, rollbackErr, journalErr)
-		}
-	} else {
-		if err := a.restoreScene(st, scene); err != nil {
-			rollbackErr := a.rollbackSceneState(st, before, scene)
-			journalErr := a.persistSceneRollbackIfNeeded(st, before)
-			return errors.Join(err, rollbackErr, journalErr)
-		}
-		st.SceneEnabled[scene] = false
-		if err := a.syncXrayServiceForStore(st); err != nil {
-			rollbackErr := a.rollbackSceneState(st, before, scene)
-			journalErr := a.persistSceneRollbackIfNeeded(st, before)
-			return errors.Join(err, rollbackErr, journalErr)
-		}
-	}
-	if err := a.saveStore(st); err != nil {
-		// 系统侧改动已生效但状态未能持久化：回滚系统侧（恢复 SceneEnabled、重新
-		// 应用/恢复场景并重新同步核心服务），使磁盘状态与实际系统保持一致，避免
-		// status 误报、boot-restore 重复应用已被拆除的场景。
-		rollbackErr := a.rollbackSceneState(st, before, scene)
-		persistErr := a.saveStore(st)
-		return errors.Join(err, rollbackErr, wrapRollbackError("恢复旧状态文件", persistErr))
+	if err := a.commitStoreMutation(st, func(candidate *Store) error { candidate.SceneEnabled[scene] = enabled; return nil }, mode); err != nil {
+		return err
 	}
 	a.printSceneChange(scene, enabled)
 	return nil
@@ -162,53 +77,6 @@ func (a *App) printSceneChange(scene Scene, enabled bool) {
 		fmt.Println("提示：当前已打开的 shell 不会自动继承新的代理环境变量。")
 		fmt.Println("如需当前 shell 立即生效，请执行：source /etc/profile.d/proxyscene-global-proxy.sh")
 	}
-}
-
-func (a *App) persistSceneRollbackIfNeeded(st, before *Store) error {
-	if slices.Equal(st.TelegramTargets, before.TelegramTargets) {
-		return nil
-	}
-	if err := a.saveStore(st); err != nil {
-		return wrapRollbackError("保存待重试的 Telegram 清理状态", err)
-	}
-	return nil
-}
-
-func (a *App) syncXrayServiceForStore(st *Store) error {
-	if !hasEnabledScene(st) {
-		if err := a.stopXrayService(); err != nil {
-			return err
-		}
-		return a.clearXrayConfig()
-	}
-	if err := a.writeCheckedXrayConfig(st); err != nil {
-		return err
-	}
-	return a.startXrayService()
-}
-
-func (a *App) rollbackSceneState(st, before *Store, scene Scene) error {
-	restoreStore(st, before)
-	var errs []error
-	if before.SceneEnabled[scene] {
-		if scene == SceneTelegram {
-			targets, discoverErr := a.telegramTargets(before, false)
-			if discoverErr != nil {
-				errs = append(errs, discoverErr)
-			}
-			_, err := a.applyTelegram(before, targets)
-			errs = append(errs, err)
-		} else {
-			errs = append(errs, a.applyScene(before, scene))
-		}
-	} else {
-		errs = append(errs, a.restoreScene(before, scene))
-	}
-	if err := a.syncXrayServiceForStore(before); err != nil {
-		errs = append(errs, fmt.Errorf("场景回滚后同步核心服务失败：%w", err))
-	}
-	restoreStore(st, before)
-	return errors.Join(errs...)
 }
 
 func sceneName(scene Scene) string {
@@ -731,52 +599,51 @@ func (a *App) cleanupManagedOpenClawTargets(trigger systemdTargetName, allowShar
 	return targets, nil
 }
 
-func (a *App) cleanupStaleTelegramOwnership(st *Store, desired, ready map[string]bool) error {
-	var errs []error
-	hermesTargets, err := a.allManagedHermesTelegramTargets()
-	if err != nil {
-		errs = append(errs, err)
-	} else {
-		for _, target := range hermesTargets {
-			key := canonicalTelegramTargetName(target)
-			if desired[key] {
-				continue
-			}
-			fmt.Printf("清理不再管理的 Hermes Telegram 目标：%s\n", key)
-			if err := a.cleanupHermesTelegramTarget(target); err != nil {
-				errs = append(errs, fmt.Errorf("清理 Hermes Telegram 目标 %s 失败：%w", key, err))
-			}
-		}
+func (a *App) cleanupStaleTelegramOwnership(st *Store, plan *telegramPlan, ready map[string]bool) error {
+	if plan == nil {
+		return fmt.Errorf("电报代理清理缺少明确授权计划")
 	}
-	openClawTargets, err := a.allManagedOpenClawTargets()
-	if err != nil {
-		errs = append(errs, err)
-	} else {
-		processedUsers := map[string]bool{}
-		for _, target := range openClawTargets {
-			key := canonicalTelegramTargetName(target)
-			if desired[key] || processedUsers[target.User] {
+	var errs []error
+	processedUsers := map[string]bool{}
+	for _, release := range plan.releases {
+		target := release.target
+		key := canonicalTelegramTargetName(target)
+		if release.openClaw {
+			if processedUsers[target.User] {
 				continue
 			}
 			processedUsers[target.User] = true
-			fmt.Printf("清理不再管理的 OpenClaw Telegram 目标：%s\n", key)
-			if _, err := a.cleanupManagedOpenClawTargets(target, false); err != nil {
-				errs = append(errs, fmt.Errorf("清理 OpenClaw Telegram 目标 %s 失败：%w", key, err))
+			if _, err := a.cleanupManagedOpenClawTargets(target, true); err != nil {
+				errs = append(errs, fmt.Errorf("退管 OpenClaw Telegram 目标 %s 失败：%w", key, err))
+			}
+		} else if err := a.cleanupHermesTelegramTarget(target); err != nil {
+			errs = append(errs, fmt.Errorf("退管 Hermes Telegram 目标 %s 失败：%w", key, err))
+		}
+	}
+	// Preserve every legacy record unless this plan explicitly authorizes its
+	// release, or its selected replacement has completed the required apply.
+	preserve, handoffReady := map[string]bool{}, map[string]bool{}
+	if st != nil {
+		for _, key := range st.TelegramTargets {
+			if target, err := parseSystemdTargetName(key); err == nil {
+				preserve[canonicalTelegramTargetName(target)] = true
 			}
 		}
 	}
-	if err := a.cleanupLegacyTelegramTargets(st, desired, ready); err != nil {
+	for _, target := range plan.legacyReleases {
+		preserve[canonicalTelegramTargetName(target)] = false
+	}
+	for _, target := range plan.legacyHandoffs {
+		key := canonicalTelegramTargetName(target)
+		handoffReady[key] = ready[key]
+	}
+	legacyStore := cloneStore(st)
+	legacyStore.RuntimeConfig = plan.observed.legacyRuntime
+	if err := a.cleanupLegacyTelegramTargets(legacyStore, preserve, handoffReady); err != nil {
 		errs = append(errs, err)
 	}
-	return errors.Join(errs...)
-}
-
-func mergeStringSlices(values ...[]string) []string {
-	merged := []string{}
-	for _, group := range values {
-		for _, value := range group {
-			merged = appendUniqueString(merged, value)
-		}
+	if st != nil {
+		st.TelegramTargets = legacyStore.TelegramTargets
 	}
-	return merged
+	return errors.Join(errs...)
 }

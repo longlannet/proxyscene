@@ -2048,7 +2048,7 @@ func TestDevRuntimeUserTransitionRecoversCrashBeforeStoreCommit(t *testing.T) {
 	state := newStore()
 	state.SceneEnabled[SceneDev] = true
 	state.RuntimeConfig = oldApp.cfg.runtimeConfig()
-	if err := cleanupStoreRuntimeScenes(oldApp, state); err != nil {
+	if err := oldApp.restoreScene(state, SceneDev); err != nil {
 		t.Fatal(err)
 	}
 	if got := values["root"]["http.proxy"]; len(got) != 1 || got[0] != "root-http-original" {

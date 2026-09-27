@@ -8,14 +8,20 @@ import (
 )
 
 type App struct {
-	cfg Config
+	cfg                Config
+	runtimeStoreCommit *runtimeTransitionRecord
 }
 
 type installStoreCommit func(*Store, func(*Store) error, storeRuntimeSyncMode) error
 
 func NewApp(cfg Config) *App { return &App{cfg: cfg} }
 
-func (a *App) Run(args []string) error {
+func (a *App) Run(args []string) (err error) {
+	defer func() {
+		if err == errMenuClosed || err == errMenuCancelled {
+			err = nil
+		}
+	}()
 	if err := a.cfg.ValidateLocators(); err != nil {
 		return err
 	}
@@ -35,10 +41,16 @@ func (a *App) Run(args []string) error {
 		return a.sceneCommand(args)
 	case "node", "nodes":
 		return a.nodeCommand(args[1:])
+	case "subscription":
+		return a.subscriptionCommand(args[1:])
+	case "update":
+		return a.updateCommand(args[1:])
 	case "test":
 		return a.testProxy()
 	case "boot-restore":
 		return a.bootRestore()
+	case "recover":
+		return a.recoverRuntimeCommand()
 	case "uninstall":
 		return a.uninstall()
 	case "help", "-h", "--help":
@@ -54,8 +66,8 @@ func (a *App) Run(args []string) error {
 
 func (a *App) help() {
 	fmt.Println("用法：")
-	fmt.Println("  proxyscene install                  初始化/更新管理服务，并交互录入节点")
-	fmt.Println("  proxyscene install --skip-node      初始化/更新管理服务，不交互录入节点")
+	fmt.Println("  proxyscene install                  初始化/修复管理服务，并交互录入节点")
+	fmt.Println("  proxyscene install --skip-node      初始化/修复管理服务，不交互录入节点")
 	fmt.Println("  proxyscene                         打开交互菜单")
 	fmt.Println("  proxyscene global|dev|tg           切换场景开关")
 	fmt.Println("  proxyscene global on|off           显式开启/关闭全局代理")
@@ -63,79 +75,80 @@ func (a *App) help() {
 	fmt.Println("  proxyscene node list               查看节点")
 	fmt.Println("  proxyscene node add --stdin [备注]  从标准输入读取节点链接")
 	fmt.Println("  proxyscene node import --stdin      从标准输入读取订阅链接")
+	fmt.Println("  proxyscene subscription             打开订阅管理菜单")
+	fmt.Println("  proxyscene subscription list        查看订阅列表（隐藏链接凭据）")
+	fmt.Println("  proxyscene subscription update <序号或ID>  更新单个订阅")
+	fmt.Println("  proxyscene subscription update --all      更新全部订阅")
 	fmt.Println("  proxyscene node rename '节点ID' '新备注'")
 	fmt.Println("  proxyscene node remove '节点ID'      删除节点（别名：delete）")
-	fmt.Println("  proxyscene node test               对所有节点做 TCP 连通性测速")
-	fmt.Println("  proxyscene node auto [范围]         测速后自动选择最快节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
+	fmt.Println("  proxyscene node test               对所有节点做 TCP 连通性/延迟测试")
+	fmt.Println("  proxyscene node auto [范围]         按 TCP 延迟自动选用节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
 	fmt.Println("  proxyscene node use '节点ID' [范围] 使用指定节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
 	fmt.Println("  proxyscene test                    通过全局代理测试连通性")
 	fmt.Println("  proxyscene status                  查看状态")
+	fmt.Println("  proxyscene update --check           检查程序新版本和更新说明")
+	fmt.Println("  proxyscene update [--yes] [--source github|mirror]  升级程序")
+	fmt.Println("  proxyscene recover                 续跑未完成事务的固定恢复计划")
 	fmt.Println("  proxyscene version                 查看版本")
 	fmt.Println("  proxyscene uninstall               卸载 systemd 服务（保留数据目录）")
 }
 
 func (a *App) menu() error {
 	for {
-		st, err := a.loadStore()
-		fmt.Println()
-		fmt.Println("==============================")
-		fmt.Printf(" Xray 代理管理器 v%s\n", Version)
-		fmt.Println("==============================")
-		if err != nil {
-			fmt.Println("状态读取失败：", err)
+		st, stateErr := a.loadStore()
+		fmt.Printf("\n========== proxyscene %s ==========\n", sanitizeDisplayText(VersionString(), 200))
+		if stateErr != nil {
+			fmt.Println("状态读取失败：", stateErr)
 		} else {
-			a.printSceneStatus(st)
+			printMenuSceneSummary(st)
 		}
 		fmt.Println()
-		fmt.Println("1. 初始化/更新管理服务")
-		fmt.Println("2. 切换全局代理")
-		fmt.Println("3. 切换开发代理")
-		fmt.Println("4. 切换电报服务代理")
-		fmt.Println("5. 节点管理")
-		fmt.Println("6. 测试代理")
-		fmt.Println("7. 查看状态")
-		fmt.Println("8. 卸载")
-		fmt.Println("9. 退出")
-		choice, ok := ask("请输入选项 [1-9]: ")
-		if !ok {
-			fmt.Println()
+		for i, scene := range []Scene{SceneGlobal, SceneDev, SceneTelegram} {
+			action := "开启"
+			if stateErr != nil {
+				action = "状态未知，无法操作："
+			} else if st.SceneEnabled[scene] {
+				action = "关闭"
+			}
+			fmt.Printf("%d. %s%s\n", i+1, action, menuSceneName(scene))
+		}
+		fmt.Println("\n4. 节点管理\n5. 订阅管理\n6. 状态与连接检测\n7. 程序更新\n8. 安装与维护\n0. 退出")
+		choice, err := menuInput("请输入选项 [0-8，q 退出]: ")
+		if errors.Is(err, errMenuCancelled) || (err == nil && (choice == "0" || choice == "9")) {
 			return nil
+		}
+		if err != nil {
+			return err
 		}
 		switch choice {
-		case "1":
-			if err := a.install("", true); err != nil {
-				fmt.Println(err)
-			}
-		case "2":
-			if err := a.toggleScene(SceneGlobal); err != nil {
-				fmt.Println(err)
-			}
-		case "3":
-			if err := a.toggleScene(SceneDev); err != nil {
-				fmt.Println(err)
+		case "1", "2", "3":
+			if stateErr != nil {
+				err = fmt.Errorf("无法读取当前状态，请先检查状态读取错误")
+			} else {
+				scene := []Scene{SceneGlobal, SceneDev, SceneTelegram}[int(choice[0]-'1')]
+				// Execute the action displayed above, even if another process has
+				// changed the switch since this menu was rendered.
+				err = a.setScene(scene, !st.SceneEnabled[scene])
 			}
 		case "4":
-			if err := a.toggleScene(SceneTelegram); err != nil {
-				fmt.Println(err)
-			}
+			err = a.nodeMenu()
 		case "5":
-			if err := a.nodeMenu(); err != nil {
-				fmt.Println(err)
-			}
+			err = a.subscriptionMenu()
 		case "6":
-			if err := a.testProxy(); err != nil {
-				fmt.Println(err)
-			}
+			err = a.statusMenu()
 		case "7":
-			if err := a.status(); err != nil {
-				fmt.Println(err)
+			attempted, updateErr := a.updateMenu()
+			if attempted {
+				return updateErr
 			}
+			err = updateErr
 		case "8":
-			if err := a.uninstall(); err != nil {
-				fmt.Println(err)
-			}
-		case "9":
-			return nil
+			err = a.maintenanceMenu()
+		default:
+			fmt.Println("无效选项，请输入 0-8")
+		}
+		if err := reportMenuAction(err); err != nil {
+			return err
 		}
 	}
 }
@@ -161,7 +174,11 @@ func (a *App) install(raw string, promptNode bool) error {
 		return err
 	}
 	if raw == "" && promptNode {
-		raw, _ = ask("请输入节点链接（VLESS / VMess / Trojan / Shadowsocks，可留空跳过）: ")
+		var err error
+		raw, err = menuInput("请输入节点链接（VLESS / VMess / Trojan / Shadowsocks，留空跳过，q 取消初始化）: ")
+		if err != nil {
+			return err
+		}
 	}
 	return a.installPrepared(raw)
 }
@@ -187,10 +204,16 @@ func (a *App) installPrepared(raw string) error {
 			if err != nil {
 				return err
 			}
+			if err := a.preflightInstallation(st, raw); err != nil {
+				return err
+			}
+			if err := a.preflightRestoreService(); err != nil {
+				return err
+			}
 			if err := a.installWithStore(st, raw, a.ensureXrayInstalled, a.installXrayService, a.installRestoreService, a.commitStoreMutation); err != nil {
 				return err
 			}
-			fmt.Println("管理服务初始化/更新完成")
+			fmt.Println("管理服务初始化/修复完成")
 			return nil
 		})
 	})
@@ -200,25 +223,33 @@ func (a *App) installWithStore(st *Store, raw string, ensureXray, installMainUni
 	if err := ensureXray(); err != nil {
 		return err
 	}
-	// 先安装 unit，再执行可能停止/重启 Xray 的状态事务。干净系统首次带节点
-	// 初始化时，候选同步因此不会对尚不存在的 unit 执行 stop/show。
-	if err := installMainUnit(); err != nil {
-		return err
-	}
-	if err := installRestoreUnit(); err != nil {
-		return err
+	// The caller has completed the read-only installation preflight. Only a
+	// fresh installation may bootstrap its account and main unit. Existing core
+	// units and permissions must be captured before the runtime transaction writes.
+	if st.RuntimeConfig == nil {
+		if err := installMainUnit(); err != nil {
+			return err
+		}
 	}
 	mode := storeRuntimeSyncXray
 	if hasEnabledScene(st) || a.runtimeConfigDiffers(st) {
 		mode = storeRuntimeSyncAll
 	}
-	return commit(st, func(candidate *Store) error {
+	if err := commit(st, func(candidate *Store) error {
 		if strings.TrimSpace(raw) == "" {
 			return nil
 		}
 		_, err := a.addNode(candidate, raw, "", "default")
 		return err
-	}, mode)
+	}, mode); err != nil {
+		return err
+	}
+	// Boot activation follows the committed runtime state. This final install
+	// step is outside the runtime transaction and has an explicit partial result.
+	if err := installRestoreUnit(); err != nil {
+		return fmt.Errorf("运行配置已提交，但开机恢复服务安装失败；修复后执行 proxyscene install --skip-node 重试：%w", err)
+	}
+	return nil
 }
 
 func (a *App) sceneCommand(args []string) error {
@@ -277,6 +308,12 @@ func (a *App) bootRestore() error {
 		return err
 	}
 	return a.withStoreLock(func() error {
+		if recovered, err := a.recoverRuntimeTransition(); err != nil {
+			return err
+		} else if recovered {
+			fmt.Println("已恢复未完成事务；本次启动不再重新协调其他场景")
+			return nil
+		}
 		st, err := a.loadStoreForBoot()
 		if err != nil {
 			return err

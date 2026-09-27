@@ -89,7 +89,6 @@ type telegramProxyJournalEntry struct {
 type telegramHermesApplyPreparation struct {
 	managed   bool
 	reconcile bool
-	release   bool
 }
 
 type telegramHermesRestorePreparation struct {
@@ -851,42 +850,13 @@ func (a *App) prepareHermesTelegramApply(target systemdTargetName, desired []byt
 
 		result.managed = true
 		if entry.Phase == telegramPhaseRestoring {
-			if readErr == nil && telegramContentOwnedByEntry(current, entry) {
-				if _, err := removeTelegramManagedArtifact(target, identity, path, current, false); err != nil {
-					return fmt.Errorf("继续清理目标 %s 的 Telegram drop-in 失败：%w", key, err)
-				}
-			} else if readErr != nil && !missing {
-				fmt.Printf("警告：目标 %s 的 restoring drop-in 无法安全读取，已保留文件：%v\n", key, readErr)
-			} else if readErr == nil {
-				fmt.Printf("警告：目标 %s 的 restoring drop-in 已被修改，已保留文件并释放 ownership\n", key)
-			}
-			result.managed = false
-			result.reconcile = true
-			result.release = true
-			return nil
+			return fmt.Errorf("目标 %s 的 Telegram ownership 正在退管，拒绝在应用过程中隐式释放；请先完成恢复", key)
 		}
-
 		if readErr != nil && !missing {
-			entry.Phase = telegramPhaseRestoring
-			if err := a.saveTelegramProxyJournal(journal); err != nil {
-				return err
-			}
-			fmt.Printf("警告：目标 %s 的受管 drop-in 无法安全读取，已保留文件并准备释放 ownership：%v\n", key, readErr)
-			result.managed = false
-			result.reconcile = true
-			result.release = true
-			return nil
+			return fmt.Errorf("目标 %s 的受管 drop-in 无法安全读取，保留文件和 ownership：%w", key, readErr)
 		}
 		if readErr == nil && !telegramContentOwnedByEntry(current, entry) {
-			entry.Phase = telegramPhaseRestoring
-			if err := a.saveTelegramProxyJournal(journal); err != nil {
-				return err
-			}
-			fmt.Printf("警告：目标 %s 的受管 drop-in 已被操作员修改，已保留文件并准备释放 ownership\n", key)
-			result.managed = false
-			result.reconcile = true
-			result.release = true
-			return nil
+			return fmt.Errorf("目标 %s 的受管 drop-in 已被操作员修改，保留文件和 ownership", key)
 		}
 		if entry.Phase == telegramPhaseActive && readErr == nil &&
 			bytes.Equal(current, []byte(entry.ManagedContent)) && entry.ManagedContent == string(desired) {
@@ -1287,9 +1257,8 @@ func (a *App) cleanupLegacyTelegramTargets(st *Store, desired, ready map[string]
 
 func (a *App) cleanupLegacyTelegramTarget(st *Store, target systemdTargetName) error {
 	key := canonicalTelegramTargetName(target)
-	if st.RuntimeConfig == nil {
-		fmt.Printf("警告：旧 Telegram 目标 %s 缺少 RuntimeConfig，无法证明 drop-in 字节归属；已保留文件\n", key)
-		return a.reloadAndRestartTelegramArtifactTarget(target)
+	if st == nil || st.RuntimeConfig == nil {
+		return fmt.Errorf("旧 Telegram 目标 %s 缺少历史 RuntimeConfig，无法证明归属；保留文件和记录，拒绝协调服务", key)
 	}
 	legacyCfg := st.RuntimeConfig.applyTo(a.cfg)
 	if target.UserMode {

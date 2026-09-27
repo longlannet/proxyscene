@@ -65,6 +65,7 @@ MANAGER_BASE_URL="${PROXYSCENE_BASE_URL:-}"
 BUILD_FROM_SOURCE="${PROXYSCENE_BUILD_FROM_SOURCE:-0}"
 
 OFFLINE_REQUESTED=0
+EXPECTED_MANAGER_SHA256=""
 SHOW_HELP=0
 RESOLVED_MANAGER_VERSION=""
 TX_DIR=""
@@ -139,6 +140,12 @@ parse_args() {
       --offline)
         OFFLINE_REQUESTED=1
         ;;
+      --expected-manager-sha256)
+        [[ $# -ge 2 && -z "$EXPECTED_MANAGER_SHA256" && "$2" =~ ^[0-9a-f]{64}$ ]] \
+          || fatal "--expected-manager-sha256 需要唯一的 64 位 SHA256"
+        EXPECTED_MANAGER_SHA256="$2"
+        shift
+        ;;
       -*)
         fatal "未知选项：$1"
         ;;
@@ -148,6 +155,8 @@ parse_args() {
     esac
     shift
   done
+  [[ -z "$EXPECTED_MANAGER_SHA256" || "$OFFLINE_REQUESTED" == "1" ]] \
+    || fatal "--expected-manager-sha256 仅用于 --offline 自更新"
 }
 
 require_root() {
@@ -669,6 +678,20 @@ acquire_install_lock() {
   chmod 600 "$INSTALL_LOCK_PATH" || fatal "无法收紧安装锁权限：$INSTALL_LOCK_PATH"
   validate_root_regular_file "$INSTALL_LOCK_PATH" "安装锁"
   flock -n "$INSTALL_LOCK_FD" || fatal "另一个 proxyscene 安装器正在运行"
+}
+
+# The updater has not held the lock while downloading. Recheck its exact
+# executable under our installation lock before touching any installed file.
+# A CLI option (rather than an environment hint) makes older installers fail
+# closed if they do not implement this precondition.
+verify_expected_manager() {
+  [[ -n "$EXPECTED_MANAGER_SHA256" ]] || return 0
+  validate_root_regular_file "$INSTALL_BIN" "自更新前的管理程序"
+  local actual
+  actual="$(sha256sum -- "$INSTALL_BIN" | awk '{print $1}')" \
+    || fatal "无法校验当前管理程序"
+  [[ "$actual" == "$EXPECTED_MANAGER_SHA256" ]] \
+    || fatal "当前程序在准备升级期间已被替换，本次升级未执行；请重新运行 proxyscene"
 }
 
 acquire_host_runtime_lock() {
@@ -1201,6 +1224,7 @@ main() {
     bdir="$(bundle_dir)" || fatal "--offline 必须从解压后的 bundle 内执行"
     verify_bundle_manifest "$bdir"
     acquire_install_lock
+    verify_expected_manager
     acquire_host_runtime_lock
     acquire_store_runtime_lock
     validate_install_bin
