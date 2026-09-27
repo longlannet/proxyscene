@@ -105,6 +105,8 @@ jobs:
           shellcheck install.sh scripts/*.sh
           sudo -- bash scripts/install-test.sh
           sudo -- bash scripts/bootstrap-test.sh
+      - name: Hermes installation permission tests
+        run: sudo -- "$(command -v go)" test ./internal/manager -run '^TestHermes(System|Project|UserProject)' -count=1
       - name: Workflow validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
       - name: Require clean source before build
