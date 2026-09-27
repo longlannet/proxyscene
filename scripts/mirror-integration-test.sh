@@ -6,7 +6,7 @@ set -euo pipefail
   exit 2
 }
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-TAG=${PROXYSCENE_MIRROR_TEST_TAG:-v0.9.0}
+TAG=${PROXYSCENE_MIRROR_TEST_TAG:-v0.9.1}
 [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ && ${#TAG} -le 128 ]]
 EVIDENCE=${PROXYSCENE_MIRROR_TEST_EVIDENCE:-$(mktemp -d /tmp/proxyscene-mirror-integration.XXXXXXXX)}
 mkdir -p -- "$EVIDENCE"

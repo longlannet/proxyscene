@@ -1169,15 +1169,29 @@ func validateHermesRuntimeFilesWithRestartPolicy(target systemdTargetName, ident
 		return err
 	}
 
-	expectedProjectRoot := filepath.Join(hermesRoot, "hermes-agent")
-	if projectRoot != expectedProjectRoot {
-		return fmt.Errorf("检测到 Hermes PROJECT_ROOT=%s 与可验证路径 %s 不一致", projectRoot, expectedProjectRoot)
+	systemLayout, err := hermesProjectUsesSystemLayout(hermesRoot, projectRoot)
+	if err != nil {
+		return err
+	}
+	if systemLayout {
+		if err := validateHermesSystemProject(content, projectRoot); err != nil {
+			return err
+		}
+		if err := rejectHermesSystemDotEnv(filepath.Join(projectRoot, ".env")); err != nil {
+			return err
+		}
+	} else {
+		if err := validateHermesUserProjectDirectory(user, runtimeIdentity, projectRoot); err != nil {
+			return err
+		}
+		if err := rejectHermesRuntimeDotEnv(user, runtimeIdentity, filepath.Join(projectRoot, ".env")); err != nil {
+			return err
+		}
 	}
 
 	for _, path := range []string{
 		filepath.Join(activeHome, ".env"),
 		filepath.Join(activeHome, ".op.env"),
-		filepath.Join(projectRoot, ".env"),
 	} {
 		if err := rejectHermesRuntimeDotEnv(user, runtimeIdentity, path); err != nil {
 			return err
@@ -1275,18 +1289,20 @@ func effectiveServiceSingleWord(content, directive string) (string, error) {
 	return value, nil
 }
 
-// The caller has already required one direct Hermes gateway ExecStart.
+// Derive the installation only from the executable, never from an option value.
 func hermesProjectRootFromArgv(argv []string) (string, error) {
-	for _, arg := range argv {
-		if !filepath.IsAbs(arg) || filepath.Clean(arg) != arg {
-			continue
-		}
-		marker := string(os.PathSeparator) + "venv" + string(os.PathSeparator) + "bin" + string(os.PathSeparator)
-		if index := strings.Index(arg, marker); index > 0 {
-			return filepath.Clean(arg[:index]), nil
+	if hermesGatewayArgv(argv) {
+		command, ok := systemdDirectExecCommand(argv[0])
+		if ok && filepath.IsAbs(command) && filepath.Clean(command) == command {
+			bin := filepath.Dir(command)
+			venv := filepath.Dir(bin)
+			projectRoot := filepath.Dir(venv)
+			if filepath.Base(bin) == "bin" && filepath.Base(venv) == "venv" && projectRoot != string(os.PathSeparator) {
+				return projectRoot, nil
+			}
 		}
 	}
-	return "", fmt.Errorf("无法从 Hermes gateway ExecStart 绑定 PROJECT_ROOT")
+	return "", fmt.Errorf("无法从 Hermes gateway ExecStart argv[0] 绑定 PROJECT_ROOT")
 }
 
 func validHermesProfileName(name string) bool {

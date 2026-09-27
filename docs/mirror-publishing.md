@@ -13,7 +13,7 @@ proxyscene 镜像位于 `https://dl.ll.cd/proxyscene`。它保存 GitHub 已公�
 旧版本允许归档，但不能降低 Latest。已存在的版本只能以完全相同内容幂等重试，不能覆盖或修补公开的半成品目录。格式损坏或不规范的现存 `latest.json` 会阻断更新，不能被当作首次发布。已有索引用于记录本地版本高水位；同一 tag 的身份信息不能改写，新 tag 则独立按 GitHub 身份与资产重新验证。镜像故障不会删除或重建已经发布的 GitHub Release；修复后单独重跑镜像工作流。
 
 ```bash
-gh workflow run 'Mirror release' --ref main -f tag=v0.9.0
+gh workflow run 'Mirror release' --ref main -f tag=v0.9.1
 ```
 
 正式 `Release` 工作流在 GitHub 发布后校验成功时，按仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true` 自动调用相同镜像流程。未配置镜像时该可选 job 跳过。手动同步也要求该变量为 true。自动与手动入口使用相同 concurrency group，并由服务器上的文件锁串行化实际写入。
@@ -69,9 +69,9 @@ sudo -- bash scripts/bootstrap-test.sh
 独立准备和验收（输出目录须不存在）：
 
 ```bash
-python3 -I scripts/mirror_release.py prepare --tag v0.9.0 \
+python3 -I scripts/mirror_release.py prepare --tag v0.9.1 \
   --directory /tmp/proxyscene-canonical --record /tmp/proxyscene-release.json
-python3 -I scripts/mirror_release.py verify --tag v0.9.0 \
+python3 -I scripts/mirror_release.py verify --tag v0.9.1 \
   --directory /tmp/proxyscene-canonical --output /tmp/proxyscene-public --stable
 ```
 
@@ -81,7 +81,7 @@ python3 -I scripts/mirror_release.py verify --tag v0.9.0 \
 
 ```bash
 PROXYSCENE_MIRROR_CONTAINER_TEST=1 \
-  PROXYSCENE_MIRROR_TEST_TAG=v0.9.0 \
+  PROXYSCENE_MIRROR_TEST_TAG=v0.9.1 \
   bash scripts/mirror-integration-test.sh
 ```
 

@@ -215,6 +215,198 @@ assert_git_values() {
   done
 }
 
+# A real Python venv with editable source metadata exercises -m imports under
+# PYTHONSAFEPATH=1 and the usual venv/bin/python -> /usr/bin/python3 link.
+# It deliberately contains no Hermes credentials or network clients.
+install_hermes_python_fixture() {
+  local project="$1" site_packages
+  install -d -m 0755 "$project" "$project/hermes_cli" "$project/gateway"
+  python3 -m venv --without-pip "$project/venv"
+  site_packages="$("$project/venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+  printf '%s\n' "$project" > "$site_packages/hermes_agent_fixture.pth"
+  install -d -m 0755 "$site_packages/hermes_agent_fixture-0.0.0.dist-info"
+  printf '{"url":"file://%s","dir_info":{"editable":true}}\n' "$project" \
+    > "$site_packages/hermes_agent_fixture-0.0.0.dist-info/direct_url.json"
+  install -m 0644 /dev/null "$project/hermes_cli/__init__.py"
+  install -m 0644 /dev/null "$project/gateway/__init__.py"
+  install -m 0644 /dev/stdin "$project/hermes_cli/main.py" <<'HERMES_PYTHON'
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+if sys.argv[1:] != ["gateway", "run"]:
+    raise SystemExit(2)
+prefix = Path("/run/proxyscene-integration-targets/hermes-layout")
+with prefix.with_suffix(".starts").open("a") as output:
+    output.write(f"{os.getpid()}\n")
+prefix.with_suffix(".runtime").write_text(json.dumps({
+    "project": str(Path(__file__).resolve().parent.parent),
+    "uid": os.getuid(),
+    "home": os.environ.get("HOME"),
+    "hermes_home": os.environ.get("HERMES_HOME"),
+    "proxy": os.environ.get("TELEGRAM_PROXY", ""),
+    "safe_path": sys.flags.safe_path,
+}))
+while True:
+    time.sleep(3600)
+HERMES_PYTHON
+  install -m 0644 /dev/stdin "$project/gateway/systemd_stop_mark.py" <<'HERMES_HOOK'
+from pathlib import Path
+with Path("/run/proxyscene-integration-targets/hermes-layout.hooks").open("a") as output:
+    output.write(__name__ + "\n")
+HERMES_HOOK
+  cp -- "$project/gateway/systemd_stop_mark.py" "$project/gateway/cgroup_cleanup.py"
+  # venv creation inherits the script's restrictive umask; root-owned system
+  # installations must still be readable/executable by the service user.
+  find "$project" -type d -exec chmod 0755 {} +
+  find "$project" -type f -exec chmod go+r {} +
+}
+
+write_hermes_layout_unit() {
+  local project="$1" service_user="$2" service_home="$3" config_home="$4"
+  install -m 0644 /dev/stdin /etc/systemd/system/hermes-gateway.service <<HERMES_LAYOUT_UNIT
+[Unit]
+Description=proxyscene integration Hermes installation layout
+# Lifecycle tests deliberately restart fixtures faster than normal gateways.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$service_user
+Environment=HOME=$service_home
+Environment=HERMES_HOME=$config_home
+ExecStart=$project/venv/bin/python -m hermes_cli.main gateway run
+ExecStop=-$project/venv/bin/python -m gateway.systemd_stop_mark
+ExecStopPost=-$project/venv/bin/python -m gateway.cgroup_cleanup
+
+[Install]
+WantedBy=multi-user.target
+HERMES_LAYOUT_UNIT
+  systemctl daemon-reload
+}
+
+assert_hermes_layout_runtime() {
+  local project="$1" service_uid="$2" config_home="$3" expected_proxy="$4"
+  jq -e --arg project "$project" --argjson uid "$service_uid" \
+    --arg config "$config_home" --arg home "${config_home%/*}" --arg proxy "$expected_proxy" \
+    '.project == $project and .uid == $uid and .home == $home and .hermes_home == $config and .proxy == $proxy
+     and (if $proxy == "" then true else .safe_path == true end)' \
+    /run/proxyscene-integration-targets/hermes-layout.runtime >/dev/null
+}
+
+assert_hermes_layout_rejected() {
+  local label="$1" evidence_dir="$2" state_path="$3" expected_reason="$4"
+  local prior_count before after output
+  prior_count="$(target_start_count hermes-layout)"
+  before="$(sha256sum "$state_path" /opt/proxyscene/config.json \
+    /opt/proxyscene/telegram-proxy-journal.json \
+    /opt/proxyscene/telegram-proxy-journal.json.bak)"
+  output="$evidence_dir/hermes-layout-${label}.log"
+  expect_failure "Hermes unsafe $label" "$output" \
+    env PROXYSCENE_TG_SERVICES=hermes-gateway /usr/local/bin/proxyscene tg on
+  assert_contains "$output" "$expected_reason" "Hermes unsafe $label rejection reason"
+  assert_not_contains "$output" 'canary-secret-token' "Hermes rejection redacted dotenv value"
+  after="$(sha256sum "$state_path" /opt/proxyscene/config.json \
+    /opt/proxyscene/telegram-proxy-journal.json \
+    /opt/proxyscene/telegram-proxy-journal.json.bak)"
+  assert_eq "$before" "$after" "Hermes unsafe $label preserved state/config/journal bytes"
+  assert_eq "$prior_count" "$(target_start_count hermes-layout)" \
+    "Hermes unsafe $label did not restart service"
+  assert_no_path /etc/systemd/system/hermes-gateway.service.d/90-proxyscene-telegram-proxy.conf
+  service_is_active hermes-gateway.service || fail "Hermes unsafe $label stopped service"
+  printf 'HERMES_LAYOUT_REJECTION_OK case=%s no_state_write no_ownership no_restart\n' "$label"
+}
+
+hermes_installation_layout_canary() {
+  local evidence_dir="$1" state_path="$2"
+  local service_user=proxyscene-hermes-test service_home=/home/proxyscene-hermes-test
+  local config_home="$service_home/.hermes-layout" user_project system_project service_uid count_before
+  local managed_drop_in=/etc/systemd/system/hermes-gateway.service.d/90-proxyscene-telegram-proxy.conf
+  user_project="$config_home/hermes-agent"
+  system_project=/usr/local/lib/hermes-agent
+
+  log "Hermes auto-detects user and system installations with independent configuration"
+  systemctl stop -- hermes-gateway.service
+  useradd --create-home --shell /bin/bash "$service_user"
+  service_uid="$(id -u "$service_user")"
+  install -d -o "$service_user" -g "$service_user" -m 0700 "$config_home"
+  install -o "$service_user" -g "$service_user" -m 0600 /dev/stdin "$config_home/config.yaml" <<'HERMES_LAYOUT_CONFIG'
+platforms:
+  telegram:
+    extra:
+      drop_pending_on_cold_boot: false
+HERMES_LAYOUT_CONFIG
+  install_hermes_python_fixture "$user_project"
+  chown -R "$service_user:$service_user" "$user_project"
+  install_hermes_python_fixture "$system_project"
+  assert_eq 0 "$(stat -c '%u' "$system_project")" "system Hermes project owned by root"
+  [[ -L "$system_project/venv/bin/python" ]] || fail "system Hermes venv fixture lacks interpreter link"
+
+  write_hermes_layout_unit "$user_project" "$service_user" "$service_home" "$config_home"
+  systemctl start -- hermes-gateway.service
+  wait_for "user-owned Hermes editable Python source" assert_hermes_layout_runtime \
+    "$user_project" "$service_uid" "$config_home" ''
+  env PROXYSCENE_TG_SERVICES=hermes-gateway /usr/local/bin/proxyscene tg on
+  wait_for "user Hermes proxy injection" assert_hermes_layout_runtime \
+    "$user_project" "$service_uid" "$config_home" http://127.0.0.1:7892
+
+  # The journal owns only the proxy configuration. A changed service program
+  # must be re-detected during restore, without persisting the old install path.
+  write_hermes_layout_unit "$system_project" "$service_user" "$service_home" "$config_home"
+  /usr/local/bin/proxyscene tg off
+  wait_for "restore after migration to root-owned system Hermes" assert_hermes_layout_runtime \
+    "$system_project" "$service_uid" "$config_home" ''
+  assert_no_path "$managed_drop_in"
+  printf 'HERMES_LAYOUT_MIGRATION_OK user_to_system tg_off actual_python_source\n'
+
+  install -m 0600 /dev/stdin "$system_project/.env" <<'HERMES_UNSAFE_ENV'
+TELEGRAM_PROXY=http://canary-secret-token.invalid:9999
+HERMES_UNSAFE_ENV
+  assert_hermes_layout_rejected dotenv "$evidence_dir" "$state_path" TELEGRAM_PROXY
+  rm -- "$system_project/.env"
+  chmod 0777 "$system_project"
+  assert_hermes_layout_rejected writable-project "$evidence_dir" "$state_path" "$system_project"
+  chmod 0755 "$system_project"
+  chown "$service_user:$service_user" "$system_project"
+  assert_hermes_layout_rejected wrong-owner "$evidence_dir" "$state_path" "$system_project"
+  chown root:root "$system_project"
+  mv -- "$system_project" "${system_project}.canary-hidden"
+  assert_hermes_layout_rejected missing-project "$evidence_dir" "$state_path" "$system_project"
+  mv -- "${system_project}.canary-hidden" "$system_project"
+  ln -s -- "$config_home/.env" "$system_project/.env"
+  assert_hermes_layout_rejected linked-dotenv "$evidence_dir" "$state_path" '.env'
+  rm -- "$system_project/.env"
+  mkfifo -m 0600 "$system_project/.env"
+  assert_hermes_layout_rejected fifo-dotenv "$evidence_dir" "$state_path" '.env'
+  rm -- "$system_project/.env"
+
+  env PROXYSCENE_TG_SERVICES=hermes-gateway /usr/local/bin/proxyscene tg on
+  wait_for "non-root service uses trusted root-owned Hermes and safe Python import" \
+    assert_hermes_layout_runtime "$system_project" "$service_uid" "$config_home" http://127.0.0.1:7892
+  count_before="$(target_start_count hermes-layout)"
+  /usr/local/bin/proxyscene tg on
+  assert_eq "$count_before" "$(target_start_count hermes-layout)" \
+    "unchanged system installation did not restart Hermes"
+
+  write_hermes_layout_unit "$user_project" "$service_user" "$service_home" "$config_home"
+  rm -- "$managed_drop_in"
+  systemctl daemon-reload
+  systemctl start -- proxyscene-restore.service
+  wait_for "boot reconciliation after return to user Hermes" assert_hermes_layout_runtime \
+    "$user_project" "$service_uid" "$config_home" http://127.0.0.1:7892
+  assert_file "$managed_drop_in"
+  /usr/local/bin/proxyscene tg off
+  wait_for "migrated user Hermes restored without proxy" assert_hermes_layout_runtime \
+    "$user_project" "$service_uid" "$config_home" ''
+  assert_no_path "$managed_drop_in"
+  assert_json /opt/proxyscene/telegram-proxy-journal.json '.targets | length == 0' \
+    "migration cleanup cleared ownership"
+  assert_json "$state_path" '.scene_enabled.telegram == false' "layout canary disabled Telegram"
+  printf 'HERMES_LAYOUT_MIGRATION_OK system_to_user boot_restore tg_off actual_python_source\n'
+}
+
 inside_container() {
   local current_archive="$1"
   local old_archive="$2"
@@ -252,6 +444,10 @@ inside_container() {
 	test_root="$(mktemp -d /root/proxyscene-systemd-integration.XXXXXX)"
 	cleanup_inside() {
 		local status=$?
+		if (( status != 0 )); then
+			systemctl --no-pager --full status hermes-gateway.service proxyscene.service >&2 || true
+			journalctl --no-pager -n 120 -u hermes-gateway.service -u proxyscene.service >&2 || true
+		fi
 		if [[ -n "${test_root:-}" && "$test_root" == /root/proxyscene-systemd-integration.* ]]; then
 			rm -rf -- "$test_root" || return 1
 		fi
@@ -658,6 +854,8 @@ HERMES_HELPER
   install -m 0644 /dev/stdin /etc/systemd/system/hermes-gateway.service <<'HERMES_UNIT'
 [Unit]
 Description=proxyscene integration Hermes gateway
+# Lifecycle tests deliberately restart fixtures faster than normal gateways.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -735,6 +933,8 @@ OPENCLAW_HELPER
     "/home/$oc_user/.config/systemd/user/openclaw-gateway.service" <<OPENCLAW_UNIT
 [Unit]
 Description=proxyscene integration OpenClaw gateway
+# Lifecycle tests deliberately restart fixtures faster than normal gateways.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -929,6 +1129,8 @@ LEGACY_ENV
     "Telegram inbounds removed"
   wait_for "removed Telegram HTTP listener" port_is_not_listening 7892
   wait_for "removed Telegram SOCKS listener" port_is_not_listening 7893
+
+  hermes_installation_layout_canary "$test_root" "$old_state"
 
   log "uninstall retries after restore-unit/main-unit partial completion"
   global_profile_concurrent='# operator replaced the profile while proxyscene was active'
@@ -1131,7 +1333,7 @@ outer_main() {
       apt-get update
       apt-get install -y --no-install-recommends \
         bash ca-certificates coreutils dbus dbus-user-session git iproute2 jq \
-        libpam-systemd npm passwd procps systemd systemd-sysv tar unzip util-linux
+        libpam-systemd npm passwd procps python3-venv systemd systemd-sysv tar unzip util-linux
       apt-get clean
       exec /sbin/init
     ')"; then
