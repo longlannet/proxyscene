@@ -850,7 +850,11 @@ func TestGlobalProxyDisabledStoreCleanupReconcilesJournal(t *testing.T) {
 	if st.SceneEnabled[SceneGlobal] {
 		t.Fatal("test requires disabled Store state")
 	}
-	if err := cleanupStoreRuntimeScenes(a, st); err != nil {
+	if err := a.saveStore(st); err != nil {
+		t.Fatal(err)
+	}
+	stubStoreTransitionCore(t)
+	if err := a.commitStoreMutation(st, func(*Store) error { return nil }, storeRuntimeSyncAll); err != nil {
 		t.Fatalf("disabled Store did not reconcile global journal: %v", err)
 	}
 	for _, path := range []string{profile, apt} {

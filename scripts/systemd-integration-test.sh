@@ -8,6 +8,7 @@ readonly CURRENT_CONTAINER_BUNDLE="/artifacts/current-amd64-bundle.tar.gz"
 readonly BASELINE_CONTAINER_BUNDLE="/artifacts/baseline-amd64-bundle.tar.gz"
 readonly V071_BUNDLE_SHA256="08a12e5716166c76095c54f6ea8227db8f623a719051479ceb7d6720c5c0da38"
 readonly V080_BUNDLE_SHA256="6f650d09dcb67d1f745b2e381e6358b2821253edea8b365415f9922e0bbe171a"
+readonly V092_BUNDLE_SHA256="0464e87cb15fbcfd6f967202d805f2d699952a5c12053b9392d1025d34368cdc"
 
 log() {
   printf '\n==> %s\n' "$*"
@@ -24,6 +25,7 @@ upgrade_baseline_identity() {
   case "$1" in
     "$V071_BUNDLE_SHA256") printf '%s\n' 'v0.7.1 1.22.12' ;;
     "$V080_BUNDLE_SHA256") printf '%s\n' 'v0.8.0 1.26.5' ;;
+    "$V092_BUNDLE_SHA256") printf '%s\n' 'v0.9.2 1.27.1' ;;
     *) fail "unsupported upgrade baseline bundle SHA256: $1" ;;
   esac
 }
@@ -421,8 +423,20 @@ HERMES_UNSAFE_ENV
     "unchanged system installation did not restart Hermes"
 
   write_hermes_layout_unit "$user_project" "$service_user" "$service_home" "$config_home"
+  # Program relocation can be validated anew; disappearance of owned proxy
+  # bytes is an administrator conflict and must not be silently reclaimed.
+  cp -p -- "$managed_drop_in" "$evidence_dir/hermes-layout-owned-drop-in"
   rm -- "$managed_drop_in"
   systemctl daemon-reload
+  expect_failure "boot reconciliation with missing owned Hermes drop-in" \
+    "$evidence_dir/hermes-layout-missing-owned.log" /usr/local/bin/proxyscene boot-restore
+  assert_no_path "$managed_drop_in"
+  assert_no_path /opt/proxyscene/runtime-transition.json
+  cp -p -- "$evidence_dir/hermes-layout-owned-drop-in" "$managed_drop_in"
+  systemctl daemon-reload
+  # The operator changed the gateway program. Start that program explicitly,
+  # as a normal boot would, before asking proxyscene to reconcile its proxy.
+  systemctl restart -- hermes-gateway.service
   systemctl start -- proxyscene-restore.service
   wait_for "boot reconciliation after return to user Hermes" assert_hermes_layout_runtime \
     "$user_project" "$service_uid" "$config_home" http://127.0.0.1:7892
@@ -437,6 +451,101 @@ HERMES_UNSAFE_ENV
   printf 'HERMES_LAYOUT_MIGRATION_OK system_to_user boot_restore tg_off actual_python_source\n'
 }
 
+assert_core_process_loaded() {
+  local label="$1" pid actual
+  pid="$(systemctl show --property=MainPID --value proxyscene.service)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || fail "$label has no MainPID"
+  assert_eq "$(stat -Lc '%d:%i' /opt/proxyscene/xray)" \
+    "$(stat -Lc '%d:%i' "/proc/$pid/exe")" "$label executable identity"
+  actual="$(tr '\0' '\n' < "/proc/$pid/cmdline")"
+  assert_eq $'/opt/proxyscene/xray\nrun\n-config\n/opt/proxyscene/config.json' "$actual" "$label argv"
+  wait_for "$label active service" service_is_active proxyscene.service
+}
+
+assert_core_loaded_receipt() {
+  local receipt=/opt/proxyscene/core-loaded.json
+  assert_file "$receipt"
+  assert_eq "$(sha256_file /opt/proxyscene/xray)" "$(jq -r .binary "$receipt")" "loaded binary digest"
+  assert_eq "$(sha256_file /opt/proxyscene/config.json)" "$(jq -r .config "$receipt")" "loaded config digest"
+  assert_eq "$(sha256_file /etc/systemd/system/proxyscene.service)" "$(jq -r .unit "$receipt")" "loaded unit digest"
+  assert_eq "$(systemctl show --property=InvocationID --value proxyscene.service)" \
+    "$(jq -r .invocation "$receipt")" "loaded service invocation"
+}
+
+runtime_transaction_canary() {
+  local test_root="$1" fault_bin="$2" old_port="$3"
+  local fault_mode marker before_store before_generation before_config before_profile before_apt
+  local candidate_port=$((old_port + 1)) pid invocation store_sha
+  local state=/opt/proxyscene/state.json receipt=/opt/proxyscene/runtime-transition.json
+  local trusted_fault_bin=/usr/local/sbin/systemctl
+
+  for fault_mode in core-restart-once core-kill-after-restart; do
+    log "real systemd runtime transaction recovery: $fault_mode"
+    before_store="$(jq -cS 'del(.generation)' "$state")"
+    before_generation="$(jq -r .generation "$state")"
+    before_config="$(sha256_file /opt/proxyscene/config.json)"
+    before_profile="$(sha256_file /etc/profile.d/proxyscene-global-proxy.sh)"
+    before_apt="$(sha256_file /etc/apt/apt.conf.d/99proxyscene-global-proxy)"
+    marker="/run/proxyscene-$fault_mode"
+    assert_no_path "$trusted_fault_bin"
+    assert_no_path "$marker"
+    install -m 0755 "$fault_bin" "$trusted_fault_bin"
+    expect_failure "$fault_mode" "$test_root/$fault_mode.log" \
+      env "PROXYSCENE_GLOBAL_HTTP_PORT=$candidate_port" \
+        "PROXYSCENE_FAULT_MODE=$fault_mode" "PROXYSCENE_FAULT_MARKER=$marker" \
+        /usr/local/bin/proxyscene global on
+    rm -f -- "$trusted_fault_bin"
+    assert_file "$marker"
+    if [[ "$fault_mode" == core-kill-after-restart ]]; then
+      assert_file "$receipt"
+      assert_json "$receipt" '.phase == "applying" and any(.steps[]; .name == "core" and .started == true)' \
+        "crash retained a started core plan"
+      assert_eq "$before_generation" "$(jq -r .generation "$state")" "crash did not commit Store"
+      wait_for "candidate listener before recovery" port_is_listening "$candidate_port"
+      expect_failure "pending transaction blocks mutations" "$test_root/pending-mutation.log" \
+        /usr/local/bin/proxyscene global off
+      assert_contains "$test_root/pending-mutation.log" 'proxyscene recover' "pending mutation guidance"
+      /usr/local/bin/proxyscene recover
+    fi
+    assert_no_path "$receipt"
+    assert_eq "$before_store" "$(jq -cS 'del(.generation)' "$state")" "$fault_mode restored Store semantics"
+    assert_eq "$before_generation" "$(jq -r .generation "$state")" "$fault_mode retained uncommitted Store generation"
+    cmp -- "$state" "$state.bak" || fail "$fault_mode Store backup differs"
+    assert_eq "$before_config" "$(sha256_file /opt/proxyscene/config.json)" "$fault_mode restored config"
+    assert_eq "$before_profile" "$(sha256_file /etc/profile.d/proxyscene-global-proxy.sh)" "$fault_mode retained profile"
+    assert_eq "$before_apt" "$(sha256_file /etc/apt/apt.conf.d/99proxyscene-global-proxy)" "$fault_mode retained apt proxy"
+    assert_core_process_loaded "$fault_mode compensated core"
+    wait_for "restored original listener" port_is_listening "$old_port"
+    wait_for "retired candidate listener" port_is_not_listening "$candidate_port"
+    /usr/local/bin/proxyscene global on
+    assert_core_loaded_receipt
+    printf 'RUNTIME_TRANSACTION_RECOVERY_VERIFIED mode=%s real_systemd=1\n' "$fault_mode"
+  done
+
+  log "unloaded core drop-in fails before Store, runtime files or process change"
+  pid="$(systemctl show --property=MainPID --value proxyscene.service)"
+  invocation="$(systemctl show --property=InvocationID --value proxyscene.service)"
+  store_sha="$(sha256_file "$state")"
+  before_config="$(sha256_file /opt/proxyscene/config.json)"
+  assert_no_path /etc/systemd/system/proxyscene.service.d
+  install -d -m 0755 /etc/systemd/system/proxyscene.service.d
+  printf '[Service]\nEnvironment=PROXYSCENE_CANARY_UNLOADED=1\n' \
+    > /etc/systemd/system/proxyscene.service.d/99-canary-unloaded.conf
+  chmod 0644 /etc/systemd/system/proxyscene.service.d/99-canary-unloaded.conf
+  expect_failure "unloaded core drop-in" "$test_root/core-drop-in.log" \
+    /usr/local/bin/proxyscene global on
+  assert_contains "$test_root/core-drop-in.log" 'drop-in' "unloaded core drop-in refusal"
+  assert_eq "$store_sha" "$(sha256_file "$state")" "unloaded drop-in preserved Store"
+  assert_eq "$before_config" "$(sha256_file /opt/proxyscene/config.json)" "unloaded drop-in preserved core config"
+  assert_eq "$pid" "$(systemctl show --property=MainPID --value proxyscene.service)" "unloaded drop-in preserved process"
+  assert_eq "$invocation" "$(systemctl show --property=InvocationID --value proxyscene.service)" "unloaded drop-in preserved invocation"
+  assert_no_path "$receipt"
+  rm -f -- /etc/systemd/system/proxyscene.service.d/99-canary-unloaded.conf
+  rmdir /etc/systemd/system/proxyscene.service.d
+  systemctl daemon-reload
+  printf 'CORE_UNLOADED_OVERRIDE_REFUSAL_VERIFIED real_systemd=1\n'
+}
+
 inside_container() {
   local current_archive="$1"
   local old_archive="$2"
@@ -445,6 +554,7 @@ inside_container() {
   local rollback_test_root rollback_output tampered_dir tamper_output
   local old_manager_sha old_state old_version custom_port node_url upgraded_global_port
   local baseline_identity baseline_version baseline_go_version
+  local upgrade_pid upgrade_invocation upgrade_executable legacy_snapshot path snapshot_name
   local oc_user oc_uid oc_group openclaw_config hermes_before openclaw_before count_after telegram_before
   local failure_output global_profile_original global_profile_concurrent global_apt_original
   local legacy_drop_in legacy_env legacy_state_tmp
@@ -558,6 +668,29 @@ mode="${PROXYSCENE_FAULT_MODE:-}"
 marker="${PROXYSCENE_FAULT_MARKER:-/run/proxyscene-integration-fault}"
 if [[ ! -e "$marker" ]]; then
   case "$mode" in
+    observe-upgrade)
+      if [[ "${1:-}" == show && "${*: -1}" == proxyscene.service ]]; then
+        pid="$(/usr/bin/systemctl show --property=MainPID --value proxyscene.service)"
+        if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && \
+          [[ "$(stat -Lc '%d:%i' "/proc/$pid/exe")" != "$(stat -Lc '%d:%i' /opt/proxyscene/xray)" ]]; then
+          : > "$marker"
+        fi
+      fi
+      ;;
+    core-restart-once)
+      if [[ "$*" == "restart -- proxyscene.service" ]]; then
+        : > "$marker"
+        exit 95
+      fi
+      ;;
+    core-kill-after-restart)
+      if [[ "$*" == "restart -- proxyscene.service" ]]; then
+        /usr/bin/systemctl "$@"
+        : > "$marker"
+        kill -KILL "$PPID"
+        exit 96
+      fi
+      ;;
     manager-init)
       if [[ "$#" -eq 1 && "$1" == "daemon-reload" ]]; then
         : > "$marker"
@@ -643,7 +776,7 @@ FAULT_SYSTEMCTL
     cd "$old_dir"
     case "$baseline_version" in
       v0.7.1) ./install.sh --offline "$node_url" ;;
-      v0.8.0)
+      v0.8.0|v0.9.2)
         ./install.sh --offline
         printf '%s\n' "$node_url" | /usr/local/bin/proxyscene node add --stdin
         ;;
@@ -668,20 +801,79 @@ FAULT_SYSTEMCTL
   case "$baseline_version" in
     v0.7.1)
       assert_json "$old_state" '.runtime_config == null' "v0.7.1 has no persisted runtime configuration"
-      upgraded_global_port=7890
+      upgraded_global_port="$custom_port"
       ;;
-    v0.8.0)
+    v0.8.0|v0.9.2)
       assert_json "$old_state" ".runtime_config.global_http_port == $custom_port" \
-        "v0.8.0 custom global port persisted before upgrade"
+        "$baseline_version custom global port persisted before upgrade"
       upgraded_global_port="$custom_port"
       ;;
   esac
 
-  log "upgrade $baseline_version in place from the current offline bundle"
+  upgrade_pid="$(systemctl show --property=MainPID --value proxyscene.service)"
+  upgrade_invocation="$(systemctl show --property=InvocationID --value proxyscene.service)"
+  upgrade_executable="$(stat -Lc '%d:%i' "/proc/$upgrade_pid/exe")"
+  if [[ "$baseline_version" == v0.7.1 ]]; then
+    log "legacy state without RuntimeConfig refuses migration and retains active runtime"
+    legacy_snapshot="$test_root/legacy-before"
+    install -d -m 0700 "$legacy_snapshot"
+    for path in /opt/proxyscene/state.json /opt/proxyscene/state.json.bak \
+      /opt/proxyscene/config.json /etc/systemd/system/proxyscene.service \
+      /etc/systemd/system/proxyscene-restore.service \
+      /etc/profile.d/proxyscene-global-proxy.sh /etc/apt/apt.conf.d/99proxyscene-global-proxy; do
+      snapshot_name="${path//\//_}"
+      if [[ -e "$path" ]]; then
+        cp -p -- "$path" "$legacy_snapshot/$snapshot_name"
+      fi
+    done
+    # Binary installation commits independently; missing historical runtime
+    # evidence must stop manager initialization before touching live resources.
+    # shellcheck disable=SC2016
+    expect_failure "unsupported v0.7.1 runtime migration" "$test_root/legacy-refusal.log" \
+      bash -c 'cd "$1" && exec ./install.sh --offline' _ "$current_dir"
+    assert_contains "$test_root/legacy-refusal.log" '缺少 RuntimeConfig' "legacy refusal reason"
+    assert_eq "$current_manager_sha" "$(sha256_file /usr/local/bin/proxyscene)" "verified manager retained after refusal"
+    assert_eq "$current_xray_sha" "$(sha256_file /opt/proxyscene/xray)" "verified Xray retained after refusal"
+    for path in /opt/proxyscene/state.json /opt/proxyscene/state.json.bak \
+      /opt/proxyscene/config.json /etc/systemd/system/proxyscene.service \
+      /etc/systemd/system/proxyscene-restore.service \
+      /etc/profile.d/proxyscene-global-proxy.sh /etc/apt/apt.conf.d/99proxyscene-global-proxy; do
+      snapshot_name="${path//\//_}"
+      if [[ -e "$legacy_snapshot/$snapshot_name" ]]; then
+        cmp -- "$legacy_snapshot/$snapshot_name" "$path" || fail "legacy runtime changed: $path"
+        assert_eq "$(stat -c '%u:%g:%a' "$legacy_snapshot/$snapshot_name")" \
+          "$(stat -c '%u:%g:%a' "$path")" "legacy runtime metadata $path"
+      else
+        assert_no_path "$path"
+      fi
+    done
+    assert_eq "$upgrade_pid" "$(systemctl show --property=MainPID --value proxyscene.service)" "legacy process retained"
+    assert_eq "$upgrade_invocation" "$(systemctl show --property=InvocationID --value proxyscene.service)" "legacy invocation retained"
+    assert_eq "$upgrade_executable" "$(stat -Lc '%d:%i' "/proc/$upgrade_pid/exe")" "legacy executable retained"
+    wait_for "legacy custom listener after refusal" port_is_listening "$custom_port"
+    assert_no_path /opt/proxyscene/runtime-transition.json
+    assert_no_path /opt/proxyscene/global-proxy-journal.json
+    printf 'LEGACY_MIGRATION_REFUSAL_VERIFIED baseline=%s runtime_unchanged=1 binaries_committed=1\n' "$baseline_version"
+    cleanup_inside
+    trap - EXIT
+    return 0
+  fi
+
+  log "upgrade $baseline_version in place with an active old executable"
+  install -m 0755 "$fault_bin" "$trusted_fault_bin"
   (
     cd "$current_dir"
-    ./install.sh --offline
+    PROXYSCENE_FAULT_MODE=observe-upgrade \
+      PROXYSCENE_FAULT_MARKER=/run/proxyscene-active-upgrade-observed \
+      ./install.sh --offline
   )
+  rm -f -- "$trusted_fault_bin"
+  assert_file /run/proxyscene-active-upgrade-observed
+  [[ "$(systemctl show --property=InvocationID --value proxyscene.service)" != "$upgrade_invocation" ]] \
+    || fail "upgrade did not replace the old service invocation"
+  assert_core_process_loaded "upgraded core"
+  assert_core_loaded_receipt
+  printf 'ACTIVE_BINARY_UPGRADE_VERIFIED baseline=%s\n' "$baseline_version"
   assert_eq "$current_manager_sha" "$(sha256_file /usr/local/bin/proxyscene)" \
     "upgraded manager SHA256"
   assert_eq "$current_xray_sha" "$(sha256_file /opt/proxyscene/xray)" \
@@ -712,6 +904,8 @@ FAULT_SYSTEMCTL
   assert_json /opt/proxyscene/config.json \
     ".inbounds[] | select(.tag == \"global-http\" and .port == $upgraded_global_port)" \
     "upgraded global inbound"
+
+  runtime_transaction_canary "$test_root" "$fault_bin" "$upgraded_global_port"
 
   log "custom runtime port survives a restore-unit start without caller environment"
   env "PROXYSCENE_GLOBAL_HTTP_PORT=$custom_port" /usr/local/bin/proxyscene global on
@@ -1117,12 +1311,20 @@ LEGACY_ENV
   hermes_before="$(target_start_count hermes)"
   rm -f /run/proxyscene-telegram-reload-crash
   failure_output="$test_root/telegram-reload-crash.log"
+  # User systemd commands run as their persisted UID; the shared helper must
+  # be traversable by that UID instead of living below the root-only fixture.
+  assert_no_path "$trusted_fault_bin"
+  install -m 0755 "$fault_bin" "$trusted_fault_bin"
   expect_failure "Telegram cleanup crash after unlink" "$failure_output" \
-    env "PATH=$fault_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    env \
       PROXYSCENE_FAULT_MODE=kill-daemon-reload \
       PROXYSCENE_FAULT_MARKER=/run/proxyscene-telegram-reload-crash \
       /usr/local/bin/proxyscene tg off
-  assert_file /run/proxyscene-telegram-reload-crash
+  rm -f -- "$trusted_fault_bin"
+  if [[ ! -f /run/proxyscene-telegram-reload-crash ]]; then
+    cat -- "$failure_output" >&2
+    fail "Telegram cleanup did not reach the crash injection point"
+  fi
   assert_json "$old_state" '.scene_enabled.telegram == true' \
     "crashed Telegram cleanup left durable enabled state"
   assert_no_path /etc/openclaw-hermes-tg-proxy.env
@@ -1135,6 +1337,14 @@ LEGACY_ENV
     '.channels.telegram.proxy == "http://127.0.0.1:7892"' \
     "OpenClaw ownership survived earlier Hermes cleanup crash"
 
+  assert_file /opt/proxyscene/runtime-transition.json
+  expect_failure "Telegram mutation while recovery is pending" "$test_root/telegram-pending.log" \
+    /usr/local/bin/proxyscene tg off
+  /usr/local/bin/proxyscene recover
+  assert_no_path /opt/proxyscene/runtime-transition.json
+  assert_json "$old_state" '.scene_enabled.telegram == true' "Telegram recovery compensated to enabled scene"
+  assert_file /etc/systemd/system/hermes-gateway.service.d/90-proxyscene-telegram-proxy.conf
+  wait_for "Hermes compensation restart" target_start_count_greater_than hermes "$hermes_before"
   /usr/local/bin/proxyscene tg off
   assert_json "$old_state" '.scene_enabled.telegram == false' "Telegram retry disabled scene"
   assert_json "$old_state" '.telegram_targets | length == 0' \
@@ -1164,9 +1374,25 @@ LEGACY_ENV
 
   log "uninstall retries after restore-unit/main-unit partial completion"
   global_profile_concurrent='# operator replaced the profile while proxyscene was active'
+  cp -p -- /etc/profile.d/proxyscene-global-proxy.sh "$test_root/global-owned-profile"
+  cp -p -- "$old_state" "$test_root/global-before-conflict-state"
   printf '%s\n' "$global_profile_concurrent" > /etc/profile.d/proxyscene-global-proxy.sh
   chmod 0644 /etc/profile.d/proxyscene-global-proxy.sh
+  expect_failure "global ownership divergence" "$test_root/global-ownership-conflict.log" \
+    /usr/local/bin/proxyscene global off
+  assert_contains "$test_root/global-ownership-conflict.log" 'ownership' "global conflict reason"
+  cmp -- "$old_state" "$test_root/global-before-conflict-state" || fail "global conflict changed Store"
+  assert_eq "$global_profile_concurrent" \
+    "$(tr -d '\r\n' < /etc/profile.d/proxyscene-global-proxy.sh)" "global conflict retained administrator content"
+  assert_no_path /opt/proxyscene/runtime-transition.json
+  # Explicit fixture repair represents the operator resolving the ownership
+  # conflict; no manager command is allowed to silently claim the replacement.
+  cp -p -- "$test_root/global-owned-profile" /etc/profile.d/proxyscene-global-proxy.sh
   /usr/local/bin/proxyscene global off
+  assert_eq "$global_profile_original" \
+    "$(tr -d '\r\n' < /etc/profile.d/proxyscene-global-proxy.sh)" "global off restored original profile"
+  printf '%s\n' "$global_profile_concurrent" > /etc/profile.d/proxyscene-global-proxy.sh
+  chmod 0644 /etc/profile.d/proxyscene-global-proxy.sh
   assert_json "$old_state" \
     '(.scene_enabled.global == false) and (.scene_enabled.dev == false) and (.scene_enabled.telegram == false)' \
     "all scenes disabled before uninstall"

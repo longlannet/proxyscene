@@ -17,13 +17,14 @@
 - 单二进制 Go 管理程序，安装后命令为 `proxyscene`。
 - Release 的 `checksums.txt` 覆盖版本化 `install.sh`、管理程序包、离线 bundle 和固定 Xray 对应源码归档；安装器解析 `latest` 后固定到一个明确 tag，再按 SHA256 校验下载内容。
 - 支持离线安装：先用 Release checksum 校验自包含 bundle，解压后显式运行 `install.sh --offline`；包内 manifest 会在复制前复核全部组件。
+- 支持内置检查更新与手动升级：显示正式版本和更新说明，验证 GitHub 发布身份后，从 `dl.ll.cd` 或 GitHub 下载完整 bundle，并复用安装器升级。
 - GitHub Actions 从 `main` 手动发起发布，交叉编译 amd64/arm64/386/armv7；检查通过并发布 GitHub immutable Latest、完成发布后校验，再同步并验收 `dl.ll.cd`。
 - 支持 Xray 主服务和开机恢复服务的 systemd 管理。
 - 支持三类代理场景：
   - 全局代理：写入系统 profile 和 apt 代理配置。
   - 开发代理：为目标用户设置 git/npm 代理，并在关闭时恢复。
   - Telegram 服务代理：为 Hermes systemd 服务注入专用环境，并事务化托管用户级 OpenClaw 的 Telegram 配置。
-- 支持多节点管理：添加、删除、改名、列表、订阅导入、测速、自动选择。
+- 支持多节点管理：添加、删除、改名、列表、订阅导入与更新、测速、自动选择。
 - 支持基础节点协议解析：VLESS、VMess、Trojan、Shadowsocks。
 - 支持按场景选择不同节点。
 - 状态文件带进程锁，避免多个管理进程并发写入造成覆盖。
@@ -301,7 +302,11 @@ sudo proxyscene status
 > 离线安装（见上文「方式一」）只在显式给出 `--offline` 时启用。安装器会先校验完整内部 manifest 和所有 ELF 架构，再进行文件替换；同目录存在二进制不会触发自动离线模式。
 > 运行 `proxyscene version` 可查看已安装的版本与 commit（预编译二进制会在构建时注入 git tag 与 commit）。
 
-安装器对本次管理程序、Xray、许可证、源码说明和版本标记文件的替换保留逐文件备份；下载、校验或文件替换失败时会尝试恢复。文件全部就绪后，安装器先提交这些依赖，再调用管理程序初始化：若初始化在写入用户、systemd unit、状态或配置后失败，已验证文件会保留，避免 unit 指向被回滚或不存在的二进制，并提示修复原因后执行 `sudo proxyscene install --skip-node` 重试。软件包管理器和管理程序内部副作用不属于文件事务。下载、备份、模块缓存、构建缓存和 GOPATH 位于 root-only 的 `/run/proxyscene-install-tmp/transaction.*`，提交或回滚时删除；因为 `/run` 通常挂载为 `noexec`，源码编译临时下载的可执行 Go 工具链会放在已验证 CoreDir 内的隐藏临时目录，并在提交或回滚时删除。安装器不会替换 `/usr/local/go`，固定的空事务根目录会保留供后续安装复用。
+安装器对本次管理程序、Xray、许可证、源码说明和版本标记文件的替换保留逐文件备份；下载、校验或文件替换失败时会尝试恢复。文件全部就绪后，安装器先提交这些依赖，再调用管理程序初始化：若初始化在写入用户、systemd unit、状态或配置后失败，已验证文件会保留，避免 unit 指向被回滚或不存在的二进制，并提示修复原因后执行 `sudo proxyscene install --skip-node` 重试；若提示存在未完成运行事务，须先按下文执行 `sudo proxyscene recover`。软件包管理器、管理服务的初始账号和 unit 创建不属于安装器文件事务；已经进入运行事务的变更由管理程序自己的恢复记录处理。下载、备份、模块缓存、构建缓存和 GOPATH 位于 root-only 的 `/run/proxyscene-install-tmp/transaction.*`，提交或回滚时删除；因为 `/run` 通常挂载为 `noexec`，源码编译临时下载的可执行 Go 工具链会放在已验证 CoreDir 内的隐藏临时目录，并在提交或回滚时删除。安装器不会替换 `/usr/local/go`，固定的空事务根目录会保留供后续安装复用。
+
+安装器已经独立提交新 Xray 后，管理程序会单独验证仍在运行的旧进程，并在切换前检查新版能否读取补偿所需的旧配置。运行事务失败时恢复旧配置，必要时由已安装的新版 Xray 重新加载；这一恢复不回退安装器已提交的 Xray 版本。
+
+已有 `RuntimeConfig` 的安装修复会先记录原有核心 unit、配置和权限，再通过运行事务修改；只有通过无历史运行状态预检的新安装才提前创建初始服务账号和主 unit。开机恢复 unit 在运行配置提交成功后安装并启用。如果提示“运行配置已提交，但开机恢复服务安装失败”，当前运行配置已经生效，开机恢复尚未完成；修复原因后执行 `sudo proxyscene install --skip-node` 重试。
 
 ### 安装脚本是否交互式
 
@@ -313,7 +318,7 @@ sudo proxyscene status
 
 安装器拒绝所有位置参数，不支持在安装命令中直接携带节点 URL。
 
-订阅链接不在 `install` 中录入，订阅应通过节点管理导入：
+订阅链接不在 `install` 中录入；可在主菜单的「订阅管理」中添加，也可以用命令导入：
 
 ```bash
 sudo proxyscene node import --stdin
@@ -327,17 +332,23 @@ sudo proxyscene node import --stdin
 sudo proxyscene
 ```
 
-主菜单包含：
+主页显示三个场景的配置开关、各自选用的节点，以及节点是「跟随默认」还是「单独指定」。开关项直接显示即将执行的动作，例如「开启全局代理」或「关闭全局代理」。
 
-1. 初始化/更新管理服务。
-2. 切换全局代理。
-3. 切换开发代理。
-4. 切换 Telegram 服务代理。
-5. 节点管理。
-6. 测试代理。
-7. 查看状态。
-8. 卸载。
-9. 退出。
+| 输入 | 操作 |
+| --- | --- |
+| `1` | 开启或关闭全局代理 |
+| `2` | 开启或关闭开发代理 |
+| `3` | 开启或关闭 Telegram 服务代理 |
+| `4` | 节点管理 |
+| `5` | 订阅管理 |
+| `6` | 状态与连接检测 |
+| `7` | 程序更新：检查版本、选择下载来源并升级 |
+| `8` | 安装与维护：初始化/修复管理服务、卸载服务 |
+| `0` / `q` | 退出（兼容原来的 `9`） |
+
+子菜单使用 `0` 或 `q` 返回；输入结束时取消当前操作。主页不会自动测速或发起网络连通性检查，需要时在「状态与连接检测」中手动执行。Telegram 的配置开关只表示代理配置意图，实际连接和服务状态应查看诊断结果。
+
+维护菜单中的卸载会关闭已托管的代理、移除 systemd 服务，并保留数据目录。程序会先说明影响，只有明确确认才执行；直接回车、`q` 或输入结束均不会卸载。
 
 ### 初始化
 
@@ -345,6 +356,28 @@ sudo proxyscene
 sudo proxyscene install
 sudo proxyscene install --skip-node
 ```
+
+此命令初始化或修复 systemd 服务和运行配置，不下载新版程序。升级程序使用下面的 `update` 命令或主菜单中的「程序更新」。
+
+### 检查更新与升级程序
+
+```bash
+proxyscene update --check                    # 只读检查，显示当前版本、最新正式版本和更新说明
+sudo proxyscene update                       # 下载并校验后，确认执行升级
+sudo proxyscene update --yes                 # 明确同意升级，适用于非交互调用
+sudo proxyscene update --source github       # 从 GitHub 下载 bundle
+sudo proxyscene update --source mirror       # 从 dl.ll.cd 下载 bundle（默认）
+```
+
+`--check` 不需要 root，不安装文件或修改配置。实际升级需要 root，默认下载 `dl.ll.cd` 上对应固定 tag 的 bundle；两种下载来源都必须先通过 GitHub 验证，不支持自定义仓库、下载地址或仅凭镜像认证。GitHub 不可访问、镜像尚未发布目标版本或任何校验失败时，命令会终止；可以用 `--source github` 明确选择 GitHub 下载。
+
+检查会固定 GitHub 的最新正式 immutable Release，核对 tag 对应 commit、11 项资产及其 GitHub SHA256 digest。升级时再从 GitHub 下载并验证 `checksums.txt` 和安装包摘要。下载后还会限制解压路径、文件类型与大小，验证包内 manifest、程序架构及 Go 模块身份；版本和 commit 由已验证的 GitHub 发布身份与完整归档 SHA256 绑定。通过后调用包内安装器完成升级。更新说明只作显示，不执行其中的命令。
+
+自动升级只接受高于当前版本的正式稳定版本，没有强制降级参数。`dev`、缺少 commit 或从已配置安装路径之外运行的程序不能自动安装更新；应先使用经过验证的 Release bundle 完成安装。相同版本的 commit 身份不一致也会拒绝继续。升级前还会检查正在运行的程序与安装文件是否一致；安装器取得安装锁后再次核对原程序 SHA256，防止另一个进程已经升级后，旧进程又覆盖它。
+
+升级保留四个安装定位配置：`PROXYSCENE_MANAGER_DIR`、`PROXYSCENE_SWITCH_BIN`、`PROXYSCENE_SYSTEMD_SERVICE_NAME` 和 `PROXYSCENE_BOOT_RESTORE_SERVICE_NAME`。端口、代理目标等运行配置从已有状态文件读取，不继承本次调用环境中的临时运行参数。自定义安装应沿用安装时的定位配置。升级包含 bundle 内的固定 Xray，并会执行管理服务初始化，可能重启相关服务；它不是只替换一个命令文件。
+
+下载和验证在管理目录内的 root-only 临时目录中完成，正常结束时清理。安装器启动前失败不会替换正式文件；文件替换阶段失败会由既有文件事务尝试回滚。如果文件已提交、后续管理服务初始化失败，新程序和配套文件会保留。此时先运行 `proxyscene version` 确认版本；若有未完成运行事务，先执行 `sudo proxyscene recover`。修复提示的问题后再执行 `sudo proxyscene install --skip-node`，不能将失败理解为整套系统已回到旧版。主菜单一旦启动安装器，无论成功或失败都会退出，后续操作须重新打开程序，避免旧进程继续写入新版状态。
 
 ### 状态查看
 
@@ -371,6 +404,24 @@ sudo proxyscene dev
 sudo proxyscene tg
 ```
 
+单独切换场景会协调该场景和共享的 Xray 核心；同时显式修改了其他场景的端口、用户或目标等运行参数时，已启用或仍有接管记录的相应场景也会纳入计划。只更换上游节点时主要更新 Xray，Telegram 客户端的托管配置未变就不会因此重启网关。
+
+### 运行事务与故障恢复
+
+运行变更先按影响范围完成目标发现、身份与 ownership 校验、场景资源检查，再用私有临时配置验证 Xray。预检无法确认目标或历史状态时会停止，不先改写正式核心配置、场景代理文件或协调服务。配置、文件或身份在规划后变化也会拒绝继续；错误会保留具体原因。
+
+执行前，程序在核心目录保存 `runtime-transition.json`，固定本次涉及的目标、原值和执行进度。执行失败时只补偿已经开始的步骤。若补偿或最终提交确认未完成，记录会保留，新的状态修改和初始化会拒绝继续。按照提示处理冲突后执行：
+
+```bash
+sudo proxyscene recover
+```
+
+`recover` 会修改配置或协调记录中的服务。它只使用已有事务计划：候选状态已提交到主状态文件时完成收尾，否则逆序恢复已开始的步骤；不会重新发现目标或额外接管服务。身份或配置仍有冲突时继续保留记录，可在冲突解决后重试。不要通过删除 `runtime-transition.json` 或各场景 journal 绕过恢复检查。
+
+`boot-restore` 遇到未完成运行事务时，同样先执行固定恢复，完成后立即返回，本次不再协调其他场景。没有未完成事务时，才按已保存配置规划正常开机恢复。
+
+节点改名、保存 TCP 测试结果和订阅更新属于状态编辑，保留原有运行配置，不因本次环境变量而迁移代理设置。它们也会在存在未完成运行事务时拒绝提交。旧状态若缺少历史 `RuntimeConfig`，但仍有开启场景、核心配置或接管记录，运行变更会拒绝猜测；应先核验旧配置和备份，而不是补入当前环境参数后重试。只有旧场景 journal、没有完整运行事务记录的异常，`recover` 也不会自动推导历史计划。
+
 ### 节点管理
 
 打开节点管理菜单：
@@ -378,6 +429,12 @@ sudo proxyscene tg
 ```bash
 sudo proxyscene node
 ```
+
+节点菜单提供查看、选用、添加、TCP 测试、按 TCP 延迟选用、改名和删除。节点可用列表序号、完整 ID 或唯一短 ID 选择；列表同时标注默认节点和各场景的实际用途。订阅导入已集中在主菜单的「订阅管理」。
+
+选用节点时先选节点、再选作用范围，并预览受影响的场景后确认。添加节点默认只保存，首个节点会成为默认节点；已有节点时，可另行确认同时修改默认节点。删除会先展示默认节点及场景的变化，删除最后一个节点会关闭所有代理场景，默认不执行。交互期间节点或配置被其他命令改变时，提交会拒绝旧的选择，需重新查看并确认。
+
+TCP 测试测量节点地址的连接延迟，不代表代理能正常出网或实际带宽。「按 TCP 延迟选用」会先测试，再展示候选节点和影响范围，确认后才切换。
 
 查看节点列表：
 
@@ -431,6 +488,25 @@ sudo proxyscene node remove '节点ID'
 sudo proxyscene node rename '节点ID' '新备注'
 ```
 
+### 订阅管理
+
+主菜单中的「订阅管理」提供添加/导入、更新单个和更新全部三个入口。更新全部需确认，直接回车默认取消；列表为空时会提示先添加订阅。也可以使用以下命令：
+
+```bash
+sudo proxyscene subscription                 # 打开订阅菜单
+sudo proxyscene subscription list            # 查看订阅列表
+sudo proxyscene subscription update 1        # 更新列表中的第 1 个订阅
+sudo proxyscene subscription update --all    # 更新全部订阅
+```
+
+单个订阅也可以用唯一的 ID 前缀或完整 ID 指定。列表展示短 ID 和主机名，不显示带 token 的订阅地址。首次通过 `node import --stdin` 导入会记录节点来源；再次导入同一订阅链接会执行更新。
+
+更新按节点链接同步：已有链接保留节点 ID、自定义备注和场景绑定，新链接加入节点列表。地址或密码变化按新节点处理，不根据同名备注猜测替换关系。一个节点可以来自多个订阅，只有所有来源都不再提供它，且它未被默认节点或任意场景选中时，才会自动删除。手动添加的节点和未记录来源的旧节点始终保留；已选中但订阅中已下线的节点会保留并提醒，手动切换后可在下次更新时清理。
+
+更新接受完整的节点 URI 列表或其 Base64 编码，不支持 Clash YAML；首次导入仍可从文本中提取节点链接。更新全部会先下载并校验全部订阅，再一次性保存。任一下载失败、内容为空、列表含无效条目或解析失败，均不修改节点和订阅状态；下载期间状态被其他命令修改时也会拒绝提交，需重试。单次更新的下载总时限为 2 分钟，条目总数上限为 4096（包括跨订阅重复条目），超额可分别更新。HTTP 和私网订阅仍使用下文的显式兼容开关。
+
+订阅更新需手动触发，不定时运行，也不自动测速或切换节点。写入节点来源信息后，旧版程序无法读取新状态；需要降级时，应使用升级前的整套备份，并按原有运行时恢复要求操作。
+
 ### 测试代理
 
 ```bash
@@ -462,7 +538,7 @@ sudo proxyscene global off
 首次写入前，程序会把这两个专用路径的原始存在状态、内容、权限和本次托管内容记录到
 `/opt/proxyscene/global-proxy-journal.json`。关闭或卸载只恢复仍与 journal 中托管内容逐字节匹配的文件；
 原文件会按原内容和权限恢复，原本不存在的文件才会删除。没有 journal 时不会按路径或内容猜测并删除文件；
-托管期间被管理员修改的普通文件会作为管理员的新原值保留，并在恢复其它受管文件后释放 ownership。
+运行事务预检发现文件与 journal 中受管内容或元数据不符时，会保留文件和 ownership 并拒绝继续；应先核验管理员修改与原始备份。
 
 默认监听地址：
 
@@ -621,7 +697,7 @@ HTTP  : 127.0.0.1:7892
 SOCKS : 127.0.0.1:7893
 ```
 
-默认目标服务（锚定规范的系统级 hermes 网关和 root 用户级 hermes 网关；OpenClaw 网关、hermes 的 profile 实例、其它用户级单元都由自动发现覆盖；目标不存在时会跳过，不生成 phantom drop-in）：
+默认目标服务（锚定规范的系统级 hermes 网关和 root 用户级 hermes 网关；OpenClaw 网关、hermes 的 profile 实例、其它用户级单元都由自动发现覆盖；目标确认不存在且尚未接管时会跳过，不生成多余 drop-in）：
 
 ```text
 hermes-gateway user:root:hermes-gateway
@@ -631,6 +707,9 @@ hermes-gateway user:root:hermes-gateway
 
 - 按 systemd 搜索优先级选择同名单元，尊重高优先级覆盖、mask、alias、runtime/generator 单元和 drop-in；解析
   `Environment`、`UnsetEnvironment` 与 `ExecStart=` reset 后的最终结果，而不是按文件名或文本子串猜测。
+- 可靠确认不存在或被屏蔽的未接管候选可以跳过；悬空链接、别名循环、读取错误和相关指令解析失败会中止预检，
+  不会被当作“没有网关”。无法证明无关的损坏别名也会报错，需按提示核验该 unit 后重试。
+  已接管目标从发现结果中消失，不代表可以清理其配置。明确关闭缺失或被屏蔽的目标，还须确认服务已经停止。
 - 运行时校验拒绝有效 systemd specifier、`ExecStart` 的 `$` 展开、启动前后钩子、`PAMName`、`DynamicUser`，以及会让服务看到
   不同文件树的 `RootDirectory`/`RootImage`、bind/image/extension/tmpfs/inaccessible namespace 和 `ProtectHome` 设置。
   Hermes 官方的 `ExecStop=-<PROJECT_ROOT>/venv/bin/python -m gateway.systemd_stop_mark` 和
@@ -645,12 +724,13 @@ hermes-gateway user:root:hermes-gateway
 
 目标服务支持两种写法：
 
-- 系统级 systemd 服务：`hermes-gateway` 或实际消费 `TELEGRAM_PROXY` 的自定义服务名。
+- 系统级 systemd 服务：`hermes-gateway` 或使用受支持启动方式的自定义 Hermes 网关服务名。
 - 用户级 systemd 服务：`user:用户名:服务名`，例如 `user:alice:hermes-gateway-coder`。
 
 最终目标由“配置的锚定目标 + 自动发现目标”合并去重得到。设置 `PROXYSCENE_TG_SERVICES` 会替换默认锚定列表，
 但不会关闭精确自动发现。新接管的 Hermes 和 OpenClaw 目标分别记录在独立的持久化 ownership journal 中；
-`state.json` 的 `telegram_targets` 只保留用于旧版本 drop-in 的保守迁移。关闭、卸载或崩溃后重试不依赖当前发现结果。
+`state.json` 的 `telegram_targets` 只保留用于旧版本 drop-in 的保守迁移。关闭和卸载依据已有 ownership 及严格的历史证据规划；崩溃后的 `recover` 只续跑已经固定的事务计划。
+旧系统级 Telegram 记录需同时匹配历史运行配置和确切的受管文件，才能显式 `tg off` 后重新开启；旧 EnvironmentFile 尚在时，直接 `tg on` 会保守拒绝。旧用户级记录缺少稳定身份时不会按同名用户自动迁移。
 
 可以通过 `PROXYSCENE_TG_SERVICES` 替换默认锚定目标：
 
@@ -660,12 +740,13 @@ sudo PROXYSCENE_TG_SERVICES='user:alice:hermes-gateway-coder' proxyscene tg off
 ```
 
 关闭 Telegram 服务代理时，程序只删除内容仍与 Hermes journal 匹配的 direct drop-in；对 OpenClaw 则恢复 journal 中记录的精确原值
-（包括 absent、null 或字符串）和原容器结构。相关服务 `try-restart` 成功后才释放 ownership；若配置在托管期间被用户
-改动，会保留用户的新值；ownership 只在相关服务成功重载该值后释放。清理以 journal 和严格的旧版迁移证据为准，不要求关闭时
-重复开启时的 `PROXYSCENE_TG_SERVICES`。
+（包括 absent、null 或字符串）和原容器结构。运行事务预检发现受管内容与 journal 不符、身份无法确认或历史证据不足时，
+会保留现状和 ownership 并停止；不会把发现失败当作退管授权。同一用户共享的 OpenClaw 配置必须获得全部相关目标的退管授权。
+清理以 journal 和严格的旧版迁移证据为准，不要求关闭时重复开启时的 `PROXYSCENE_TG_SERVICES`。
 
-每次 `tg on` 和 `boot-restore` 都会依据 Hermes journal 协调目标。prepared/restoring 阶段会重放未完成的
-`daemon-reload` 与 `try-restart`；active 且字节未变化时不做无意义重启。若 reload/restart 失败，journal 保留待重试状态。
+正常 `tg on` 和开机恢复会在固定计划内协调目标；active 且受管内容未变化时不重启网关。执行中的 reload/restart 失败由
+运行事务尝试补偿，未完成时保留外层恢复记录和相关 journal，后续使用 `proxyscene recover` 续跑。单独遗留的旧
+prepared/restoring journal 会阻止新事务，不能通过重新发现目标或删除记录来跳过。
 
 ## 配置环境变量
 
@@ -722,14 +803,14 @@ sudo XRAY_RELEASE_BASE=https://mirror.example/xray/v26.9.9 bash ./install.sh
 | `PROXYSCENE_TG_SOCKS_PORT` | `7893` | Telegram SOCKS 代理端口。 |
 | `PROXYSCENE_GLOBAL_SOCKS_PORT` | `7894` | 全局 SOCKS 代理端口。 |
 | `PROXYSCENE_DEV_TARGET_USER` | 空 | 开发代理要修改 git/npm 配置的目标用户。 |
-| `PROXYSCENE_TG_SERVICES` | `hermes-gateway user:root:hermes-gateway` | Telegram 代理的手动 systemd 目标服务列表（默认锚定系统级 hermes 网关和 root 用户级 hermes 网关，目标不存在时跳过）；程序还会自动发现 OpenClaw/Hermes 的系统级和用户级网关，用户级服务使用 `user:用户名:服务名`。 |
+| `PROXYSCENE_TG_SERVICES` | `hermes-gateway user:root:hermes-gateway` | Telegram 代理的手动 systemd 目标服务列表（默认锚定系统级 hermes 网关和 root 用户级 hermes 网关，目标确认不存在且未接管时跳过）；程序还会自动发现 OpenClaw/Hermes 的系统级和用户级网关，用户级服务使用 `user:用户名:服务名`。 |
 | `PROXYSCENE_MANAGE_OPENCLAW_CONFIG` | `1` | 设为 `0` 时不接管用户级 OpenClaw 的 `channels.telegram.proxy`；Hermes 注入不受影响。 |
 | `PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION` | `0` | 默认拒绝明文 HTTP 订阅；确需导入 HTTP 订阅时设为 `1`，程序会打印风险警告。 |
 | `PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION` | `0` | 默认拒绝订阅链接解析到环回/私网/链路本地/CGNAT 等非公网地址（含重定向跳转），以防 SSRF；订阅托管在内网时设为 `1`。 |
 | `PROXYSCENE_ALLOW_PUBLIC_BIND` | `0` | 代理监听地址默认只允许环回。本地 HTTP/SOCKS 入站无认证，绑定 `0.0.0.0` 或公网 IP 会形成开放代理；确需对外监听时设为 `1`。 |
 | `PROXYSCENE_TEST_URL` | `https://www.google.com/generate_204` | `proxyscene test` 通过全局代理测试连通性时请求的地址；必须是 http(s) URL，可改为在你的网络环境下更可达的目标。 |
 
-监听地址、端口、Xray 服务用户、开发目标用户、Telegram 目标、OpenClaw 接管开关和公开监听开关会在成功的管理操作中写入 `state.json`。后续普通命令会先读取这些值，再应用本次显式提供且有效的环境覆盖；`boot-restore` 和卸载只使用已提交的持久化值。定位目录/二进制/unit 名称仍由 restore unit 保存，订阅安全开关和测试 URL 不持久化。
+监听地址、端口、Xray 服务用户、开发目标用户、Telegram 目标、OpenClaw 接管开关和公开监听开关会在成功的运行变更中写入 `state.json`；仅编辑节点备注、测速结果或订阅时保留原运行配置。后续普通命令会先读取这些值，再应用本次显式提供且有效的环境覆盖；`boot-restore` 和卸载只使用已提交的持久化值。定位目录/二进制/unit 名称仍由 restore unit 保存，订阅安全开关和测试 URL 不持久化。
 
 示例：
 
@@ -757,7 +838,9 @@ sudo PROXYSCENE_TG_SERVICES='user:alice:hermes-gateway-coder' proxyscene tg on
 | `/opt/proxyscene/SOURCE-Xray` | 固定 Xray ELF 的版本、提交和同一 Release 对应源码归档说明。 |
 | `/opt/proxyscene/THIRD_PARTY_LICENSES-Xray` | 固定 Xray ELF 实际链接模块的版本、module sum、许可证和 NOTICE。 |
 | `/opt/proxyscene/config.json` | 生成的 Xray 配置。 |
-| `/opt/proxyscene/state.json` | 节点、场景、订阅、测速状态、运行配置和旧版 Telegram 目标迁移证据。 |
+| `/opt/proxyscene/state.json` | 已提交的节点、场景、订阅、测速状态、运行配置和旧版 Telegram 目标迁移证据；另有 `state.json.bak`。 |
+| `/opt/proxyscene/runtime-transition.json` | 未完成运行事务的固定目标、原值和进度；使用 `proxyscene recover` 恢复，完成后删除。 |
+| `/opt/proxyscene/core-loaded.json` | 核心已加载配置的摘要和运行代际证据，用于确认可跳过重复重启。 |
 | `/opt/proxyscene/.state.lock` | 状态文件锁。 |
 | `/opt/proxyscene/installation-ownership.json` | 绑定核心目录、管理程序和两个 systemd unit locator 的安装 ownership。 |
 | `/opt/proxyscene/dev-proxy-backup.json` | 开发代理 git/npm 配置备份。 |
@@ -793,9 +876,9 @@ drop-in、OpenClaw 配置以及对应 journal/backup，保留 root-only 证据�
 | 服务 | 说明 |
 | --- | --- |
 | `proxyscene.service` | Xray 主服务。 |
-| `proxyscene-restore.service` | 开机恢复服务，读取保存的场景状态并恢复。 |
+| `proxyscene-restore.service` | 开机恢复服务；有未完成事务时只续跑固定恢复并返回，否则按保存状态协调场景。 |
 
-开机恢复 Telegram 场景时，Hermes/OpenClaw 只在 ownership journal 尚待协调或托管内容实际变化时重载相关服务。
+没有未完成运行事务时，开机恢复会重新做只读预检并固定计划；Telegram 托管内容未变化时不重启网关。预检发现旧 journal 待恢复、目标不明或历史配置不足时会报错并保留证据。
 
 常用检查命令：
 
@@ -808,6 +891,10 @@ journalctl -u proxyscene.service -e
 当全部场景关闭时，管理器会停止并禁用 Xray 主服务。当任意场景开启时，管理器会只为已开启场景生成对应监听端口，并启动 Xray 主服务。场景切换失败时会尽量回滚场景状态、代理环境和 Xray 服务配置。
 
 Xray 主服务默认使用专用系统用户 `proxyscene` 运行，并启用 systemd 沙箱选项，包括 `NoNewPrivileges`、`PrivateTmp`、`PrivateDevices`、`ProtectSystem=strict`、`ProtectHome`、`RestrictAddressFamilies` 和最小化 capability 集。程序会把核心目录和 Xray 配置文件调整为该服务用户所属组可读，以便非 root 服务读取配置和数据文件。
+
+核心协调要求有效 unit 直接调用本安装的 Xray 和固定配置，并使用已绑定的服务账号。发现额外 systemd drop-in、替换的启动命令或账号，或无法把实际 MainPID 绑定到该二进制、参数和服务时会停止；已有事务会保留恢复记录。配置摘要相同也必须通过实际运行身份验证，才能跳过重启。
+
+为避免歧义解析 systemd 的执行信息，核心执行路径不支持空白、反斜杠、分号或花括号；默认 `/opt/proxyscene` 路径不受影响。
 
 ## 卸载
 
@@ -847,7 +934,7 @@ sudo rm -rf /opt/proxyscene
 
 卸载会同时读取 Global、Hermes、OpenClaw ownership journal 和旧版状态迁移证据清理已接管目标；不需要重新提供开启时的
 `PROXYSCENE_TG_SERVICES`。外部固定路径可能包含已恢复的管理员原文件或无法证明归属的旧文件，不应在“彻底清理”时按路径盲删。
-若卸载报告 ownership 恢复或服务重启失败，不要先删除核心目录中的 journal，修复原因后重试。
+若卸载报告 ownership 恢复或服务重启失败，不要删除核心目录中的恢复记录；修复原因后，若存在未完成运行事务，先执行 `sudo proxyscene recover`，再重试卸载。
 所有会修改主机状态的命令还会校验固定的主机 ownership 记录，防止两个不同 CoreDir 同时对 `/etc` 和同一用户配置做嵌套接管；只有共享资源和 systemd unit 都成功清理后，卸载才会释放它。
 
 ## 手动构建
@@ -874,7 +961,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./dist/proxyscene ./cmd/pro
 gh workflow run Release --ref main -f version=v0.9.2
 ```
 
-不要预先创建或推送 tag。工作流首先要求仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`；未配置或停用镜像时，在构建和创建 GitHub Release 前失败。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 v0.7.1、v0.8.0 到新版本的 Debian systemd 安装/升级 canary。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
+不要预先创建或推送 tag。工作流首先要求仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`；未配置或停用镜像时，在构建和创建 GitHub Release 前失败。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 Debian systemd 安装、v0.8.0/v0.9.2 升级和事务故障恢复 canary；v0.7.1 则验证缺少历史运行配置时的安全拒绝。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
 
 上述 GitHub 发布和只读验证全部成功后，正式 Release 必须调用 `mirror-publish.yml` 完成镜像发布。接收端验证并发布固定版本目录，CI 再匿名下载并逐字节比对全部 11 项资产，最后原子更新防降级的 `latest.json` 并再次验收。镜像失败时整个发布仍未完成，已发布的 immutable GitHub Release 保留；修复后从 `main` 单独运行 `Mirror release` 并输入相同 tag 重试；该入口也调用相同 worker 和专用 Secret 映射，无需重建或重发 GitHub Release。部署和故障恢复见 [镜像发布说明](docs/mirror-publishing.md)。
 
@@ -919,7 +1006,7 @@ sudo PROXYSCENE_DEV_TARGET_USER=alice proxyscene dev on
 
 ### 修改端口后不生效
 
-用环境变量执行一次会修改状态的管理命令。例如：
+用环境变量执行一次会协调相应场景的管理命令；节点改名、TCP 测试和订阅更新不会应用端口覆盖。例如：
 
 ```bash
 sudo PROXYSCENE_GLOBAL_HTTP_PORT=7898 proxyscene global on
@@ -940,12 +1027,13 @@ sudo PROXYSCENE_GLOBAL_HTTP_PORT=7898 proxyscene global on
 - Hermes 的受管 drop-in 还固定 `PYTHONSAFEPATH=1`，防止 `python -m` 把 `WorkingDirectory` 中的同名模块置于
   已绑定 venv 之前；协调后会同时核对该值、`TELEGRAM_PROXY` 和 `HERMES_TELEGRAM_DISABLE_FALLBACK_IPS=1`。unit、manager、dotenv 或 secret source 中冲突的
   `PYTHONSAFEPATH` 会 fail closed。
-- 用户级 systemd 总线未运行或重启失败时，drop-in/OpenClaw journal 会保留，命令会报告部分失败；总线恢复后应重新执行
-  开启/关闭命令，让 prepared/restoring 操作完成。
-- `boot-restore` 会依据 Hermes/OpenClaw ownership journal 重放未完成的 prepared/restoring 操作；active 且托管内容未变化时不会无意义地 reload/restart 服务。
-- 自动发现只接受最终有效的 OpenClaw gateway marker 或 Hermes gateway `ExecStart`。非标准/不可识别的 Hermes 服务需用
-  `PROXYSCENE_TG_SERVICES` 显式指定；全局 user-unit 需显式绑定用户。发现过程会解析 canonical/alias、mask、模板实例和
-  target-name 对应 drop-in 的有效配置；无法映射到具体用户或无法识别最终启动命令的单元仍需人工指定。
+- 用户级 systemd 总线未运行或重启失败时，预检可能直接拒绝，已经开始的事务则尝试补偿；补偿未完成会保留恢复记录。
+  总线恢复后，存在未完成运行事务时先执行 `proxyscene recover`，再按需要重新执行开启/关闭命令。
+- `boot-restore` 遇到未完成运行事务时只续跑固定恢复并返回；无事务时才重新规划场景。旧 prepared/restoring journal
+  如果没有对应外层事务证据，会阻止新事务并要求核验。
+- 自动发现只接受最终有效的 OpenClaw gateway marker 或 Hermes gateway `ExecStart`。`PROXYSCENE_TG_SERVICES` 只添加
+  候选锚定目标，不能绕过启动方式、身份和配置路径校验；全局 user-unit 需显式绑定用户。发现过程会解析 canonical/alias、
+  mask、模板实例和 target-name 对应 drop-in；非标准启动布局需先调整为受支持的形式。
 - 开发代理会修改目标用户的 git/npm 配置；关闭时会按备份和本程序写入值进行保守恢复，并支持识别开启期间记录过的多个 managed 代理地址。为避免跨文件或 include 顺序造成不可逆覆盖，双 Git global 文件、非常规配置文件及 `include`/`includeIf` 会失败关闭。
 
 ## 开发验证
@@ -970,7 +1058,7 @@ sudo -- bash ./scripts/install-test.sh
 
 - 真实 VLESS、VMess、Trojan、Shadowsocks 节点链接。
 - 订阅链接。
-- 运行期生成的 `state.json`、`config.json`、`dev-proxy-backup.json`、所有 `*-proxy-journal.json` 及其备份。
+- 运行期生成的 `state.json`、`config.json`、`runtime-transition.json`、`core-loaded.json`、`dev-proxy-backup.json`、所有 `*-proxy-journal.json` 及其备份。
 - Telegram Bot Token、访问令牌、私钥或其他服务凭据。
 
 运行期状态和构建产物已经在 `.gitignore` 中默认忽略。安全问题报告方式见 `SECURITY.md`。

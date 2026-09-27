@@ -446,12 +446,14 @@ func (c Config) needsPrivilegedPortCap() bool {
 }
 
 type Node struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Protocol  string    `json:"protocol"`
-	RawURL    string    `json:"raw_url"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID                  string    `json:"id"`
+	Name                string    `json:"name"`
+	Protocol            string    `json:"protocol"`
+	RawURL              string    `json:"raw_url"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
+	SubscriptionIDs     []string  `json:"subscription_ids,omitempty"`
+	SubscriptionManaged bool      `json:"subscription_managed,omitempty"`
 }
 
 type SpeedResult struct {

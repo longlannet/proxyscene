@@ -19,6 +19,14 @@ func validateHermesTelegramRestartPolicy(target systemdTargetName, identity *per
 	return validateHermesTargetRuntimeWithRestartPolicy(target, identity, "", true)
 }
 
+func validateHermesTelegramReleaseRestartPolicy(target systemdTargetName, identity *persistedUserIdentity) error {
+	content, err := effectiveTelegramTargetUnitContent(target, identity)
+	if err != nil {
+		return err
+	}
+	return validateHermesRuntimeContent(target, identity, content, "", true, false)
+}
+
 func validateHermesFallbackDiscoveryEnvironment(environment map[string]string, required bool) error {
 	if required && environment[hermesDisableFallbackEnv] != "1" {
 		return fmt.Errorf("最终 %s 与受管值 1 不一致，无法排除绕过 Telegram 代理的 DNS/DoH 发现", hermesDisableFallbackEnv)

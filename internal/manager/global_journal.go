@@ -431,6 +431,10 @@ func globalProxyQuarantineMismatchError(dirFD int, base, quarantine, path string
 }
 
 func writeGlobalProxyArtifactCAS(path string, expected []globalProxyArtifactState, desired globalProxyArtifactState) error {
+	return writeBoundedArtifactCAS(path, expected, desired, maxGlobalProxyArtifactBytes)
+}
+
+func writeBoundedArtifactCAS(path string, expected []globalProxyArtifactState, desired globalProxyArtifactState, maxBytes int64) error {
 	if !desired.present {
 		return fmt.Errorf("全局代理 CAS 写入目标不能为空：%s", path)
 	}
@@ -445,13 +449,13 @@ func writeGlobalProxyArtifactCAS(path string, expected []globalProxyArtifactStat
 	claimedInCall := false
 
 	for attempt := 0; attempt < maxGlobalProxyCASAttempts; attempt++ {
-		claimed, readErr := readGlobalProxyArtifactAt(dirFD, quarantine, quarantinePath, maxGlobalProxyArtifactBytes)
+		claimed, readErr := readGlobalProxyArtifactAt(dirFD, quarantine, quarantinePath, maxBytes)
 		if readErr != nil {
-			final, finalErr := readGlobalProxyArtifactAt(dirFD, base, cleanPath, maxGlobalProxyArtifactBytes)
+			final, finalErr := readGlobalProxyArtifactAt(dirFD, base, cleanPath, maxBytes)
 			return errors.Join(globalProxyQuarantineMismatchError(dirFD, base, quarantine, cleanPath, final, readErr), finalErr)
 		}
 		if claimed.present {
-			final, finalErr := readGlobalProxyArtifactAt(dirFD, base, cleanPath, maxGlobalProxyArtifactBytes)
+			final, finalErr := readGlobalProxyArtifactAt(dirFD, base, cleanPath, maxBytes)
 			if finalErr != nil {
 				return errors.Join(errGlobalProxyArtifactChanged, fmt.Errorf("无法安全读取并发全局代理目标，隔离文件已保留：%s：%w", cleanPath, finalErr))
 			}
@@ -487,7 +491,7 @@ func writeGlobalProxyArtifactCAS(path string, expected []globalProxyArtifactStat
 			return removeGlobalProxyQuarantine(dirFD, quarantine, quarantinePath)
 		}
 
-		final, readErr := readGlobalProxyArtifactAt(dirFD, base, cleanPath, maxGlobalProxyArtifactBytes)
+		final, readErr := readGlobalProxyArtifactAt(dirFD, base, cleanPath, maxBytes)
 		if readErr != nil {
 			return readErr
 		}

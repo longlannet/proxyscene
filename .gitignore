@@ -36,6 +36,8 @@ coverage.out
 /config.json
 /state.json
 /state.json.bak
+/runtime-transition.json
+/core-loaded.json
 /.state.lock
 /dev-proxy-backup.json
 /xray.log

@@ -163,21 +163,15 @@ func removeXrayTempConfig(path, dir string) error {
 	return nil
 }
 
-// clearXrayConfig removes the last active configuration when no scene remains.
-// A future enable always regenerates it from state, so retaining it only keeps
-// deleted node credentials on disk.
-func (a *App) clearXrayConfig() error {
-	err := os.Remove(a.cfg.XrayConfig())
-	if os.IsNotExist(err) {
-		return nil
-	}
+func (a *App) writeXrayConfigTo(st *Store, path string) error {
+	data, err := a.renderXrayConfig(st)
 	if err != nil {
 		return err
 	}
-	return fsyncDir(a.cfg.CoreDir)
+	return writeFileAtomic(path, data, 0o600)
 }
 
-func (a *App) writeXrayConfigTo(st *Store, path string) error {
+func (a *App) renderXrayConfig(st *Store) ([]byte, error) {
 	if st == nil {
 		st = newStore()
 	}
@@ -200,22 +194,22 @@ func (a *App) writeXrayConfigTo(st *Store, path string) error {
 	}
 
 	if err := addScene(SceneDev, []string{"dev-http"}, "proxy-dev", inbound("dev-http", a.cfg.ProxyHost, a.cfg.DevHTTPPort, "http", nil)); err != nil {
-		return err
+		return nil, err
 	}
 	if err := addScene(SceneTelegram, []string{"telegram-http", "telegram-socks"}, "proxy-telegram",
 		inbound("telegram-http", a.cfg.ProxyHost, a.cfg.TGHTTPPort, "http", nil),
 		inbound("telegram-socks", a.cfg.ProxyHost, a.cfg.TGSocksPort, "socks", map[string]any{"udp": true}),
 	); err != nil {
-		return err
+		return nil, err
 	}
 	if err := addScene(SceneGlobal, []string{"global-http", "global-socks"}, "proxy-global",
 		inbound("global-http", a.cfg.ProxyHost, a.cfg.GlobalHTTPPort, "http", nil),
 		inbound("global-socks", a.cfg.ProxyHost, a.cfg.GlobalSocksPort, "socks", map[string]any{"udp": true}),
 	); err != nil {
-		return err
+		return nil, err
 	}
 	if len(inbounds) == 0 {
-		return fmt.Errorf("没有已开启场景，无需生成 Xray 配置")
+		return nil, fmt.Errorf("没有已开启场景，无需生成 Xray 配置")
 	}
 
 	cfg := map[string]any{
@@ -226,9 +220,9 @@ func (a *App) writeXrayConfigTo(st *Store, path string) error {
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return writeFileAtomic(path, append(b, '\n'), 0o600)
+	return append(b, '\n'), nil
 }
 
 func inbound(tag, listen string, port int, protocol string, settings map[string]any) map[string]any {

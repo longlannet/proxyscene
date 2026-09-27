@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -33,6 +34,7 @@ type openClawTestHarness struct {
 
 func newOpenClawTestHarness(t *testing.T, initialConfig string) *openClawTestHarness {
 	t.Helper()
+	stubTelegramPlanUnitsForLifecycle(t)
 	h := &openClawTestHarness{
 		app:  testApp(t),
 		user: "root",
@@ -49,7 +51,7 @@ func newOpenClawTestHarness(t *testing.T, initialConfig string) *openClawTestHar
 		return "", errors.New("fixture has no gateway RPC")
 	}
 
-	h.identity = localUserIdentity{Name: h.user, UID: 0, GID: 0, UIDText: "0", GIDText: "0", Home: h.home}
+	h.identity = localUserIdentity{Name: h.user, UID: os.Getuid(), GID: os.Getgid(), UIDText: strconv.Itoa(os.Getuid()), GIDText: strconv.Itoa(os.Getgid()), Home: h.home}
 	if err := os.MkdirAll(filepath.Dir(h.configPath), 0o700); err != nil {
 		t.Fatal(err)
 	}

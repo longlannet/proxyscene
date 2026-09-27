@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 )
 
@@ -19,6 +21,9 @@ type localUserAccount struct {
 	Home string
 	UID  string
 }
+
+// Tests inject a scan over private fixture roots; production uses systemd discovery.
+var telegramDiscoverTargetNames = discoverTelegramTargetNames
 
 func (a *App) telegramTargets(st *Store, includeStored bool) ([]systemdTargetName, error) {
 	names, err := a.telegramTargetNames(st, includeStored)
@@ -40,7 +45,7 @@ func (a *App) telegramTargets(st *Store, includeStored bool) ([]systemdTargetNam
 func (a *App) telegramTargetNames(st *Store, includeStored bool) ([]string, error) {
 	names := []string{}
 	names = append(names, a.cfg.TGTargetServices...)
-	discovered, err := discoverTelegramTargetNames()
+	discovered, err := telegramDiscoverTargetNames()
 	names = append(names, discovered...)
 	if includeStored && st != nil {
 		names = append(names, st.TelegramTargets...)
@@ -258,32 +263,45 @@ func discoverEffectiveTelegramUnits(roots []unitSearchRoot, prefix string) ([]st
 			if !root.Manage {
 				continue
 			}
-			path, usable := effectiveUnitPathInRoots(service, rootPaths)
-			if !usable {
-				if info.Mode()&os.ModeSymlink != 0 {
-					target, linkErr := filepath.EvalSymlinks(entryPath)
-					if linkErr == nil && filepath.Clean(target) == "/dev/null" {
-						continue
-					}
-					errs = append(errs, fmt.Errorf("systemd 单元别名无法解析为普通文件：%s", entryPath))
-					continue
-				}
-				errs = append(errs, fmt.Errorf("systemd 单元不是普通文件：%s", entryPath))
+			resolution := resolveTelegramUnitInRoots(service, rootPaths)
+			if current, statErr := os.Lstat(entryPath); statErr != nil || !sameTelegramUnitFileEvidence(info, current) {
+				errs = append(errs, fmt.Errorf("%w：%s", errTelegramUnitChanged, entryPath))
 				continue
 			}
+			if resolution.State == telegramUnitMasked {
+				continue
+			}
+			if resolution.State != telegramUnitResolved {
+				if resolution.Err == nil {
+					resolution.Err = fmt.Errorf("%w：扫描到的单元已消失：%s", errTelegramUnitChanged, entryPath)
+				}
+				errs = append(errs, resolution.Err)
+				continue
+			}
+			path := resolution.Path
 			fragmentIdentity := effectiveUnitFragmentIdentity(path, service)
 			if seenFragments[fragmentIdentity] {
 				continue
 			}
 			seenFragments[fragmentIdentity] = true
-			content, err := readTelegramUnitContentWithDropIns(path, service, roots)
+			content, err := readResolvedTelegramUnitContent(resolution, roots)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("读取 systemd 单元 %s 失败：%w", path, err))
 				continue
 			}
-			if unitLooksLikeTelegramClient(content) {
+			kind, err := classifyTelegramUnitContent(content)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("识别 systemd 单元 %s 失败：%w", path, err))
+				continue
+			}
+			if kind != telegramUnitOther {
 				discoveredService := canonicalUnitNameForFragment(path, service)
-				if canonicalPath, exists := effectiveUnitPathInRoots(discoveredService, rootPaths); !exists || !sameUnitFragment(canonicalPath, path) {
+				canonical := resolveTelegramUnitInRoots(discoveredService, rootPaths)
+				if canonical.Err != nil {
+					errs = append(errs, canonical.Err)
+					continue
+				}
+				if canonical.State != telegramUnitResolved || !sameUnitFragment(canonical.Path, path) {
 					discoveredService = service
 				}
 				values = append(values, prefix+discoveredService)
@@ -302,75 +320,246 @@ func effectiveUnitFragmentIdentity(path, requested string) string {
 	return filepath.Clean(path) + "\x00"
 }
 
-func effectiveUnitPathInRoots(service string, roots []string) (string, bool) {
-	service = normalizeSystemdServiceName(service)
-	path, _, usable := resolveEffectiveUnitPathInRoots(service, roots, map[string]bool{})
-	return path, usable
+type telegramUnitResolutionState uint8
+
+const (
+	telegramUnitResolved telegramUnitResolutionState = iota + 1
+	telegramUnitAbsent
+	telegramUnitMasked
+	telegramUnitDangling
+	telegramUnitCycle
+	telegramUnitInvalid
+	telegramUnitIOError
+	telegramUnitChanged
+)
+
+// Chain contains every probed name, including absent higher-priority entries.
+// This describes unit resolution only; callers must also pin effective content
+// (including drop-ins) before authorizing any change to a managed resource.
+type telegramUnitResolution struct {
+	State     telegramUnitResolutionState
+	Requested string
+	Path      string
+	Chain     []telegramUnitPathEvidence
+	Err       error
 }
 
-func resolveEffectiveUnitPathInRoots(service string, roots []string, resolving map[string]bool) (string, bool, bool) {
-	path, found, usable := effectiveUnitPathExactInRoots(service, roots, resolving)
-	if found {
-		return path, true, usable
+type telegramUnitPathEvidence struct {
+	Path            string
+	Info            os.FileInfo // nil means this exact lookup was absent
+	LinkTarget      string
+	ContentSHA256   [sha256.Size]byte
+	ContentRecorded bool
+}
+
+var errTelegramUnitChanged = errors.New("systemd 单元解析证据已变化")
+
+const maxTelegramUnitAliasDepth = 40
+
+func effectiveUnitPathInRoots(service string, roots []string) (string, bool) {
+	result := resolveTelegramUnitInRoots(service, roots)
+	return result.Path, result.State == telegramUnitResolved
+}
+
+// resolveTelegramUnitInRoots is read-only. Unlike the compatibility bool wrapper,
+// its result distinguishes a legitimately absent optional anchor from an
+// unreadable, masked, or broken previously selected unit.
+func resolveTelegramUnitInRoots(service string, roots []string) telegramUnitResolution {
+	service = normalizeSystemdServiceName(service)
+	if err := safeSystemdServiceName(service); err != nil {
+		return telegramUnitResolution{State: telegramUnitInvalid, Requested: service, Err: err}
+	}
+	resolver := telegramUnitResolver{roots: roots, names: map[string]bool{}, paths: map[string]bool{}}
+	result := resolver.resolveName(service)
+	result.Requested = service
+	result.Chain = resolver.chain
+	if result.State == telegramUnitResolved || result.State == telegramUnitAbsent || result.State == telegramUnitMasked {
+		if err := validateTelegramUnitResolution(result); err != nil {
+			result.State, result.Path, result.Err = telegramUnitChanged, "", err
+		}
+	}
+	return result
+}
+
+type telegramUnitResolver struct {
+	roots []string
+	names map[string]bool
+	paths map[string]bool
+	chain []telegramUnitPathEvidence
+	depth int
+}
+
+func (r *telegramUnitResolver) resolveName(service string) telegramUnitResolution {
+	if r.names[service] {
+		return telegramUnitResolution{State: telegramUnitCycle, Err: fmt.Errorf("systemd 单元别名循环：%s", service)}
+	}
+	r.names[service] = true
+	defer delete(r.names, service)
+	result := r.resolveExactName(service)
+	if result.State != telegramUnitAbsent {
+		return result
 	}
 	template, _, kind := splitServiceUnitName(service)
 	if kind != serviceUnitInstance {
-		return "", false, false
+		return result
 	}
-	return effectiveUnitPathExactInRoots(template, roots, resolving)
+	return r.resolveName(template)
 }
 
-func effectiveUnitPathExactInRoots(service string, roots []string, resolving map[string]bool) (string, bool, bool) {
-	if resolving[service] {
-		return "", true, false
+func (r *telegramUnitResolver) resolveExactName(service string) telegramUnitResolution {
+	for _, root := range r.roots {
+		result := r.resolvePath(filepath.Join(root, service), service)
+		if result.State != telegramUnitAbsent {
+			return result
+		}
 	}
-	resolving[service] = true
-	defer delete(resolving, service)
+	return telegramUnitResolution{State: telegramUnitAbsent}
+}
 
-	for _, root := range roots {
-		path := filepath.Join(root, service)
-		info, err := os.Lstat(path)
-		if errors.Is(err, os.ErrNotExist) {
+func (r *telegramUnitResolver) resolvePath(path, service string) telegramUnitResolution {
+	path = filepath.Clean(path)
+	if r.paths[path] || r.depth > maxTelegramUnitAliasDepth {
+		return telegramUnitResolution{State: telegramUnitCycle, Err: fmt.Errorf("systemd 单元别名循环或超过解析上限：%s", path)}
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		r.chain = append(r.chain, telegramUnitPathEvidence{Path: path})
+		return telegramUnitResolution{State: telegramUnitAbsent}
+	}
+	if err != nil {
+		state := telegramUnitIOError
+		if errors.Is(err, syscall.ELOOP) {
+			state = telegramUnitCycle
+		}
+		return telegramUnitResolution{State: state, Err: fmt.Errorf("读取 systemd 单元信息 %s 失败：%w", path, err)}
+	}
+	evidence := telegramUnitPathEvidence{Path: path, Info: info}
+	if info.Mode()&os.ModeSymlink == 0 {
+		r.chain = append(r.chain, evidence)
+		if !info.Mode().IsRegular() {
+			return telegramUnitResolution{State: telegramUnitInvalid, Err: fmt.Errorf("systemd 单元不是普通文件：%s", path)}
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return telegramUnitResolution{State: telegramUnitChanged, Err: fmt.Errorf("%w：%s", errTelegramUnitChanged, path)}
+		}
+		if filepath.Clean(resolved) != path {
+			// Preserve support for linked unit files whose parent directory is a
+			// symlink. Record both the requested path and its final fragment.
+			return r.resolvePath(resolved, service)
+		}
+		if info.Size() > maxTelegramUnitReadBytes {
+			return telegramUnitResolution{State: telegramUnitInvalid, Err: fmt.Errorf("systemd 单元超过大小限制：%s", path)}
+		}
+		raw, err := readRegularFileNoFollow(path, maxTelegramUnitReadBytes)
+		if err != nil {
+			return telegramUnitResolution{State: telegramUnitIOError, Err: fmt.Errorf("读取 systemd 单元 %s 失败：%w", path, err)}
+		}
+		r.chain[len(r.chain)-1].ContentSHA256 = sha256.Sum256(raw)
+		r.chain[len(r.chain)-1].ContentRecorded = true
+		if len(raw) == 0 {
+			// systemd also treats an empty unit file as a mask.
+			return telegramUnitResolution{State: telegramUnitMasked}
+		}
+		return telegramUnitResolution{State: telegramUnitResolved, Path: path}
+	}
+	link, err := os.Readlink(path)
+	if err != nil {
+		return telegramUnitResolution{State: telegramUnitIOError, Err: fmt.Errorf("读取 systemd 单元别名 %s 失败：%w", path, err)}
+	}
+	evidence.LinkTarget = link
+	r.chain = append(r.chain, evidence)
+	target := link
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	target = filepath.Clean(target)
+	if target == "/dev/null" {
+		return telegramUnitResolution{State: telegramUnitMasked}
+	}
+	r.paths[path] = true
+	r.depth++
+	defer func() { delete(r.paths, path); r.depth-- }()
+	var result telegramUnitResolution
+	if targetName, ok := unitNameInSearchRoots(target, r.roots); ok && targetName != service {
+		// Unit aliases refer to the effective canonical name, not necessarily the
+		// literal vendor file their symlink names. Same-name vendor links are
+		// different: follow their actual path instead of recursing into the alias.
+		result = r.resolveName(targetName)
+	} else {
+		result = r.resolvePath(target, service)
+	}
+	if result.State == telegramUnitAbsent {
+		result.State = telegramUnitDangling
+		result.Err = fmt.Errorf("systemd 单元别名目标不存在：%s", path)
+	}
+	return result
+}
+
+func validateTelegramUnitResolution(result telegramUnitResolution) error {
+	if result.Err != nil {
+		return result.Err
+	}
+	if result.State != telegramUnitResolved && result.State != telegramUnitAbsent && result.State != telegramUnitMasked {
+		return fmt.Errorf("systemd 单元解析状态不能作为可信前置条件：%s", result.Requested)
+	}
+	if result.Requested == "" || (result.State == telegramUnitResolved && (result.Path == "" || len(result.Chain) == 0)) {
+		return fmt.Errorf("systemd 单元解析结果缺少可信路径证据")
+	}
+	for _, expected := range result.Chain {
+		current, err := os.Lstat(expected.Path)
+		if expected.Info == nil && errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err != nil {
-			return "", true, false
+		if err != nil || expected.Info == nil || !sameTelegramUnitFileEvidence(expected.Info, current) {
+			return fmt.Errorf("%w：%s", errTelegramUnitChanged, expected.Path)
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			link, err := os.Readlink(path)
-			if err != nil {
-				return "", true, false
+		if expected.Info.Mode()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(expected.Path)
+			if err != nil || link != expected.LinkTarget {
+				return fmt.Errorf("%w：%s", errTelegramUnitChanged, expected.Path)
 			}
-			target := link
-			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(path), target)
-			}
-			target = filepath.Clean(target)
-			if target == "/dev/null" {
-				return "", true, false
-			}
-			if targetName, ok := unitNameInSearchRoots(target, roots); ok {
-				if targetName != service {
-					resolved, _, usable := resolveEffectiveUnitPathInRoots(targetName, roots, resolving)
-					return resolved, true, usable
-				}
-			}
-			resolved, err := filepath.EvalSymlinks(path)
-			if err != nil || filepath.Clean(resolved) == "/dev/null" {
-				return "", true, false
-			}
-			targetInfo, err := os.Stat(resolved)
-			if err != nil || !targetInfo.Mode().IsRegular() {
-				return "", true, false
-			}
-			return resolved, true, true
 		}
-		if !info.Mode().IsRegular() {
-			return "", true, false
+		if expected.ContentRecorded {
+			raw, err := readRegularFileNoFollow(expected.Path, maxTelegramUnitReadBytes)
+			if err != nil || sha256.Sum256(raw) != expected.ContentSHA256 {
+				return fmt.Errorf("%w：%s", errTelegramUnitChanged, expected.Path)
+			}
 		}
-		return path, true, true
 	}
-	return "", false, false
+	return nil
+}
+
+func sameTelegramUnitFileEvidence(before, after os.FileInfo) bool {
+	if before == nil || after == nil || !os.SameFile(before, after) || before.Mode() != after.Mode() || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return false
+	}
+	oldStat, oldOK := before.Sys().(*syscall.Stat_t)
+	newStat, newOK := after.Sys().(*syscall.Stat_t)
+	return oldOK && newOK && oldStat.Uid == newStat.Uid && oldStat.Gid == newStat.Gid && oldStat.Ctim == newStat.Ctim
+}
+
+// readResolvedTelegramUnitContent checks resolution evidence before and after
+// reading. A transaction plan should retain the returned content and compare it
+// with a fresh effective read before applying its authorized resource changes.
+func readResolvedTelegramUnitContent(result telegramUnitResolution, roots []unitSearchRoot) (string, error) {
+	if result.State != telegramUnitResolved {
+		if result.Err != nil {
+			return "", result.Err
+		}
+		return "", fmt.Errorf("systemd 单元未解析为普通文件：%s", result.Requested)
+	}
+	if err := validateTelegramUnitResolution(result); err != nil {
+		return "", err
+	}
+	content, err := readTelegramUnitContentWithDropIns(result.Path, result.Requested, roots)
+	if err != nil {
+		return "", err
+	}
+	if err := validateTelegramUnitResolution(result); err != nil {
+		return "", err
+	}
+	return content, nil
 }
 
 func unitNameInSearchRoots(path string, roots []string) (string, bool) {
@@ -431,12 +620,44 @@ func telegramRelatedUnit(path, service string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return unitLooksLikeTelegramClient(content), nil
+	kind, err := classifyTelegramUnitContent(content)
+	return kind != telegramUnitOther && err == nil, err
+}
+
+type telegramUnitKind uint8
+
+const (
+	telegramUnitOther telegramUnitKind = iota
+	telegramUnitOpenClaw
+	telegramUnitHermes
+)
+
+// Classification errors mean unknown, never proof that a unit was deselected.
+// Parse both relevant directives even if one already identifies a gateway.
+func classifyTelegramUnitContent(content string) (telegramUnitKind, error) {
+	environment, err := effectiveServiceEnvironment(content)
+	if err != nil {
+		return telegramUnitOther, fmt.Errorf("systemd Environment/UnsetEnvironment 无法解析：%w", err)
+	}
+	starts, err := effectiveServiceExecStarts(content)
+	if err != nil {
+		return telegramUnitOther, fmt.Errorf("systemd ExecStart 无法解析：%w", err)
+	}
+	if environment["OPENCLAW_SERVICE_MARKER"] == "openclaw" && environment["OPENCLAW_SERVICE_KIND"] == "gateway" {
+		return telegramUnitOpenClaw, nil
+	}
+	for _, words := range starts {
+		if hermesGatewayArgv(words) {
+			return telegramUnitHermes, nil
+		}
+	}
+	return telegramUnitOther, nil
 }
 
 // unitLooksLikeTelegramClient 解析单元内容，按 OpenClaw 厂商标记或 Hermes 程序身份判定。
 func unitLooksLikeTelegramClient(content string) bool {
-	return unitHasOpenClawGatewayMarker(content) || unitIsHermesGatewayExec(content)
+	kind, err := classifyTelegramUnitContent(content)
+	return err == nil && kind != telegramUnitOther
 }
 
 // unitHasOpenClawGatewayMarker 报告单元是否带 OpenClaw 网关的厂商标记
@@ -787,6 +1008,13 @@ func readTelegramUnitContent(path string) (string, error) {
 }
 
 func readTelegramUnitContentWithDropIns(path, service string, roots []unitSearchRoot) (string, error) {
+	return readTelegramUnitContentWithoutDropIn(path, service, roots, "")
+}
+
+// Project the unit after removing exactly one proven owned drop-in. Skipping it
+// before basename precedence is applied exposes any lower-priority replacement,
+// just as systemd will after the actual removal.
+func readTelegramUnitContentWithoutDropIn(path, service string, roots []unitSearchRoot, omittedPath string) (string, error) {
 	content, err := readTelegramUnitContent(path)
 	if err != nil {
 		return "", err
@@ -819,6 +1047,9 @@ func readTelegramUnitContentWithDropIns(path, service string, roots []unitSearch
 		}
 		for _, entry := range entries {
 			name := entry.Name()
+			if filepath.Join(dir, name) == omittedPath {
+				continue
+			}
 			if !strings.HasSuffix(name, ".conf") || seenFiles[name] {
 				continue
 			}
@@ -957,8 +1188,17 @@ func effectiveDropInUnitNames(path, requested string, roots []unitSearchRoot) ([
 			if !ok || adapted == canonical || adapted == requested {
 				continue
 			}
-			candidatePath, exists := effectiveUnitPathInRoots(adapted, rootPaths)
-			if !exists || !sameUnitFragment(candidatePath, path) {
+			resolution := resolveTelegramUnitInRoots(adapted, rootPaths)
+			if resolution.State == telegramUnitMasked {
+				continue
+			}
+			if resolution.State != telegramUnitResolved {
+				if resolution.Err != nil {
+					return nil, resolution.Err
+				}
+				return nil, fmt.Errorf("%w：别名单元已消失：%s", errTelegramUnitChanged, adapted)
+			}
+			if !sameUnitFragment(resolution.Path, path) {
 				continue
 			}
 			aliases = appendUniqueString(aliases, adapted)

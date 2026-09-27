@@ -22,13 +22,26 @@ func (a *App) installXrayService() error {
 	if err := a.prepareXrayServiceRuntime(); err != nil {
 		return err
 	}
+	unit := a.xrayUnitContent()
+	unitPath := "/etc/systemd/system/" + a.cfg.SystemdService
+	legacyExec := "ExecStart=" + systemdQuote(a.cfg.XrayBin()) + " run -config " + systemdQuote(a.cfg.XrayConfig())
+	if err := validateUnitReplacementOwnership(unitPath, legacyExec); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(unitPath, unit, 0o644); err != nil {
+		return err
+	}
+	return systemctlRun("重新加载 systemd 配置", "daemon-reload")
+}
+
+func (a *App) xrayUnitContent() []byte {
 	// 默认端口(789x)不需要任何 capability，清空 bounding set；仅在操作员显式配置
 	// <1024 的监听端口时才授予绑定特权端口所需的 CAP_NET_BIND_SERVICE。
 	capLines := "CapabilityBoundingSet="
 	if a.cfg.needsPrivilegedPortCap() {
 		capLines = "CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE"
 	}
-	unit := fmt.Sprintf(managedSystemdUnitHeader+`[Unit]
+	return []byte(fmt.Sprintf(managedSystemdUnitHeader+`[Unit]
 Description=Xray 代理主服务
 After=network-online.target nss-lookup.target
 Wants=network-online.target
@@ -60,16 +73,7 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target
-`, a.cfg.XrayServiceUser, systemdPath(a.cfg.CoreDir), systemdQuote(a.cfg.XrayBin()), systemdQuote(a.cfg.XrayConfig()), systemdPath(a.cfg.CoreDir), capLines)
-	unitPath := "/etc/systemd/system/" + a.cfg.SystemdService
-	legacyExec := "ExecStart=" + systemdQuote(a.cfg.XrayBin()) + " run -config " + systemdQuote(a.cfg.XrayConfig())
-	if err := validateUnitReplacementOwnership(unitPath, legacyExec); err != nil {
-		return err
-	}
-	if err := writeFileAtomic(unitPath, []byte(unit), 0o644); err != nil {
-		return err
-	}
-	return systemctlRun("重新加载 systemd 配置", "daemon-reload")
+`, a.cfg.XrayServiceUser, systemdPath(a.cfg.CoreDir), systemdQuote(a.cfg.XrayBin()), systemdQuote(a.cfg.XrayConfig()), systemdPath(a.cfg.CoreDir), capLines))
 }
 
 func (a *App) prepareXrayServiceRuntime() error {
@@ -150,8 +154,17 @@ func chownRootGroupMode(path string, gid int, mode os.FileMode, required bool) e
 	return os.Chmod(path, mode)
 }
 
-func (a *App) installRestoreService() error {
+func (a *App) preflightRestoreService() error {
 	if err := validatePrivilegedExecutable(a.cfg.InstallBin, "PROXYSCENE_SWITCH_BIN"); err != nil {
+		return err
+	}
+	unitPath := "/etc/systemd/system/" + a.cfg.RestoreService
+	legacyExec := "ExecStart=" + systemdQuote(a.cfg.InstallBin) + " boot-restore"
+	return validateUnitReplacementOwnership(unitPath, legacyExec)
+}
+
+func (a *App) installRestoreService() error {
+	if err := a.preflightRestoreService(); err != nil {
 		return err
 	}
 	envLines := restoreServiceEnvironmentLines(a.cfg)
@@ -170,10 +183,6 @@ RemainAfterExit=no
 WantedBy=multi-user.target
 `, a.cfg.SystemdService, envLines, systemdQuote(a.cfg.InstallBin))
 	unitPath := "/etc/systemd/system/" + a.cfg.RestoreService
-	legacyExec := "ExecStart=" + systemdQuote(a.cfg.InstallBin) + " boot-restore"
-	if err := validateUnitReplacementOwnership(unitPath, legacyExec); err != nil {
-		return err
-	}
 	if err := writeFileAtomic(unitPath, []byte(unit), 0o644); err != nil {
 		return err
 	}
@@ -226,16 +235,6 @@ func restoreServiceEnvironmentLines(cfg Config) string {
 		lines = append(lines, "Environment="+systemdQuote(value.key+"="+value.value))
 	}
 	return strings.Join(lines, "\n")
-}
-
-func (a *App) startXrayService() error {
-	if err := a.installXrayService(); err != nil {
-		return err
-	}
-	if err := systemctlRun("启用 Xray 主服务", "enable", "--", a.cfg.SystemdService); err != nil {
-		return err
-	}
-	return a.restartXrayService()
 }
 
 func (a *App) restartXrayService() error {

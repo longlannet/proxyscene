@@ -67,7 +67,7 @@ func TestApplyTelegramSharedConfigCapturesEveryReloadBeforeWrite(t *testing.T) {
 	h, first, _, changed := setupOpenClawReloadFixture(t, `{}`)
 	second := h.target("openclaw-batch-other.service")
 	unitPath := filepath.Join(h.home, ".config", "systemd", "user", second.Service)
-	if err := os.WriteFile(unitPath, []byte("[Service]\nExecStart=/usr/bin/node /opt/openclaw/dist/index.js gateway --port 18789\n"), 0o600); err != nil {
+	if err := os.WriteFile(unitPath, []byte("[Service]\nEnvironment=OPENCLAW_SERVICE_MARKER=openclaw OPENCLAW_SERVICE_KIND=gateway\nExecStart=/usr/bin/node /opt/openclaw/dist/index.js gateway --port 18789\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	oldExists, oldUserRun := telegramUserUnitExists, userSystemctlRun

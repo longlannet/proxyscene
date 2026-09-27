@@ -366,6 +366,9 @@ func (a *App) applyOpenClawTelegramProxy(target systemdTargetName, proxyURL stri
 			return err
 		}
 		entry := journal.Users[user]
+		if entry != nil && entry.Phase == openClawPhaseRestoring {
+			return fmt.Errorf("用户 %s 的 OpenClaw ownership 正在退管，拒绝在应用过程中隐式恢复；请先完成恢复", user)
+		}
 		var identity *persistedUserIdentity
 		if entry == nil {
 			identity, err = capturePersistedUserIdentity(user, openClawLookupUserIdentity)
@@ -460,9 +463,6 @@ func (a *App) applyOpenClawTelegramProxy(target systemdTargetName, proxyURL stri
 				if entry.PendingManagedValue == entry.ManagedValue {
 					acceptable = acceptable || proxyStatesEqual(current, present, entry.OriginalValue, entry.OriginalPresent)
 				}
-			case openClawPhaseRestoring:
-				acceptable = proxyStateMatchesString(current, present, entry.ManagedValue) ||
-					proxyStatesEqual(current, present, entry.OriginalValue, entry.OriginalPresent)
 			}
 			if !acceptable {
 				return fmt.Errorf("用户 %s 的 OpenClaw proxy 在事务期间发生并发变化，拒绝覆盖", user)

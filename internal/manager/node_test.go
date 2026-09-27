@@ -101,6 +101,9 @@ func TestRenameNodeSanitizesName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("addNode: %v", err)
 	}
+	if err := a.saveStore(st); err != nil {
+		t.Fatal(err)
+	}
 	oldRun := systemctlRun
 	oldOutput := systemctlOutput
 	t.Cleanup(func() {

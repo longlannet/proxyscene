@@ -91,15 +91,6 @@ func (a *App) runtimeConfigDiffers(st *Store) bool {
 	return !runtimeConfigsEqual(st.RuntimeConfig, a.cfg.runtimeConfig())
 }
 
-func (a *App) stageRuntimeConfig(st *Store) bool {
-	if st == nil {
-		return false
-	}
-	changed := a.runtimeConfigDiffers(st)
-	st.RuntimeConfig = a.cfg.runtimeConfig()
-	return changed
-}
-
 func (a *App) appForStoreRuntime(st *Store) (*App, error) {
 	cfg := a.cfg
 	if st != nil && st.RuntimeConfig != nil {
@@ -222,6 +213,20 @@ func validateStoreSemantics(st *Store) (bool, error) {
 		return false, fmt.Errorf("没有节点时不能保留已开启场景")
 	}
 
+	seenSubscriptions := make(map[string]bool, len(st.Subscriptions))
+	subscriptionIDs := make(map[string]bool, len(st.Subscriptions))
+	for _, subscription := range st.Subscriptions {
+		if len(subscription) == 0 || len(subscription) > maxSubscriptionURLBytes || strings.TrimSpace(subscription) != subscription || seenSubscriptions[subscription] {
+			return false, fmt.Errorf("状态含无效或重复订阅链接")
+		}
+		parsed, err := url.Parse(subscription)
+		if err != nil || parsed.Host == "" || (strings.ToLower(parsed.Scheme) != "https" && strings.ToLower(parsed.Scheme) != "http") {
+			return false, fmt.Errorf("状态含无效订阅链接")
+		}
+		seenSubscriptions[subscription] = true
+		subscriptionIDs[subscriptionID(subscription)] = true
+	}
+
 	sanitized := false
 	ids := make(map[string]bool, len(st.Nodes))
 	urls := make(map[string]bool, len(st.Nodes))
@@ -235,6 +240,16 @@ func validateStoreSemantics(st *Store) (bool, error) {
 			return false, fmt.Errorf("状态含非法或重复节点 ID")
 		}
 		ids[node.ID] = true
+		if len(node.SubscriptionIDs) > maxSubscriptions {
+			return false, fmt.Errorf("状态节点 %s 的订阅来源数超过上限 %d", node.ID, maxSubscriptions)
+		}
+		seenSources := make(map[string]bool, len(node.SubscriptionIDs))
+		for _, sourceID := range node.SubscriptionIDs {
+			if !subscriptionIDs[sourceID] || seenSources[sourceID] {
+				return false, fmt.Errorf("状态节点 %s 含未知或重复订阅来源", node.ID)
+			}
+			seenSources[sourceID] = true
+		}
 		if len(node.RawURL) > maxNodeURLBytes || strings.TrimSpace(node.RawURL) != node.RawURL || urls[node.RawURL] {
 			return false, fmt.Errorf("状态含过长、带外部空白或重复的节点链接")
 		}
@@ -282,17 +297,6 @@ func validateStoreSemantics(st *Store) (bool, error) {
 		}
 	}
 
-	seenSubscriptions := make(map[string]bool, len(st.Subscriptions))
-	for _, subscription := range st.Subscriptions {
-		if len(subscription) == 0 || len(subscription) > maxSubscriptionURLBytes || strings.TrimSpace(subscription) != subscription || seenSubscriptions[subscription] {
-			return false, fmt.Errorf("状态含无效或重复订阅链接")
-		}
-		parsed, err := url.Parse(subscription)
-		if err != nil || parsed.Host == "" || (strings.ToLower(parsed.Scheme) != "https" && strings.ToLower(parsed.Scheme) != "http") {
-			return false, fmt.Errorf("状态含无效订阅链接")
-		}
-		seenSubscriptions[subscription] = true
-	}
 	seenTargets := make(map[string]bool, len(st.TelegramTargets))
 	for _, target := range st.TelegramTargets {
 		if seenTargets[target] || safeSystemdTargetName(target) != nil {
@@ -367,6 +371,9 @@ func cloneStore(st *Store) *Store {
 	}
 	clone := *st
 	clone.Nodes = append([]Node(nil), st.Nodes...)
+	for i := range clone.Nodes {
+		clone.Nodes[i].SubscriptionIDs = append([]string(nil), st.Nodes[i].SubscriptionIDs...)
+	}
 	if st.RuntimeConfig != nil {
 		runtimeClone := *st.RuntimeConfig
 		runtimeClone.TGTargetServices = append([]string(nil), st.RuntimeConfig.TGTargetServices...)
@@ -397,7 +404,20 @@ func restoreStore(dst, snapshot *Store) {
 var storeWriteFile = writeFileAtomic
 
 func (a *App) saveStore(st *Store) error {
+	if a.runtimeStoreCommit != nil {
+		return a.savePlannedRuntimeStore(st, a.runtimeStoreCommit)
+	}
 	candidate := cloneStore(st)
+	// A backup-only failed write has consumed its generation even though main is
+	// still the commit point. Never reuse that generation for a different value.
+	highest, err := a.highestStoreGeneration()
+	if err != nil {
+		return err
+	}
+	if candidate.Generation < highest {
+		candidate.Generation = highest
+	}
+
 	if candidate.Generation == ^uint64(0) {
 		return fmt.Errorf("状态 generation 已耗尽，拒绝回绕")
 	}

@@ -590,6 +590,47 @@ fi
 rm -rf "$init_test_dir"
 trap - EXIT
 
+# A stale updater must fail before any file transaction or manager init.
+update_guard_dir="$(mktemp -d)"
+trap 'rm -rf "$update_guard_dir"' EXIT
+printf 'old manager\n' > "$update_guard_dir/manager"
+chmod 600 "$update_guard_dir/manager"
+(
+  INSTALL_BIN="$update_guard_dir/manager"
+  expected="$(sha256sum "$INSTALL_BIN" | awk '{print $1}')"
+  parse_args --offline --expected-manager-sha256 "$expected"
+  verify_expected_manager
+  printf 'new manager\n' > "$INSTALL_BIN"
+  assert_fails "stale updater hash" verify_expected_manager
+)
+assert_fails "missing updater hash" parse_args --offline --expected-manager-sha256
+assert_fails "malformed updater hash" parse_args --offline --expected-manager-sha256 abc
+assert_fails "duplicate updater hash" parse_args --offline --expected-manager-sha256 "$XRAY_SHA256_AMD64" --expected-manager-sha256 "$XRAY_SHA256_AMD64"
+assert_fails "online updater precondition" parse_args --expected-manager-sha256 "$XRAY_SHA256_AMD64"
+# Exercise main's ordering without installing or creating any system file.
+(
+  parse_args() { OFFLINE_REQUESTED=1; EXPECTED_MANAGER_SHA256="$XRAY_SHA256_AMD64"; }
+  require_root() { :; }
+  validate_common_inputs() { :; }
+  validate_core_dir() { :; }
+  validate_managed_core_dir() { :; }
+  validate_install_bin() { :; }
+  bundle_dir() { printf '%s\n' "$update_guard_dir"; }
+  verify_bundle_manifest() { :; }
+  acquire_install_lock() { : > "$update_guard_dir/locked"; }
+  verify_expected_manager() { [[ -f "$update_guard_dir/locked" ]] || exit 99; exit 42; }
+  acquire_host_runtime_lock() { : > "$update_guard_dir/unsafe"; }
+  acquire_store_runtime_lock() { : > "$update_guard_dir/unsafe"; }
+  begin_transaction() { : > "$update_guard_dir/unsafe"; }
+  install_offline_local() { : > "$update_guard_dir/unsafe"; }
+  init_manager() { : > "$update_guard_dir/unsafe"; }
+  if (main --offline); then fail "stale update ordering unexpectedly succeeded"; fi
+  [[ -f "$update_guard_dir/locked" && ! -e "$update_guard_dir/unsafe" ]] \
+    || fail "stale updater reached a mutation before precondition check"
+)
+rm -rf "$update_guard_dir"
+trap - EXIT
+
 [[ "$TX_ACTIVE" == "0" ]] || fail "sourcing install.sh unexpectedly started a transaction"
 [[ -z "$(PROXYSCENE_INSTALL_TESTING=1 bash "$ROOT/install.sh")" ]] \
   || fail "testing guard produced unexpected output"
