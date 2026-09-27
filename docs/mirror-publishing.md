@@ -15,7 +15,7 @@ proxyscene 正式发布默认同时包含 GitHub 和 `https://dl.ll.cd/proxyscen
 镜像失败时整个发布仍未完成，不会删除或重建已经发布的 GitHub Release；修复后从 `main` 单独运行 `Mirror release`，输入相同 tag 重试。该入口也可归档已发布的旧版本，但不能降低 Latest。已存在的版本只能以完全相同内容幂等重试，不能覆盖或修补公开的半成品目录。格式损坏或不规范的现存 `latest.json` 会阻断更新，不能被当作首次发布。已有索引用于记录本地版本高水位；同一 tag 的身份信息不能改写，新 tag 则独立按 GitHub 身份与资产重新验证。
 
 ```bash
-gh workflow run 'Mirror release' --ref main -f tag=v0.9.1
+gh workflow run 'Mirror release' --ref main -f tag=v0.9.2
 ```
 
 镜像 job 依赖正式 `Release` 的发布后 `verify` job，不与 GitHub 发布并行。手动同步也要求仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`。自动与手动入口使用相同 concurrency group，并由服务器上的文件锁串行化实际写入。
@@ -71,9 +71,9 @@ sudo -- bash scripts/bootstrap-test.sh
 独立准备和验收（输出目录须不存在）：
 
 ```bash
-python3 -I scripts/mirror_release.py prepare --tag v0.9.1 \
+python3 -I scripts/mirror_release.py prepare --tag v0.9.2 \
   --directory /tmp/proxyscene-canonical --record /tmp/proxyscene-release.json
-python3 -I scripts/mirror_release.py verify --tag v0.9.1 \
+python3 -I scripts/mirror_release.py verify --tag v0.9.2 \
   --directory /tmp/proxyscene-canonical --output /tmp/proxyscene-public --stable
 ```
 
@@ -83,7 +83,7 @@ python3 -I scripts/mirror_release.py verify --tag v0.9.1 \
 
 ```bash
 PROXYSCENE_MIRROR_CONTAINER_TEST=1 \
-  PROXYSCENE_MIRROR_TEST_TAG=v0.9.1 \
+  PROXYSCENE_MIRROR_TEST_TAG=v0.9.2 \
   bash scripts/mirror-integration-test.sh
 ```
 

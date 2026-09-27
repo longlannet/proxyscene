@@ -208,7 +208,7 @@ BOOTSTRAP
 ```
 <!-- /bootstrap:online -->
 
-从 `v0.8.0` 起，安装器内部也可使用 `latest`；它会先通过 GitHub API 把 `latest` 解析为明确 tag，随后只从该 tag 下载。上面的 bootstrap 仍要求显式版本，便于人工确认目标。联机安装使用自定义管理程序镜像时，必须设置明确 `PROXYSCENE_VERSION`，并让 `PROXYSCENE_BASE_URL` 直接指向该 tag 的资产目录，例如 `https://dl.ll.cd/proxyscene/v0.9.1`（须已镜像该版本）。该变量只改变管理程序归档来源；`checksums.txt` 始终来自 `PROXYSCENE_REPO` 对应固定 tag 的 GitHub Release，Xray 仍走安装器原有下载路径。需要同时从镜像取得管理程序与 Xray 时，使用方式一的完整 bundle。
+从 `v0.8.0` 起，安装器内部也可使用 `latest`；它会先通过 GitHub API 把 `latest` 解析为明确 tag，随后只从该 tag 下载。上面的 bootstrap 仍要求显式版本，便于人工确认目标。联机安装使用自定义管理程序镜像时，必须设置明确 `PROXYSCENE_VERSION`，并让 `PROXYSCENE_BASE_URL` 直接指向该 tag 的资产目录，例如 `https://dl.ll.cd/proxyscene/v0.9.2`（须已镜像该版本）。该变量只改变管理程序归档来源；`checksums.txt` 始终来自 `PROXYSCENE_REPO` 对应固定 tag 的 GitHub Release，Xray 仍走安装器原有下载路径。需要同时从镜像取得管理程序与 Xray 时，使用方式一的完整 bundle。
 
 ### 方式三：从源码安装
 
@@ -550,7 +550,9 @@ Hermes 和 OpenClaw 使用不同的接管机制：
   无需填写安装路径。支持 `<Hermes配置根>/hermes-agent` 用户安装，以及官方 `/usr/local/lib/hermes-agent` 系统安装；
   系统程序可以由普通服务用户使用，配置仍保存在该用户家目录内。每次操作都重新验证当前布局。
   系统安装目录及其 `venv/bin` 必须存在、由 root 拥有且不可由组/其他用户写入；程序目录和配置文件不能经过符号链接。
-  系统安装的 Python 可执行文件链接会在限定跳数内逐跳核验目标权限。项目 `.env` 可以不存在，程序目录缺失则拒绝接管。
+  系统安装的解释器解析允许 Python 文件链接及 uv 使用的目录链接，在限定跳数内逐段检查链接、所在目录和目标：
+  全部必须属于 root，目录和最终可执行文件不可由组/其他用户写入；循环、非规范目标和不安全路径仍拒绝。
+  这不会放宽程序安装目录或配置文件的符号链接限制。项目 `.env` 可以不存在，程序目录缺失则拒绝接管。
   程序继续把 `HERMES_HOME` 和 `active_profile` 绑定到服务用户的持久身份，并检查
   profile `.env`/`.op.env`、项目 `.env` 与 `/etc/hermes/.env`；其中声明 `TELEGRAM_PROXY`、`NO_PROXY`、
   `no_proxy`、`TELEGRAM_FALLBACK_IPS`、`HERMES_TELEGRAM_DISABLE_FALLBACK_IPS`、`HERMES_HOME`、`HERMES_MANAGED_DIR` 或
@@ -779,6 +781,11 @@ drop-in、OpenClaw 配置以及对应 journal/backup，保留 root-only 证据�
 按用户名自动接管新账户的迁移命令。从 v0.7.1 升级时，如果 Dev 场景仍开启，优先用旧版先关闭再升级。旧 Dev backup
 和旧 user Telegram target 没有稳定 uid/gid/home 身份，升级后会要求人工核验，不能按同名账户自动恢复或清理。
 
+旧记录也可能缺少原始代理值、Git 配置位置或工具范围，不能仅补上当前账户的 identity 字段或修改版本号来完成迁移。
+预检须先确认实际 CoreDir、旧程序版本和原始记录，核对主备、文件归属及当前配置；没有找到旧记录只能说明“未发现”，
+不能证明另一目录或另一主机的迁移安全。`tg on`、`install --skip-node` 和 `boot-restore` 都会写配置或协调服务，不能作为
+只读预检命令。正式迁移应在 root-only 备份及回滚方案准备好后，从不依赖待迁移网关的管理连接执行。
+
 ## systemd 服务
 
 默认会创建两个 systemd 服务：
@@ -864,7 +871,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./dist/proxyscene ./cmd/pro
 之后从 Actions 页面选择 `Release`、分支选择 `main`，输入 `vMAJOR.MINOR.PATCH`；也可以执行：
 
 ```bash
-gh workflow run Release --ref main -f version=v0.9.1
+gh workflow run Release --ref main -f version=v0.9.2
 ```
 
 不要预先创建或推送 tag。工作流首先要求仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`；未配置或停用镜像时，在构建和创建 GitHub Release 前失败。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 v0.7.1、v0.8.0 到新版本的 Debian systemd 安装/升级 canary。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
