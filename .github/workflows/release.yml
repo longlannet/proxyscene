@@ -291,9 +291,12 @@ jobs:
   mirror:
     name: Mirror verified release
     needs: verify
-    uses: ./.github/workflows/mirror-release.yml
+    uses: ./.github/workflows/mirror-publish.yml
     with:
       tag: ${{ inputs.version }}
+    secrets:
+      MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+      MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
     permissions:
       contents: read
 

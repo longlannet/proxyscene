@@ -20,6 +20,8 @@ gh workflow run 'Mirror release' --ref main -f tag=v0.9.2
 
 镜像 job 依赖正式 `Release` 的发布后 `verify` job，不与 GitHub 发布并行。手动同步也要求仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`。自动与手动入口使用相同 concurrency group，并由服务器上的文件锁串行化实际写入。
 
+自动发布和手动重试都调用同一个镜像工作流，并显式传递 `MIRROR_SSH_KEY`、`MIRROR_KNOWN_HOSTS` 两个 Secret 名称；实际部署凭据仍从仅允许 main 的 `release-mirror` Environment 取得。
+
 ## 一次性部署
 
 在实际提供 `dl.ll.cd` 的服务器上单独配置 `psmirror` 账户。该账户无 sudo 权限、密码锁定；保留 `/bin/sh` 仅供 sshd 执行固定命令。不要复用 linux-temp-admin 的账号或密钥。

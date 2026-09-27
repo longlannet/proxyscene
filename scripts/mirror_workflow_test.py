@@ -7,8 +7,33 @@ import tempfile
 import unittest
 
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/mirror-release.yml"
+WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/mirror-publish.yml"
 RELEASE_WORKFLOW = WORKFLOW.with_name("release.yml")
+DISPATCH_WORKFLOW = WORKFLOW.with_name("mirror-release.yml")
+
+
+def mapping_block(name, lines, indent):
+    """Read a block mapping from the repository's actionlint-validated YAML."""
+    start = lines.index(" " * indent + name + ":")
+    body = []
+    for line in lines[start + 1:]:
+        if line and not line.startswith(" " * (indent + 2)):
+            break
+        body.append(line)
+    return body
+
+
+def direct_entries(lines, indent):
+    entries = {}
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if len(line) - len(line.lstrip()) == indent:
+            name, separator, value = line.strip().partition(":")
+            if not separator or name in entries:
+                raise AssertionError("invalid or duplicate mapping entry: " + line)
+            entries[name] = value.strip()
+    return entries
 
 
 def block(name, workflow=WORKFLOW):
@@ -107,6 +132,32 @@ printf 'verify %s\n' "$stage" >> "$CALLS"
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true", result.stderr)
 
+    def test_release_and_retry_use_the_same_worker_and_only_named_mirror_secrets(self):
+        expected_secrets = {
+            name: "${{ secrets." + name + " }}"
+            for name in ("MIRROR_SSH_KEY", "MIRROR_KNOWN_HOSTS")
+        }
+        for workflow in (RELEASE_WORKFLOW, DISPATCH_WORKFLOW):
+            with self.subTest(workflow=workflow.name):
+                jobs = mapping_block("jobs", workflow.read_text().splitlines(), 0)
+                mirror = mapping_block("mirror", jobs, 2)
+                entries = direct_entries(mirror, 4)
+                self.assertEqual(entries["uses"], "./.github/workflows/" + WORKFLOW.name)
+                self.assertNotIn("if", entries)
+                self.assertEqual(direct_entries(mapping_block("secrets", mirror, 4), 6), expected_secrets)
+                self.assertEqual(direct_entries(mapping_block("permissions", mirror, 4), 6), {"contents": "read"})
+                if workflow == RELEASE_WORKFLOW:
+                    self.assertEqual(entries["needs"], "verify")
+
+        lines = WORKFLOW.read_text().splitlines()
+        workflow_call = mapping_block("workflow_call", mapping_block("on", lines, 0), 2)
+        secret_declarations = mapping_block("secrets", workflow_call, 4)
+        self.assertEqual(set(direct_entries(secret_declarations, 6)), set(expected_secrets))
+        for name in expected_secrets:
+            self.assertEqual(direct_entries(mapping_block(name, secret_declarations, 6), 8), {"required": "false"})
+        worker = mapping_block("mirror", mapping_block("jobs", lines, 0), 2)
+        self.assertEqual(direct_entries(worker, 4)["environment"], "release-mirror")
+
     def test_sync_and_public_verification_precede_promotion_and_cleanup(self):
         self.install_stubs()
         result = self.execute("Synchronize, verify public bytes, then promote Latest")
@@ -136,13 +187,25 @@ printf 'verify %s\n' "$stage" >> "$CALLS"
         self.assertEqual(self.calls.read_text().splitlines(), ["proxyscene-mirror sync v0.9.0", "verify public"])
         self.assertEqual(list(self.root.glob("proxyscene-mirror-ssh.*")), [])
 
-    def test_missing_key_fails_before_contacting_mirror(self):
+    def test_missing_credentials_fail_before_contacting_mirror(self):
         self.install_stubs()
-        self.environment["MIRROR_SSH_KEY"] = ""
-        result = self.execute("Synchronize, verify public bytes, then promote Latest")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.calls.exists())
-        self.assertEqual(list(self.root.glob("proxyscene-mirror-ssh.*")), [])
+        for name in ("MIRROR_SSH_KEY", "MIRROR_KNOWN_HOSTS"):
+            original = self.environment[name]
+            for value in (None, ""):
+                with self.subTest(credential=name, value=value):
+                    if value is None:
+                        self.environment.pop(name, None)
+                    else:
+                        self.environment[name] = value
+                    result = self.execute("Synchronize, verify public bytes, then promote Latest")
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Mirror credentials are unavailable", result.stderr)
+                    self.assertIn("release-mirror Environment", result.stderr)
+                    self.assertIn("named secret mappings", result.stderr)
+                    self.assertNotIn("fixture-private-key", result.stderr)
+                    self.assertFalse(self.calls.exists())
+                    self.assertEqual(list(self.root.glob("proxyscene-mirror-ssh.*")), [])
+            self.environment[name] = original
 
 
 if __name__ == "__main__":
