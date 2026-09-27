@@ -17,7 +17,7 @@
 - 单二进制 Go 管理程序，安装后命令为 `proxyscene`。
 - Release 的 `checksums.txt` 覆盖版本化 `install.sh`、管理程序包、离线 bundle 和固定 Xray 对应源码归档；安装器解析 `latest` 后固定到一个明确 tag，再按 SHA256 校验下载内容。
 - 支持离线安装：先用 Release checksum 校验自包含 bundle，解压后显式运行 `install.sh --offline`；包内 manifest 会在复制前复核全部组件。
-- GitHub Actions 从 `main` 手动发起发布，交叉编译 amd64/arm64/386/armv7，校验 SHA256 后发布为 immutable Latest。
+- GitHub Actions 从 `main` 手动发起发布，交叉编译 amd64/arm64/386/armv7；检查通过并发布 GitHub immutable Latest、完成发布后校验，再同步并验收 `dl.ll.cd`。
 - 支持 Xray 主服务和开机恢复服务的 systemd 管理。
 - 支持三类代理场景：
   - 全局代理：写入系统 profile 和 apt 代理配置。
@@ -857,7 +857,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./dist/proxyscene ./cmd/pro
 
 ## 发布 Release
 
-发布不需要私钥或签名 Secret。首次发布前，仓库管理员必须先在 GitHub Settings 启用 **immutable releases**，并在发起工作流前用具备 Administration 读取权限的账号确认设置仍为 `enabled=true`。GitHub Actions 的 `GITHUB_TOKEN` 没有 Administration 权限，不能可靠读取该仓库设置；工作流会在发布后强制验证 Release 的 `immutable=true`。安装器也会拒绝可变 Release，防止发布后资产和同一份 checksum 被一起替换。
+正式发布默认同时包含 GitHub 和 `dl.ll.cd`，依次完成。GitHub 发布不需要签名私钥或签名 Secret；镜像使用本项目专用的 SSH 部署 Secret。首次发布前，仓库管理员必须先在 GitHub Settings 启用 **immutable releases**，并在发起工作流前用具备 Administration 读取权限的账号确认设置仍为 `enabled=true`。GitHub Actions 的 `GITHUB_TOKEN` 没有 Administration 权限，不能可靠读取该仓库设置；工作流会在发布后强制验证 Release 的 `immutable=true`。安装器也会拒绝可变 Release，防止发布后资产和同一份 checksum 被一起替换。
 
 先在目标提交中准备 `docs/releases/vMAJOR.MINOR.PATCH.md`，首行必须是 `# proxyscene vMAJOR.MINOR.PATCH`，写明升级要求、依赖版本和兼容限制。工作流会把这份经过审阅的说明传给发布 job，并在发布后核对公开正文。
 
@@ -867,9 +867,9 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./dist/proxyscene ./cmd/pro
 gh workflow run Release --ref main -f version=v0.9.1
 ```
 
-不要预先创建或推送 tag。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 v0.7.1、v0.8.0 到新版本的 Debian systemd 安装/升级 canary。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
+不要预先创建或推送 tag。工作流首先要求仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`；未配置或停用镜像时，在构建和创建 GitHub Release 前失败。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 v0.7.1、v0.8.0 到新版本的 Debian systemd 安装/升级 canary。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
 
-镜像发布由独立的 `mirror-release.yml` 处理：可手工输入已公开的固定 tag；配置仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true` 后，正式 Release 的只读验证成功才会自动调用。接收端验证并发布固定版本目录，CI 再匿名下载并比对全部 11 项资产，最后原子更新防降级的 `latest.json`。部署和故障恢复见 [镜像发布说明](docs/mirror-publishing.md)。镜像失败不改变已发布的 immutable GitHub Release。
+上述 GitHub 发布和只读验证全部成功后，正式 Release 必须调用 `mirror-release.yml` 完成镜像发布。接收端验证并发布固定版本目录，CI 再匿名下载并逐字节比对全部 11 项资产，最后原子更新防降级的 `latest.json` 并再次验收。镜像失败时整个发布仍未完成，已发布的 immutable GitHub Release 保留；修复后从 `main` 单独运行 `Mirror release` 并输入相同 tag 重试，无需重建或重发 GitHub Release。部署和故障恢复见 [镜像发布说明](docs/mirror-publishing.md)。
 
 如果创建 draft、上传资产或发布期间中断，不要直接盲目重跑完整 workflow。先在 GitHub 核对同名 tag、draft/Release 和资产是否存在；确认残留内容及目标 commit 后，人工删除未发布的残留 draft/tag，或仅重跑尚未执行的只读验证。工作流不会自动删除发布对象。
 

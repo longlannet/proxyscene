@@ -54,13 +54,17 @@ mirror installer would still require validation against the canonical GitHub che
 `PROXYSCENE_VERSION` and `PROXYSCENE_BASE_URL` must be fixed before execution. Do not use a
 curl-to-shell entrypoint. The installer and CLI do not acquire a new self-update or mirror trust mode.
 
-The separate `mirror-release.yml` accepts an explicit published tag. Automatic invocation runs only
-after the official Release verification succeeds and only when
-`PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`. The dedicated non-root receiver accepts only fixed-tag
+Every official release includes both GitHub and `dl.ll.cd`. Before building or publishing to GitHub,
+the Release workflow requires `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`; a missing or disabled
+configuration blocks the release instead of skipping the mirror. All build and test gates, immutable
+GitHub publication, and the complete post-publication verification must succeed before the required
+`mirror-release.yml` job starts. The dedicated non-root receiver accepts only fixed-tag
 `sync` and `promote` forced commands; it fetches and validates assets from GitHub itself, stages files
 outside the public tree, and atomically publishes a complete version directory. After CI anonymously
 compares all 11 public assets, promotion atomically updates `latest.json` and rejects downgrades.
 An SSH publication credential does not authorize arbitrary uploaded files or shell commands.
+Mirror failure leaves the overall publication incomplete and preserves the immutable GitHub Release.
+The mirror workflow also accepts an explicit published tag for an independent retry after recovery.
 See [mirror publishing](docs/mirror-publishing.md) for deployment and recovery.
 
 ## Installer Boundaries

@@ -8,10 +8,11 @@ import unittest
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/mirror-release.yml"
+RELEASE_WORKFLOW = WORKFLOW.with_name("release.yml")
 
 
-def block(name):
-    lines = WORKFLOW.read_text().splitlines()
+def block(name, workflow=WORKFLOW):
+    lines = workflow.read_text().splitlines()
     start = lines.index("      - name: " + name)
     for start in range(start + 1, len(lines)):
         if lines[start] == "        run: |":
@@ -49,8 +50,8 @@ class WorkflowTests(unittest.TestCase):
         path.write_text("#!/bin/bash\nset -eu\n" + body)
         path.chmod(0o755)
 
-    def execute(self, name):
-        return subprocess.run(["bash", "-c", block(name)], env=self.environment,
+    def execute(self, name, workflow=WORKFLOW):
+        return subprocess.run(["bash", "-c", block(name, workflow)], env=self.environment,
                               text=True, capture_output=True, timeout=20)
 
     def install_stubs(self):
@@ -91,6 +92,20 @@ printf 'verify %s\n' "$stage" >> "$CALLS"
                 self.environment[key] = original
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse((self.root / "injected").exists())
+
+    def test_release_requires_configured_mirror(self):
+        step = "Require configured mirror before release"
+        result = self.execute(step, RELEASE_WORKFLOW)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for value in (None, "", "false", "TRUE", "true ", "1"):
+            with self.subTest(configured=value):
+                if value is None:
+                    self.environment.pop("MIRROR_CONFIGURED", None)
+                else:
+                    self.environment["MIRROR_CONFIGURED"] = value
+                result = self.execute(step, RELEASE_WORKFLOW)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true", result.stderr)
 
     def test_sync_and_public_verification_precede_promotion_and_cleanup(self):
         self.install_stubs()
