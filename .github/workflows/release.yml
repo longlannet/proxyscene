@@ -22,6 +22,16 @@ jobs:
     outputs:
       source_commit: ${{ steps.source.outputs.commit }}
     steps:
+      - name: Require configured mirror before release
+        shell: bash
+        env:
+          MIRROR_CONFIGURED: ${{ vars.PROXYSCENE_RELEASE_MIRROR_CONFIGURED }}
+        run: |
+          set -euo pipefail
+          if [[ "${MIRROR_CONFIGURED:-}" != true ]]; then
+            echo "正式发布必须包含 GitHub 和 dl.ll.cd；请先完成镜像配置并设置 PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true" >&2
+            exit 1
+          fi
       - name: Checkout selected main commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -281,7 +291,6 @@ jobs:
   mirror:
     name: Mirror verified release
     needs: verify
-    if: vars.PROXYSCENE_RELEASE_MIRROR_CONFIGURED == 'true'
     uses: ./.github/workflows/mirror-release.yml
     with:
       tag: ${{ inputs.version }}

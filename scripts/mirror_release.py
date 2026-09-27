@@ -38,6 +38,7 @@ MIRROR_BASE = "https://dl.ll.cd/proxyscene"
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_ASSET_BYTES = 256 * 1024 * 1024
 MAX_RELEASE_BYTES = 512 * 1024 * 1024
+MAX_API_TOKEN_BYTES = 4096
 NETWORK_TIMEOUT = 180
 DOWNLOAD_BUDGET = 300
 API_TIMEOUT = 40
@@ -184,7 +185,11 @@ def _download_url(url, destination, max_bytes, *, api=False, token=None, mirror=
             raise MirrorError("unexpected public mirror URL")
     elif not url.startswith(RELEASE_BASE + "/") or parsed.netloc != "github.com":
         raise MirrorError("unexpected GitHub download URL")
-    if token is not None and (not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,4096}", token)):
+    # RFC 6750 section 2.1 permits opaque Bearer tokens, including installation
+    # tokens with punctuation. Keep a bounded ASCII value without curl config
+    # quoting/control characters; padding is allowed only at the end.
+    if token is not None and (not isinstance(token, str) or len(token) > MAX_API_TOKEN_BYTES
+                              or not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token)):
         raise MirrorError("invalid GitHub API token syntax")
     timeout = API_TIMEOUT if api else NETWORK_TIMEOUT
     if deadline is not None:

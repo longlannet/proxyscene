@@ -311,6 +311,39 @@ class TransportTests(Fixture):
         self.assertTrue(callable(self.options["preexec_fn"]))
         self.assertEqual(stat.S_IMODE((self.root / "api").stat().st_mode), 0o644)
 
+    def test_standard_bearer_tokens_only_pass_through_stdin_config(self):
+        fixtures = (
+            ("legacy", "ghs_fixture_123"),
+            ("installation", "ghs_fixture.header-payload.signature"),
+            ("alphabet", "AZaz09-._~+/"),
+            ("padding", "AZaz09-._~+/=="),
+            ("length-limit", "x" * (mirror.MAX_API_TOKEN_BYTES - 1) + "="),
+        )
+        for label, token in fixtures:
+            with self.subTest(label=label), mock.patch.dict(os.environ, {"GH_TOKEN": token, "GITHUB_TOKEN": token}), mock.patch.object(mirror.subprocess, "run", side_effect=self.fake_run):
+                mirror._download_url(mirror.API_BASE + "/releases/latest", self.root / label, 100, api=True, token=token)
+                self.assertEqual(self.options["input"], 'header = "Authorization: Bearer ' + token + '"\n')
+                self.assertEqual(self.command[self.command.index("--config") + 1], "-")
+                self.assertNotIn(token, " ".join(self.command))
+                self.assertNotIn("GH_TOKEN", self.options["env"])
+                self.assertNotIn("GITHUB_TOKEN", self.options["env"])
+                self.assertEqual(self.options["stderr"], subprocess.DEVNULL)
+
+    def test_invalid_bearer_tokens_rejected_before_process_or_file_creation(self):
+        invalid = (
+            "", b"bytes", 123, "x" * (mirror.MAX_API_TOKEN_BYTES + 1),
+            "=", "==", "=prefix", "middle=padding", "padding==suffix",
+            "double\"quote", "single'quote", "back\\slash", "\"\nurl = \"https://evil.example",
+            "carriage\rreturn", "line\nfeed", "trailing\n", "null\0byte", "delete\x7f",
+            "space separated", " leading", "trailing ", "tab\there", "vertical\vtab", "form\ffeed",
+            "nonascii-é", "unicode\u00a0space", "colon:header", "semicolon;value",
+        )
+        for token in invalid:
+            with self.subTest(token=repr(token)[:80]), mock.patch.object(mirror.subprocess, "run") as run, self.assertRaisesRegex(mirror.MirrorError, "^invalid GitHub API token syntax$"):
+                mirror._download_url(mirror.API_BASE + "/releases/latest", self.root / "invalid-token", 100, api=True, token=token)
+            run.assert_not_called()
+            self.assertFalse((self.root / "invalid-token").exists())
+
     def test_github_assets_are_anonymous_https_and_mirror_cannot_redirect(self):
         for origin, extra in ((mirror.RELEASE_BASE + "/v0.9.0/install.sh", {}), (mirror.MIRROR_BASE + "/v0.9.0/install.sh", {"mirror": True})):
             with self.subTest(origin=origin), mock.patch.object(mirror.subprocess, "run", side_effect=self.fake_run):
@@ -355,6 +388,9 @@ class TransportTests(Fixture):
         cases = [
             ("https://evil.example/release", {"api": True, "token": "secret"}),
             (mirror.RELEASE_BASE + "/v0.9.0/install.sh", {"token": "secret"}),
+            (mirror.MIRROR_BASE + "/v0.9.0/install.sh", {"mirror": True, "token": "AZaz09-._~+/=="}),
+            (mirror.API_BASE + "/releases/latest", {"token": "AZaz09-._~+/=="}),
+            ("https://api.github.com/repos/other/project/releases/latest", {"api": True, "token": "AZaz09-._~+/=="}),
             (mirror.API_BASE + "/releases/latest", {"api": True, "token": "bad\nheader"}),
             (mirror.MIRROR_BASE + "/v0.9.0/install.sh?token=secret", {"mirror": True}),
             ("https://dl.ll.cd.evil/proxyscene/v0.9.0/install.sh", {"mirror": True}),

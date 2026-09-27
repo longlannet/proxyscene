@@ -1,22 +1,24 @@
 # 发布到 dl.ll.cd
 
-proxyscene 镜像位于 `https://dl.ll.cd/proxyscene`。它保存 GitHub 已公开、稳定且不可变 Release 的原始资产，不重建程序，不改写安装器。GitHub 仍是版本身份与 SHA256 的信任来源；镜像不是独立签名系统。
+proxyscene 正式发布默认同时包含 GitHub 和 `https://dl.ll.cd/proxyscene`，先完成 GitHub 检查和发布，再发布镜像。镜像保存 GitHub 已公开、稳定且不可变 Release 的原始资产，不重建程序，不改写安装器。GitHub 仍是版本身份与 SHA256 的信任来源；镜像不是独立签名系统。
 
 ## 发布流程
 
-1. 从 `main` 启动 `Mirror release`，输入已发布的稳定 tag。
-2. 工作流从固定 GitHub 仓库验证 tag、commit、Release ID、不可变状态和精确 11 项资产；下载并核对 GitHub digest、实际大小及 `checksums.txt`。
-3. 专用 SSH 接收端执行 `proxyscene-mirror sync vMAJOR.MINOR.PATCH`。服务器独立从 GitHub 拉取并校验相同资产，在私有暂存目录准备完整版本，以不覆盖的原子目录重命名提交。
-4. 工作流从公开 HTTPS 镜像下载全部 11 项文件，与原始 GitHub 下载逐字节比较。
-5. 仅当选中 tag 仍是 GitHub Latest，才执行 `proxyscene-mirror promote TAG`。服务器重新核对 GitHub Latest、本地完整版本及单调版本顺序，原子更新 `latest.json`；工作流再次验收。
+1. 从 `main` 启动正式 `Release`，输入新稳定版本。构建前必须确认仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`；缺失或禁用会阻止本次发布。
+2. GitHub Actions 完成全部构建、测试、漏洞扫描、双重构建比对和 systemd canary 门禁，然后创建并公开 GitHub immutable Latest。
+3. GitHub 发布后验证确认 tag、commit、不可变状态、Latest、正文及全部资产 digest 和下载字节。仅当这些检查全部成功，才自动启动必须执行的镜像 job。
+4. 镜像工作流从固定 GitHub 仓库验证 tag、commit、Release ID、不可变状态和精确 11 项资产；下载并核对 GitHub digest、实际大小及 `checksums.txt`。
+5. 专用 SSH 接收端执行 `proxyscene-mirror sync vMAJOR.MINOR.PATCH`。服务器独立从 GitHub 拉取并校验相同资产，在私有暂存目录准备完整版本，以不覆盖的原子目录重命名提交。
+6. 工作流从公开 HTTPS 镜像下载全部 11 项文件，与原始 GitHub 下载逐字节比较。
+7. 仅当选中 tag 仍是 GitHub Latest，才执行 `proxyscene-mirror promote TAG`。服务器重新核对 GitHub Latest、本地完整版本及单调版本顺序，原子更新 `latest.json`；工作流再次验收。
 
-旧版本允许归档，但不能降低 Latest。已存在的版本只能以完全相同内容幂等重试，不能覆盖或修补公开的半成品目录。格式损坏或不规范的现存 `latest.json` 会阻断更新，不能被当作首次发布。已有索引用于记录本地版本高水位；同一 tag 的身份信息不能改写，新 tag 则独立按 GitHub 身份与资产重新验证。镜像故障不会删除或重建已经发布的 GitHub Release；修复后单独重跑镜像工作流。
+镜像失败时整个发布仍未完成，不会删除或重建已经发布的 GitHub Release；修复后从 `main` 单独运行 `Mirror release`，输入相同 tag 重试。该入口也可归档已发布的旧版本，但不能降低 Latest。已存在的版本只能以完全相同内容幂等重试，不能覆盖或修补公开的半成品目录。格式损坏或不规范的现存 `latest.json` 会阻断更新，不能被当作首次发布。已有索引用于记录本地版本高水位；同一 tag 的身份信息不能改写，新 tag 则独立按 GitHub 身份与资产重新验证。
 
 ```bash
 gh workflow run 'Mirror release' --ref main -f tag=v0.9.1
 ```
 
-正式 `Release` 工作流在 GitHub 发布后校验成功时，按仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true` 自动调用相同镜像流程。未配置镜像时该可选 job 跳过。手动同步也要求该变量为 true。自动与手动入口使用相同 concurrency group，并由服务器上的文件锁串行化实际写入。
+镜像 job 依赖正式 `Release` 的发布后 `verify` job，不与 GitHub 发布并行。手动同步也要求仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`。自动与手动入口使用相同 concurrency group，并由服务器上的文件锁串行化实际写入。
 
 ## 一次性部署
 
@@ -55,7 +57,7 @@ restrict,command="/usr/bin/python3 -I /usr/local/libexec/proxyscene-mirror/mirro
 
 使用独立 Environment `release-mirror`，只允许 main 部署。配置环境变量 `MIRROR_HOST`、`MIRROR_PORT`、`MIRROR_USER`；后者为本项目的 `psmirror`。配置环境 Secret `MIRROR_SSH_KEY`、`MIRROR_KNOWN_HOSTS`。按组织策略设置部署保护；不要借用其它项目的发布 Secret。
 
-全部部署检查通过后，最后设置仓库级变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`。停用镜像发布时将其改为 false；该变量不会改动已有 GitHub Release 或镜像版本文件。工作流只有 contents:read 权限，不执行待镜像 tag 内的代码，所有验证代码来自发起工作流的 main 提交。
+全部部署检查通过后，最后设置仓库级变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`。将其改为 false 或删除变量，会同时阻止新正式发布和手动镜像同步，不会只跳过镜像，也不会改动已有 GitHub Release 或镜像版本文件。镜像工作流只有 contents:read 权限，不执行待镜像 tag 内的代码，所有验证代码来自发起工作流的 main 提交。
 
 ## 验证与故障恢复
 
