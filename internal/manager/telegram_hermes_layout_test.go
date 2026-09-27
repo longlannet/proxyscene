@@ -92,7 +92,7 @@ func TestHermesUserProjectMustExistWithoutDotenv(t *testing.T) {
 	}
 }
 
-func hermesSystemLayoutFixture(t *testing.T) (string, func(string) error) {
+func hermesSystemLayoutFixture(t *testing.T) (string, func(string) error, func(string) error) {
 	t.Helper()
 	if os.Geteuid() != 0 {
 		t.Skip("system installation fixture must be root-owned")
@@ -122,7 +122,9 @@ func hermesSystemLayoutFixture(t *testing.T) (string, func(string) error) {
 			}
 		}
 	}
-	return project, check
+	return project, check, func(path string) error {
+		return validateHermesSystemExecutableAt(anchor, path)
+	}
 }
 
 func hermesSystemLayoutUnit(project, entry string, hooks bool) string {
@@ -142,7 +144,7 @@ func hermesSystemLayoutUnit(project, entry string, hooks bool) string {
 func TestHermesSystemProjectAllowsOfficialExecutableForms(t *testing.T) {
 	for _, entry := range []string{"python", "hermes-agent", "hermes_cli"} {
 		t.Run(entry, func(t *testing.T) {
-			project, check := hermesSystemLayoutFixture(t)
+			project, check, checkExecutable := hermesSystemLayoutFixture(t)
 			python := filepath.Join(project, "venv", "bin", "python")
 			if err := os.Rename(python, python+"3.11"); err != nil {
 				t.Fatal(err)
@@ -157,7 +159,7 @@ func TestHermesSystemProjectAllowsOfficialExecutableForms(t *testing.T) {
 			if _, err := validateHermesEffectiveUnit(unit); err != nil {
 				t.Fatal(err)
 			}
-			if err := validateHermesSystemProjectWithDirectoryCheck(unit, project, check); err != nil {
+			if err := validateHermesSystemProjectWithChecks(unit, project, check, checkExecutable); err != nil {
 				t.Fatalf("normal venv leaf links rejected: %v", err)
 			}
 		})
@@ -167,7 +169,7 @@ func TestHermesSystemProjectAllowsOfficialExecutableForms(t *testing.T) {
 func TestHermesSystemProjectRejectsUnsafeInstallations(t *testing.T) {
 	for _, kind := range []string{"missing root", "missing venv", "missing bin", "root writable", "venv writable", "bin writable", "foreign root", "root symlink", "venv symlink", "bin symlink", "missing executable", "foreign executable", "writable executable", "non executable", "executable fifo", "dangling link", "link cycle", "foreign link", "noncanonical link target", "writable link target parent", "console unsafe stop interpreter"} {
 		t.Run(kind, func(t *testing.T) {
-			project, check := hermesSystemLayoutFixture(t)
+			project, check, checkExecutable := hermesSystemLayoutFixture(t)
 			venv := filepath.Join(project, "venv")
 			bin := filepath.Join(venv, "bin")
 			python := filepath.Join(bin, "python")
@@ -237,7 +239,7 @@ func TestHermesSystemProjectRejectsUnsafeInstallations(t *testing.T) {
 				must(os.Chmod(python, 0777))
 			}
 			unit := hermesSystemLayoutUnit(project, entry, true)
-			if err := validateHermesSystemProjectWithDirectoryCheck(unit, project, check); err == nil {
+			if err := validateHermesSystemProjectWithChecks(unit, project, check, checkExecutable); err == nil {
 				t.Fatal("unsafe system installation accepted")
 			}
 		})
@@ -245,8 +247,158 @@ func TestHermesSystemProjectRejectsUnsafeInstallations(t *testing.T) {
 }
 
 func TestHermesSystemDirectoryRejectsWritableAncestor(t *testing.T) {
-	project, _ := hermesSystemLayoutFixture(t)
+	project, _, _ := hermesSystemLayoutFixture(t)
 	if err := validateHermesSystemDirectory(project); err == nil {
 		t.Fatal("production validator accepted installation under writable /tmp")
+	}
+}
+
+func TestHermesSystemProjectAllowsTrustedUVDirectoryLinks(t *testing.T) {
+	for _, kind := range []string{"absolute", "relative", "relative parent", "chained"} {
+		t.Run(kind, func(t *testing.T) {
+			project, check, checkExecutable := hermesSystemLayoutFixture(t)
+			python := filepath.Join(project, "venv", "bin", "python")
+			generation := filepath.Join(project, ".hermes-runtime", "python", "generation")
+			version := filepath.Join(generation, "cpython-3.11.15-linux-x86_64-gnu")
+			alias := filepath.Join(generation, "cpython-3.11-linux-x86_64-gnu")
+			must := func(err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			must(os.MkdirAll(filepath.Join(version, "bin"), 0755))
+			must(os.Rename(python, filepath.Join(version, "bin", "python3.11")))
+			directoryTarget := version
+			pythonTarget := filepath.Join(alias, "bin", "python3.11")
+			switch kind {
+			case "relative":
+				directoryTarget = filepath.Base(version)
+				pythonTarget = "../../.hermes-runtime/python/generation/cpython-3.11-linux-x86_64-gnu/bin/python3.11"
+			case "relative parent":
+				directoryTarget = "../generation/" + filepath.Base(version)
+			case "chained":
+				must(os.Symlink(version, alias+"-current"))
+				directoryTarget = filepath.Base(alias) + "-current"
+				must(os.Symlink("python3.11", filepath.Join(version, "bin", "python3")))
+				pythonTarget = filepath.Join(alias, "bin", "python3")
+			}
+			must(os.Symlink(directoryTarget, alias))
+			must(os.Symlink(pythonTarget, python))
+			if err := check(filepath.Join(alias, "bin")); err == nil {
+				t.Fatal("strict installation directory checker accepted the uv alias")
+			}
+			for _, entry := range []string{"python", "hermes-agent"} {
+				unit := hermesSystemLayoutUnit(project, entry, true)
+				if err := validateHermesSystemProjectWithChecks(unit, project, check, checkExecutable); err != nil {
+					t.Fatalf("trusted uv runtime rejected for %s: %v", entry, err)
+				}
+			}
+		})
+	}
+}
+
+func TestHermesSystemExecutableRejectsUnsafeDirectoryLinks(t *testing.T) {
+	for _, kind := range []string{
+		"foreign alias", "writable alias parent", "foreign alias parent", "writable target parent", "foreign target parent",
+		"writable target", "foreign target", "writable target bin", "foreign target bin", "writable binary", "foreign binary",
+		"directory cycle", "dangling directory", "directory target is file", "noncanonical directory target", "noncanonical binary target",
+		"absolute escape", "relative escape", "binary is directory", "binary is fifo", "relative executable", "noncanonical executable",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			project, _, checkExecutable := hermesSystemLayoutFixture(t)
+			python := filepath.Join(project, "venv", "bin", "python")
+			aliasParent := filepath.Join(project, "runtime")
+			targetParent := filepath.Join(project, "store")
+			version := filepath.Join(targetParent, "cpython-3.11.15")
+			alias := filepath.Join(aliasParent, "cpython-3.11")
+			binary := filepath.Join(version, "bin", "python3.11")
+			must := func(err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			must(os.MkdirAll(aliasParent, 0755))
+			must(os.MkdirAll(filepath.Dir(binary), 0755))
+			must(os.Rename(python, binary))
+			aliasTarget := version
+			pythonTarget := filepath.Join(alias, "bin", "python3.11")
+			mutations := map[string]string{
+				"alias parent": aliasParent, "target parent": targetParent, "target": version,
+				"target bin": filepath.Dir(binary), "binary": binary,
+			}
+			for name, path := range mutations {
+				if kind == "writable "+name {
+					must(os.Chmod(path, 0775))
+				} else if kind == "foreign "+name {
+					must(os.Chown(path, 1, 1))
+				}
+			}
+			switch kind {
+			case "directory cycle":
+				aliasTarget = filepath.Base(alias)
+			case "dangling directory":
+				aliasTarget = "missing"
+			case "directory target is file":
+				aliasTarget = binary
+			case "noncanonical directory target":
+				aliasTarget = targetParent + "/unchecked/../" + filepath.Base(version)
+			case "noncanonical binary target":
+				pythonTarget = alias + "/bin/../bin/python3.11"
+			case "absolute escape":
+				aliasTarget = "/usr/bin"
+			case "relative escape":
+				aliasTarget = "../../../usr/bin"
+			case "binary is directory":
+				must(os.Remove(binary))
+				must(os.Mkdir(binary, 0755))
+			case "binary is fifo":
+				must(os.Remove(binary))
+				must(syscall.Mkfifo(binary, 0755))
+			}
+			must(os.Symlink(aliasTarget, alias))
+			must(os.Symlink(pythonTarget, python))
+			if kind == "foreign alias" {
+				must(os.Lchown(alias, 1, 1))
+			}
+			if kind == "relative executable" {
+				python = "venv/bin/python"
+			} else if kind == "noncanonical executable" {
+				python = project + "/venv/../venv/bin/python"
+			}
+			if err := checkExecutable(python); err == nil {
+				t.Fatal("unsafe interpreter path accepted")
+			}
+		})
+	}
+}
+
+func TestHermesSystemExecutableBoundsCombinedDirectoryAndLeafLinks(t *testing.T) {
+	for _, count := range []int{16, 17} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			project, _, checkExecutable := hermesSystemLayoutFixture(t)
+			python := filepath.Join(project, "venv", "bin", "python")
+			binary := python + "3.11"
+			if err := os.Rename(python, binary); err != nil {
+				t.Fatal(err)
+			}
+			for i := count - 2; i >= 0; i-- {
+				target := filepath.Join(project, "venv", "bin")
+				if i < count-2 {
+					target = filepath.Join(project, fmt.Sprintf("alias-%d", i+1))
+				}
+				if err := os.Symlink(target, filepath.Join(project, fmt.Sprintf("alias-%d", i))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(filepath.Join(project, "alias-0", filepath.Base(binary)), python); err != nil {
+				t.Fatal(err)
+			}
+			err := checkExecutable(python)
+			if (err == nil) != (count == 16) {
+				t.Fatalf("combined links=%d: %v", count, err)
+			}
+		})
 	}
 }

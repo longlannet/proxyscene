@@ -198,8 +198,11 @@ The latter may serve a non-root user, but its project and virtual-environment di
 be root-owned and not be group/world writable, with no symlink directory components. Its optional
 project `.env` uses the same root-owned, bounded, no-follow reader as managed configuration and the
 same routing-key checks as user dotenv files. A missing project is an error, not an absent optional file.
-System-install executable leaf symlinks are resolved with a finite hop limit and trusted directory/file checks, so
-normal Python virtual environments remain supported. This retains the trust assumption of an
+System-install interpreter paths may contain leaf symlinks and uv directory symlinks. Resolution uses
+descriptor-relative, no-follow component checks with a finite hop limit: every link, traversed directory,
+and final executable must be root-owned, and directories/files cannot be group/world writable.
+Noncanonical link targets and cycles fail closed. Project and configuration paths retain their separate
+no-symlink rules. This retains the trust assumption of an
 administrator-maintained official installation; it is not a general proof of arbitrary Python `.pth`
 hooks or import finders. Runtime validation does not execute the target interpreter for discovery.
 The current layout is revalidated for each operation; the ownership journal continues to track only

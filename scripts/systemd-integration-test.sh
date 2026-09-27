@@ -248,6 +248,8 @@ prefix.with_suffix(".runtime").write_text(json.dumps({
     "hermes_home": os.environ.get("HERMES_HOME"),
     "proxy": os.environ.get("TELEGRAM_PROXY", ""),
     "safe_path": sys.flags.safe_path,
+    "prefix": sys.prefix,
+    "base_prefix": sys.base_prefix,
 }))
 while True:
     time.sleep(3600)
@@ -262,6 +264,22 @@ HERMES_HOOK
   # installations must still be readable/executable by the service user.
   find "$project" -type d -exec chmod 0755 {} +
   find "$project" -type f -exec chmod go+r {} +
+}
+
+wire_hermes_uv_interpreter_fixture() {
+  local project="$1" runtime alias version
+  runtime="$project/.hermes-runtime/python"
+  alias="$runtime/cpython-current-linux-x86_64-gnu"
+  version="$runtime/cpython-fixture-linux-x86_64-gnu"
+  install -d -m 0755 "$project/.hermes-runtime" "$runtime" "$version" "$version/bin"
+  ln -s -- /usr/bin/python3 "$version/bin/python3"
+  ln -s -- "${version##*/}" "$alias"
+  # Preserve pyvenv.cfg and editable imports while exercising an intermediate
+  # directory link in the real interpreter path used by systemd and both hooks.
+  ln -sfn -- "$alias/bin/python3" "$project/venv/bin/python"
+  [[ -L "$alias" && -d "$alias" ]] || fail "uv fixture lacks directory alias"
+  assert_eq "$(readlink -e -- /usr/bin/python3)" \
+    "$(readlink -e -- "$project/venv/bin/python")" "uv fixture interpreter target"
 }
 
 write_hermes_layout_unit() {
@@ -292,6 +310,7 @@ assert_hermes_layout_runtime() {
   jq -e --arg project "$project" --argjson uid "$service_uid" \
     --arg config "$config_home" --arg home "${config_home%/*}" --arg proxy "$expected_proxy" \
     '.project == $project and .uid == $uid and .home == $home and .hermes_home == $config and .proxy == $proxy
+     and .prefix == ($project + "/venv") and .prefix != .base_prefix
      and (if $proxy == "" then true else .safe_path == true end)' \
     /run/proxyscene-integration-targets/hermes-layout.runtime >/dev/null
 }
@@ -341,6 +360,7 @@ HERMES_LAYOUT_CONFIG
   install_hermes_python_fixture "$user_project"
   chown -R "$service_user:$service_user" "$user_project"
   install_hermes_python_fixture "$system_project"
+  wire_hermes_uv_interpreter_fixture "$system_project"
   assert_eq 0 "$(stat -c '%u' "$system_project")" "system Hermes project owned by root"
   [[ -L "$system_project/venv/bin/python" ]] || fail "system Hermes venv fixture lacks interpreter link"
 
@@ -381,10 +401,20 @@ HERMES_UNSAFE_ENV
   mkfifo -m 0600 "$system_project/.env"
   assert_hermes_layout_rejected fifo-dotenv "$evidence_dir" "$state_path" '.env'
   rm -- "$system_project/.env"
+  chmod 0775 "$system_project/.hermes-runtime/python"
+  assert_hermes_layout_rejected writable-uv-alias-parent "$evidence_dir" "$state_path" \
+    "$system_project/venv/bin/python"
+  chmod 0755 "$system_project/.hermes-runtime/python"
+  chown -h "$service_user:$service_user" \
+    "$system_project/.hermes-runtime/python/cpython-current-linux-x86_64-gnu"
+  assert_hermes_layout_rejected foreign-uv-alias "$evidence_dir" "$state_path" \
+    "$system_project/venv/bin/python"
+  chown -h root:root "$system_project/.hermes-runtime/python/cpython-current-linux-x86_64-gnu"
 
   env PROXYSCENE_TG_SERVICES=hermes-gateway /usr/local/bin/proxyscene tg on
   wait_for "non-root service uses trusted root-owned Hermes and safe Python import" \
     assert_hermes_layout_runtime "$system_project" "$service_uid" "$config_home" http://127.0.0.1:7892
+  printf 'HERMES_UV_INTERPRETER_OK trusted_directory_alias actual_python_venv systemd_nonroot\n'
   count_before="$(target_start_count hermes-layout)"
   /usr/local/bin/proxyscene tg on
   assert_eq "$count_before" "$(target_start_count hermes-layout)" \
