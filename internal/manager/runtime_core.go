@@ -509,6 +509,9 @@ func (a *App) applyCorePlan(p *runtimeCorePlan) error {
 	if err := a.restartXrayService(); err != nil {
 		return err
 	}
+	if err := a.waitCoreRestartExecution(p.AfterUnit, p.AfterConfig, p.Identity, p.BinaryDigest); err != nil {
+		return err
+	}
 	return a.saveCoreLoaded(p)
 }
 func (a *App) compensateCorePlan(p *runtimeCorePlan, checkpoint func() error) error {
@@ -611,6 +614,9 @@ func (a *App) compensateCorePlan(p *runtimeCorePlan, checkpoint func() error) er
 		}
 		if changed || p.RestoreServicePending || state.Active != "active" {
 			if err := a.restartXrayService(); err != nil {
+				return err
+			}
+			if err := a.waitCoreRestartExecution(p.BeforeUnit, p.BeforeConfig, beforeIdentity, p.BinaryDigest); err != nil {
 				return err
 			}
 		}

@@ -396,6 +396,10 @@ func (a *App) telegramTargetOwnership(target systemdTargetName) (*persistedUserI
 }
 
 func (a *App) restartTelegramTarget(target systemdTargetName) error {
+	return a.restartTelegramTargetForOperation(target, false)
+}
+
+func (a *App) restartTelegramTargetForOperation(target systemdTargetName, release bool) error {
 	if err := a.validatePreparedHermesTelegramRestart(target); err != nil {
 		return err
 	}
@@ -420,7 +424,11 @@ func (a *App) restartTelegramTarget(target systemdTargetName) error {
 	// Check the message policy after the final running-state decision. A gateway
 	// that was stopped during preflight may have started in the meantime.
 	if !openClawOwned {
-		if err := telegramValidateHermesRestartPolicy(target, identity); err != nil {
+		validatePolicy := telegramValidateHermesRestartPolicy
+		if release {
+			validatePolicy = telegramValidateHermesReleaseRestartPolicy
+		}
+		if err := validatePolicy(target, identity); err != nil {
 			return err
 		}
 	}

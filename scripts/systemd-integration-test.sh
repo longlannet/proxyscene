@@ -1311,12 +1311,20 @@ LEGACY_ENV
   hermes_before="$(target_start_count hermes)"
   rm -f /run/proxyscene-telegram-reload-crash
   failure_output="$test_root/telegram-reload-crash.log"
+  # User systemd commands run as their persisted UID; the shared helper must
+  # be traversable by that UID instead of living below the root-only fixture.
+  assert_no_path "$trusted_fault_bin"
+  install -m 0755 "$fault_bin" "$trusted_fault_bin"
   expect_failure "Telegram cleanup crash after unlink" "$failure_output" \
-    env "PATH=$fault_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    env \
       PROXYSCENE_FAULT_MODE=kill-daemon-reload \
       PROXYSCENE_FAULT_MARKER=/run/proxyscene-telegram-reload-crash \
       /usr/local/bin/proxyscene tg off
-  assert_file /run/proxyscene-telegram-reload-crash
+  rm -f -- "$trusted_fault_bin"
+  if [[ ! -f /run/proxyscene-telegram-reload-crash ]]; then
+    cat -- "$failure_output" >&2
+    fail "Telegram cleanup did not reach the crash injection point"
+  fi
   assert_json "$old_state" '.scene_enabled.telegram == true' \
     "crashed Telegram cleanup left durable enabled state"
   assert_no_path /etc/openclaw-hermes-tg-proxy.env

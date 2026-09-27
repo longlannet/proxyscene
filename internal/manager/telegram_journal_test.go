@@ -27,8 +27,15 @@ func newTelegramJournalTestHarness(t *testing.T) *telegramJournalTestHarness {
 	h := &telegramJournalTestHarness{app: testApp(t), dir: t.TempDir()}
 	stubTelegramServiceState(t, telegramServiceState{LoadState: "loaded", ActiveState: "active"})
 	oldRestartPolicy := telegramValidateHermesRestartPolicy
-	t.Cleanup(func() { telegramValidateHermesRestartPolicy = oldRestartPolicy })
+	oldReleaseRestartPolicy := telegramValidateHermesReleaseRestartPolicy
+	t.Cleanup(func() {
+		telegramValidateHermesRestartPolicy = oldRestartPolicy
+		telegramValidateHermesReleaseRestartPolicy = oldReleaseRestartPolicy
+	})
 	telegramValidateHermesRestartPolicy = func(systemdTargetName, *persistedUserIdentity) error { return nil }
+	telegramValidateHermesReleaseRestartPolicy = func(target systemdTargetName, identity *persistedUserIdentity) error {
+		return telegramValidateHermesRestartPolicy(target, identity)
+	}
 	oldReloadState := openClawReloadUnitState
 	t.Cleanup(func() { openClawReloadUnitState = oldReloadState })
 	openClawReloadUnitState = func(systemdTargetName, *persistedUserIdentity) (string, error) {
@@ -64,6 +71,7 @@ func newTelegramJournalTestHarness(t *testing.T) *telegramJournalTestHarness {
 	oldSystemFsync := telegramSystemDirFsync
 	oldSystemCASAfterQuarantine := telegramSystemCASAfterQuarantine
 	oldRuntimeValidator := telegramValidateHermesTarget
+	oldReleaseValidator := telegramValidateHermesReleaseTarget
 	t.Cleanup(func() {
 		telegramManagedSystemPath = oldManagedSystemPath
 		telegramManagedUserPath = oldManagedUserPath
@@ -86,6 +94,7 @@ func newTelegramJournalTestHarness(t *testing.T) *telegramJournalTestHarness {
 		telegramSystemDirFsync = oldSystemFsync
 		telegramSystemCASAfterQuarantine = oldSystemCASAfterQuarantine
 		telegramValidateHermesTarget = oldRuntimeValidator
+		telegramValidateHermesReleaseTarget = oldReleaseValidator
 	})
 
 	telegramManagedSystemPath = func(Config, string) string { return h.systemPath }
@@ -125,6 +134,12 @@ func newTelegramJournalTestHarness(t *testing.T) *telegramJournalTestHarness {
 	}
 	telegramSystemCASAfterQuarantine = func(string) {}
 	telegramValidateHermesTarget = func(systemdTargetName, *persistedUserIdentity, string) error { return nil }
+	telegramValidateHermesReleaseTarget = func(target systemdTargetName, identity *persistedUserIdentity, _ string) error {
+		if err := telegramValidateHermesTarget(target, identity, ""); err != nil {
+			return err
+		}
+		return validateHermesTelegramRestartSafety(target, identity)
+	}
 	return h
 }
 
@@ -776,11 +791,12 @@ func TestLegacyTelegramMigrationRequiresExactRuntimeBytes(t *testing.T) {
 	if err := os.WriteFile(h.envPath, []byte("operator changed env"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.app.restoreTelegram(st); err != nil {
-		t.Fatal(err)
+	systemctlRun = func(string, ...string) error { t.Fatal("mismatched legacy evidence operated the service"); return nil }
+	if err := h.app.restoreTelegram(st); err == nil {
+		t.Fatal("mismatched legacy evidence accepted")
 	}
-	if len(st.TelegramTargets) != 0 {
-		t.Fatalf("mismatched legacy evidence was not released: %v", st.TelegramTargets)
+	if len(st.TelegramTargets) != 1 {
+		t.Fatalf("mismatched legacy evidence lost tracking: %v", st.TelegramTargets)
 	}
 	got, err := os.ReadFile(h.legacyPath)
 	if err != nil || string(got) != expectedDropIn {

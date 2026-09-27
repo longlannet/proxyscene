@@ -88,6 +88,10 @@ var hermesCodeInjectionEnvKeys = map[string]bool{
 }
 
 func effectiveTelegramTargetUnitContent(target systemdTargetName, identity *persistedUserIdentity) (string, error) {
+	return effectiveTelegramTargetUnitContentWithoutDropIn(target, identity, "")
+}
+
+func effectiveTelegramTargetUnitContentWithoutDropIn(target systemdTargetName, identity *persistedUserIdentity, omittedPath string) (string, error) {
 	var roots []unitSearchRoot
 	if target.UserMode {
 		if err := validatePersistedUserIdentity(target.User, identity); err != nil {
@@ -107,7 +111,7 @@ func effectiveTelegramTargetUnitContent(target systemdTargetName, identity *pers
 	if !ok {
 		return "", fmt.Errorf("无法定位有效 systemd 单元：%s", canonicalTelegramTargetName(target))
 	}
-	content, err := readTelegramUnitContentWithDropIns(path, target.Service, roots)
+	content, err := readTelegramUnitContentWithoutDropIn(path, target.Service, roots, omittedPath)
 	if err != nil {
 		return "", fmt.Errorf("读取有效 systemd 单元失败（%s）：%w", canonicalTelegramTargetName(target), err)
 	}
@@ -903,16 +907,35 @@ func validateHermesTargetRuntime(target systemdTargetName, identity *persistedUs
 }
 
 func validateHermesTargetRuntimeWithRestartPolicy(target systemdTargetName, identity *persistedUserIdentity, expectedProxy string, checkRestartPolicy bool) error {
+	content, err := effectiveTelegramTargetUnitContent(target, identity)
+	if err != nil {
+		return err
+	}
+	return validateHermesRuntimeContent(target, identity, content, expectedProxy, checkRestartPolicy, true)
+}
+
+// Explicit release still proves the runtime identity, installation, environment
+// and safe message policy. It does not require a route that is being disabled.
+// omittedPath is used only after exact legacy ownership evidence is validated.
+func validateHermesReleaseTargetRuntime(target systemdTargetName, identity *persistedUserIdentity, omittedPath string) error {
+	content, err := effectiveTelegramTargetUnitContentWithoutDropIn(target, identity, omittedPath)
+	if err != nil {
+		return err
+	}
+	running, err := telegramTargetRunning(target, identity)
+	if err != nil {
+		return err
+	}
+	return validateHermesRuntimeContent(target, identity, content, "", running, false)
+}
+
+func validateHermesRuntimeContent(target systemdTargetName, identity *persistedUserIdentity, content, expectedProxy string, checkRestartPolicy, enforceProxy bool) error {
 	if target.UserMode {
 		if err := verifyTelegramUserIdentity(target, identity); err != nil {
 			return err
 		}
 	}
-	content, err := effectiveTelegramTargetUnitContent(target, identity)
-	if err != nil {
-		return err
-	}
-	projectRoot, err := validateHermesEffectiveUnit(content)
+	projectRoot, err := validateHermesEffectiveUnitForOperation(content, enforceProxy)
 	if err != nil {
 		return fmt.Errorf("目标 Hermes 服务 %s 无法保证 Telegram 代理生效：%w", canonicalTelegramTargetName(target), err)
 	}
@@ -924,7 +947,7 @@ func validateHermesTargetRuntimeWithRestartPolicy(target systemdTargetName, iden
 	if err != nil {
 		return fmt.Errorf("无法计算 Hermes 服务 %s 的最终环境：%w", canonicalTelegramTargetName(target), err)
 	}
-	if err := validateHermesManagerEnvironment(effectiveEnvironment); err != nil {
+	if err := validateHermesManagerEnvironmentForOperation(effectiveEnvironment, enforceProxy); err != nil {
 		return fmt.Errorf("检测到 Hermes 服务 %s 会从 systemd manager 继承代理绕过：%w", canonicalTelegramTargetName(target), err)
 	}
 	if expectedProxy != "" && effectiveEnvironment["TELEGRAM_PROXY"] != expectedProxy {
@@ -949,6 +972,10 @@ func validateHermesTargetRuntimeWithRestartPolicy(target systemdTargetName, iden
 // ExecStart. Reuse it only within this runtime check; later operations must read
 // and validate the effective unit and user identity again.
 func validateHermesEffectiveUnit(content string) (string, error) {
+	return validateHermesEffectiveUnitForOperation(content, true)
+}
+
+func validateHermesEffectiveUnitForOperation(content string, enforceProxy bool) (string, error) {
 	if err := validateTelegramServiceExecutionModel(content, true); err != nil {
 		return "", err
 	}
@@ -1017,7 +1044,7 @@ func validateHermesEffectiveUnit(content string) (string, error) {
 		return "", err
 	}
 	for _, key := range []string{"NO_PROXY", "no_proxy"} {
-		if entry, ok := firstHermesTelegramNoProxyMatch(environment[key]); ok {
+		if entry, ok := firstHermesTelegramNoProxyMatch(environment[key]); enforceProxy && ok {
 			return "", fmt.Errorf("%s 中的 %q 会绕过 api.telegram.org 或 Hermes Telegram 回退网段", key, entry)
 		}
 	}
@@ -1081,6 +1108,10 @@ func effectiveServiceCommands(content, directive string) ([][]string, error) {
 }
 
 func validateHermesManagerEnvironment(environment map[string]string) error {
+	return validateHermesManagerEnvironmentForOperation(environment, true)
+}
+
+func validateHermesManagerEnvironmentForOperation(environment map[string]string, enforceProxy bool) error {
 	if err := validateHermesMultiplexEnvironment(environment); err != nil {
 		return err
 	}
@@ -1096,7 +1127,7 @@ func validateHermesManagerEnvironment(environment map[string]string) error {
 		return err
 	}
 	for _, key := range []string{"NO_PROXY", "no_proxy"} {
-		if entry, ok := firstHermesTelegramNoProxyMatch(environment[key]); ok {
+		if entry, ok := firstHermesTelegramNoProxyMatch(environment[key]); enforceProxy && ok {
 			return fmt.Errorf("%s 中的 %q 会绕过 api.telegram.org 或 Hermes Telegram 回退网段", key, entry)
 		}
 	}

@@ -1008,6 +1008,13 @@ func readTelegramUnitContent(path string) (string, error) {
 }
 
 func readTelegramUnitContentWithDropIns(path, service string, roots []unitSearchRoot) (string, error) {
+	return readTelegramUnitContentWithoutDropIn(path, service, roots, "")
+}
+
+// Project the unit after removing exactly one proven owned drop-in. Skipping it
+// before basename precedence is applied exposes any lower-priority replacement,
+// just as systemd will after the actual removal.
+func readTelegramUnitContentWithoutDropIn(path, service string, roots []unitSearchRoot, omittedPath string) (string, error) {
 	content, err := readTelegramUnitContent(path)
 	if err != nil {
 		return "", err
@@ -1040,6 +1047,9 @@ func readTelegramUnitContentWithDropIns(path, service string, roots []unitSearch
 		}
 		for _, entry := range entries {
 			name := entry.Name()
+			if filepath.Join(dir, name) == omittedPath {
+				continue
+			}
 			if !strings.HasSuffix(name, ".conf") || seenFiles[name] {
 				continue
 			}

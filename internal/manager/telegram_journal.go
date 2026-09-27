@@ -65,10 +65,11 @@ var (
 	telegramConfirmUserAbsent = func(userName string, identity *persistedUserIdentity, path string) error {
 		return confirmUserFileAbsentPersisted(userName, identity, telegramLookupUserIdentity, path)
 	}
-	telegramLookupUserIdentity       = lookupLocalUserIdentity
-	telegramSystemDirFsync           = syscall.Fsync
-	telegramSystemCASAfterQuarantine = func(string) {}
-	telegramValidateHermesTarget     = validateHermesTargetRuntime
+	telegramLookupUserIdentity          = lookupLocalUserIdentity
+	telegramSystemDirFsync              = syscall.Fsync
+	telegramSystemCASAfterQuarantine    = func(string) {}
+	telegramValidateHermesTarget        = validateHermesTargetRuntime
+	telegramValidateHermesReleaseTarget = validateHermesReleaseTargetRuntime
 )
 
 type telegramProxyJournal struct {
@@ -1079,7 +1080,7 @@ func (a *App) reloadAndRestartTelegramArtifactTarget(target systemdTargetName) e
 		return err
 	}
 	if telegramTargetUnitInstalled(target) {
-		if err := validateHermesTelegramRestartSafety(target, identity); err != nil {
+		if err := telegramValidateHermesReleaseTarget(target, identity, ""); err != nil {
 			return err
 		}
 	}
@@ -1111,7 +1112,7 @@ func (a *App) reloadAndRestartTelegramArtifactTarget(target systemdTargetName) e
 			return nil
 		}
 	}
-	return a.restartTelegramTarget(target)
+	return a.restartTelegramTargetForOperation(target, true)
 }
 
 func telegramTargetUnitInstalled(target systemdTargetName) bool {
@@ -1131,7 +1132,7 @@ func (a *App) reloadHermesTelegramTargetManager(target systemdTargetName, identi
 	return systemctlRun("重新加载 systemd 配置", "daemon-reload")
 }
 
-func (a *App) reloadValidateAndRestartManagedHermesTarget(target systemdTargetName, identity *persistedUserIdentity) error {
+func (a *App) reloadValidateAndRestartManagedHermesTarget(target systemdTargetName, identity *persistedUserIdentity, release bool) error {
 	if err := a.reloadHermesTelegramTargetManager(target, identity); err != nil {
 		return err
 	}
@@ -1143,7 +1144,11 @@ func (a *App) reloadValidateAndRestartManagedHermesTarget(target systemdTargetNa
 			return err
 		}
 	}
-	if err := telegramValidateHermesTarget(target, identity, ""); err != nil {
+	validate := telegramValidateHermesTarget
+	if release {
+		validate = telegramValidateHermesReleaseTarget
+	}
+	if err := validate(target, identity, ""); err != nil {
 		return fmt.Errorf("恢复时 Hermes 服务 %s 的运行配置验证失败：%w", canonicalTelegramTargetName(target), err)
 	}
 	if target.UserMode {
@@ -1151,7 +1156,7 @@ func (a *App) reloadValidateAndRestartManagedHermesTarget(target systemdTargetNa
 			return err
 		}
 	}
-	return a.restartTelegramTarget(target)
+	return a.restartTelegramTargetForOperation(target, release)
 }
 
 func (a *App) restoreHermesTelegramArtifactForRetry(target systemdTargetName, content []byte) error {
@@ -1205,7 +1210,7 @@ func (a *App) cleanupHermesTelegramTarget(target systemdTargetName) error {
 	// Validate before removing the drop-in so an operator-replaced unit leaves
 	// both the artifact and ownership untouched.
 	if telegramTargetUnitInstalled(target) {
-		if err := telegramValidateHermesTarget(target, identity, ""); err != nil {
+		if err := telegramValidateHermesReleaseTarget(target, identity, ""); err != nil {
 			return fmt.Errorf("当前 Hermes 服务 %s 已不再是可安全管理的 gateway：%w", canonicalTelegramTargetName(target), err)
 		}
 	}
@@ -1213,7 +1218,7 @@ func (a *App) cleanupHermesTelegramTarget(target systemdTargetName) error {
 	if err != nil || !prepared.owned {
 		return err
 	}
-	if err := a.reloadValidateAndRestartManagedHermesTarget(target, identity); err != nil {
+	if err := a.reloadValidateAndRestartManagedHermesTarget(target, identity, true); err != nil {
 		rollbackArtifactErr := a.restoreHermesTelegramArtifactForRetry(target, prepared.removedContent)
 		var rollbackReloadErr error
 		if rollbackArtifactErr == nil && len(prepared.removedContent) != 0 {
@@ -1275,19 +1280,15 @@ func (a *App) cleanupLegacyTelegramTarget(st *Store, target systemdTargetName) e
 		// env file is deliberately retained because Store cannot prove that no
 		// other legacy drop-in references it.
 	case dropInErr != nil:
-		fmt.Printf("警告：旧 Telegram drop-in %s 无法安全读取，已保留文件：%v\n", path, dropInErr)
+		return fmt.Errorf("旧 Telegram drop-in %s 无法安全读取，保留文件和迁移记录：%w", path, dropInErr)
 	case !bytes.Equal(currentDropIn, expectedDropIn):
-		fmt.Printf("警告：旧 Telegram drop-in %s 与历史模板不一致，已保留文件\n", path)
+		return fmt.Errorf("旧 Telegram drop-in %s 与历史模板不一致，保留文件和迁移记录", path)
 	default:
 		expectedEnv := []byte(telegramProxyEnvContent(legacyCfg))
 		envPath := telegramLegacyEnvPath()
 		currentEnv, envErr := telegramReadSystemArtifact(envPath, int64(len(expectedEnv))+1)
 		if envErr != nil || !bytes.Equal(currentEnv, expectedEnv) {
-			if envErr != nil && !errors.Is(envErr, os.ErrNotExist) {
-				fmt.Printf("警告：旧 Telegram 环境文件 %s 无法安全读取，已保留 drop-in：%v\n", envPath, envErr)
-			} else {
-				fmt.Printf("警告：旧 Telegram 环境文件 %s 与 RuntimeConfig 生成内容不一致，已保留 drop-in\n", envPath)
-			}
+			return fmt.Errorf("旧 Telegram 环境文件 %s 无法与历史 RuntimeConfig 绑定，保留文件和迁移记录", envPath)
 		} else {
 			var err error
 			removed, err = telegramRemoveSystemArtifact(path, [][]byte{expectedDropIn})

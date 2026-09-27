@@ -2,7 +2,10 @@ package manager
 
 import "fmt"
 
-var telegramValidateHermesRestartPolicy = validateHermesTelegramRestartPolicy
+var (
+	telegramValidateHermesRestartPolicy        = validateHermesTelegramRestartPolicy
+	telegramValidateHermesReleaseRestartPolicy = validateHermesTelegramReleaseRestartPolicy
+)
 
 func telegramTargetRunning(target systemdTargetName, identity *persistedUserIdentity) (bool, error) {
 	state, err := telegramReadServiceState(target, identity)

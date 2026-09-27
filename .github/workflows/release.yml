@@ -120,7 +120,7 @@ jobs:
       - name: Hermes installation permission tests
         run: sudo -- "$(command -v go)" test ./internal/manager -run '^TestHermes(System|Project|UserProject)' -count=1
       - name: Privileged transaction safety tests
-        run: sudo -- "$(command -v go)" test -race ./internal/manager -run '^Test(Core|Runtime|TelegramPlan|TelegramApplyExecutionDrift|HermesApplyCannotResumePendingRelease|OpenClawApplyCannotResumePendingRelease|ExistingInstall|NodeCommitWithoutScenes)' -count=1
+        run: sudo -- "$(command -v go)" test -race ./internal/manager -run '^Test(Core|Runtime|TelegramPlan|TelegramApply|TelegramCompensation|LegacyTelegramRelease|ModernTelegramExplicitRelease|HermesApplyCannotResumePendingRelease|OpenClawApplyCannotResumePendingRelease|ExistingInstall|NodeCommitWithoutScenes)' -count=1
       - name: Workflow validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
       - name: Require clean source before build

@@ -63,7 +63,14 @@ func TestHermesRestoreRetainsRetryEvidenceWhenMessagePolicyChanges(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	telegramValidateHermesRestartPolicy = func(systemdTargetName, *persistedUserIdentity) error { return errors.New("unsafe cold boot") }
+	policyCalls := 0
+	telegramValidateHermesRestartPolicy = func(systemdTargetName, *persistedUserIdentity) error {
+		policyCalls++
+		if policyCalls == 1 {
+			return nil // pre-removal release policy is safe; it changes before restart
+		}
+		return errors.New("unsafe cold boot")
+	}
 	systemctlRun = func(_ string, args ...string) error {
 		if strings.Contains(strings.Join(args, " "), "try-restart") {
 			t.Fatal("restoration restarted with an unsafe message policy")

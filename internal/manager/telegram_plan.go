@@ -393,7 +393,11 @@ func (a *App) inspectTelegramPlanTarget(target systemdTargetName, observed teleg
 		}
 	} else {
 		if unit.resolution.State == telegramUnitResolved {
-			if err := telegramValidateHermesTarget(target, item.identity, ""); err != nil {
+			validate := telegramValidateHermesTarget
+			if release {
+				validate = telegramValidateHermesReleaseTarget
+			}
+			if err := validate(target, item.identity, ""); err != nil {
 				return item, false, err
 			}
 		}
@@ -417,7 +421,7 @@ func (a *App) inspectTelegramPlanTarget(target systemdTargetName, observed teleg
 		}
 		desired := []byte("[Service]\n" + telegramProxySystemdEnvironmentLines(a.cfg))
 		unchanged := !release && hermesEntry != nil && hermesEntry.Phase == telegramPhaseActive && bytes.Equal(item.content, desired) && hermesEntry.ManagedContent == string(desired)
-		if !unchanged && unit.resolution.State == telegramUnitResolved {
+		if !release && !unchanged && unit.resolution.State == telegramUnitResolved {
 			if err := validateHermesTelegramRestartSafety(target, item.identity); err != nil {
 				return item, false, err
 			}
@@ -516,10 +520,7 @@ func (a *App) preflightLegacyTelegramTarget(st *Store, target systemdTargetName)
 		if unit.kind != telegramUnitHermes {
 			return fmt.Errorf("旧 Telegram 目标 %s 不是可安全协调的 Hermes 网关", key)
 		}
-		if err := telegramValidateHermesTarget(target, nil, ""); err != nil {
-			return err
-		}
-		if err := validateHermesTelegramRestartSafety(target, nil); err != nil {
+		if err := telegramValidateHermesReleaseTarget(target, nil, path); err != nil {
 			return err
 		}
 	}

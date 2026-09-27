@@ -606,7 +606,7 @@ func runtimeReconcileHermes(app *App, target systemdTargetName, item *runtimeHer
 	if item.SkipRestart {
 		return app.reloadHermesTelegramTargetManager(target, item.Identity)
 	}
-	return app.reloadValidateAndRestartManagedHermesTarget(target, item.Identity)
+	return app.reloadValidateAndRestartManagedHermesTarget(target, item.Identity, item.Before == nil)
 }
 func runtimeCommitAbsentOpenClawTarget(app *App, target systemdTargetName, item *runtimeOpenClawResource) error {
 	return withFileLock(app.openClawJournalLockPath(), func() error {

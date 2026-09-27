@@ -730,6 +730,7 @@ hermes-gateway user:root:hermes-gateway
 最终目标由“配置的锚定目标 + 自动发现目标”合并去重得到。设置 `PROXYSCENE_TG_SERVICES` 会替换默认锚定列表，
 但不会关闭精确自动发现。新接管的 Hermes 和 OpenClaw 目标分别记录在独立的持久化 ownership journal 中；
 `state.json` 的 `telegram_targets` 只保留用于旧版本 drop-in 的保守迁移。关闭和卸载依据已有 ownership 及严格的历史证据规划；崩溃后的 `recover` 只续跑已经固定的事务计划。
+旧系统级 Telegram 记录需同时匹配历史运行配置和确切的受管文件，才能显式 `tg off` 后重新开启；旧 EnvironmentFile 尚在时，直接 `tg on` 会保守拒绝。旧用户级记录缺少稳定身份时不会按同名用户自动迁移。
 
 可以通过 `PROXYSCENE_TG_SERVICES` 替换默认锚定目标：
 
