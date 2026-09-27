@@ -58,7 +58,7 @@ Every official release includes both GitHub and `dl.ll.cd`. Before building or p
 the Release workflow requires `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`; a missing or disabled
 configuration blocks the release instead of skipping the mirror. All build and test gates, immutable
 GitHub publication, and the complete post-publication verification must succeed before the required
-`mirror-release.yml` job starts. The dedicated non-root receiver accepts only fixed-tag
+`mirror-publish.yml` job starts. The dedicated non-root receiver accepts only fixed-tag
 `sync` and `promote` forced commands; it fetches and validates assets from GitHub itself, stages files
 outside the public tree, and atomically publishes a complete version directory. After CI anonymously
 compares all 11 public assets, promotion atomically updates `latest.json` and rejects downgrades.

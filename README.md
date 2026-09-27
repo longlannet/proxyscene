@@ -876,7 +876,7 @@ gh workflow run Release --ref main -f version=v0.9.2
 
 不要预先创建或推送 tag。工作流首先要求仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`；未配置或停用镜像时，在构建和创建 GitHub Release 前失败。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 v0.7.1、v0.8.0 到新版本的 Debian systemd 安装/升级 canary。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
 
-上述 GitHub 发布和只读验证全部成功后，正式 Release 必须调用 `mirror-release.yml` 完成镜像发布。接收端验证并发布固定版本目录，CI 再匿名下载并逐字节比对全部 11 项资产，最后原子更新防降级的 `latest.json` 并再次验收。镜像失败时整个发布仍未完成，已发布的 immutable GitHub Release 保留；修复后从 `main` 单独运行 `Mirror release` 并输入相同 tag 重试，无需重建或重发 GitHub Release。部署和故障恢复见 [镜像发布说明](docs/mirror-publishing.md)。
+上述 GitHub 发布和只读验证全部成功后，正式 Release 必须调用 `mirror-publish.yml` 完成镜像发布。接收端验证并发布固定版本目录，CI 再匿名下载并逐字节比对全部 11 项资产，最后原子更新防降级的 `latest.json` 并再次验收。镜像失败时整个发布仍未完成，已发布的 immutable GitHub Release 保留；修复后从 `main` 单独运行 `Mirror release` 并输入相同 tag 重试；该入口也调用相同 worker 和专用 Secret 映射，无需重建或重发 GitHub Release。部署和故障恢复见 [镜像发布说明](docs/mirror-publishing.md)。
 
 如果创建 draft、上传资产或发布期间中断，不要直接盲目重跑完整 workflow。先在 GitHub 核对同名 tag、draft/Release 和资产是否存在；确认残留内容及目标 commit 后，人工删除未发布的残留 draft/tag，或仅重跑尚未执行的只读验证。工作流不会自动删除发布对象。
 
