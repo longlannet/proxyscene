@@ -57,7 +57,7 @@ func newUpdateReleaseFixture(t *testing.T) updateReleaseFixture {
 	t.Helper()
 	const tag = "v0.9.2"
 	const commit = "7823daede06af7647a51ce199b35ddb57d25dfbc"
-	r := updateRelease{Tag: tag, Commit: commit, ID: 42, Notes: "Fixed Hermes compatibility.", Assets: map[string]updateAsset{}}
+	r := updateRelease{Tag: tag, Commit: commit, ID: 42, Published: "2026-01-01T00:00:00Z", Source: "github", Notes: "Fixed Hermes compatibility.", Assets: map[string]updateAsset{}}
 	payloads := map[string][]byte{}
 	names := []string{"install.sh", "xray_source_v26.9.9.tar.gz"}
 	for _, arch := range []string{"amd64", "arm64", "386", "armv7"} {
@@ -265,6 +265,13 @@ func TestUpdateDownloadBundle(t *testing.T) {
 	for _, source := range []string{"github", "mirror"} {
 		t.Run(source, func(t *testing.T) {
 			f := newUpdateReleaseFixture(t)
+			if source == "mirror" {
+				f.release.Source = source
+				for name, asset := range f.release.Assets {
+					asset.URL = ""
+					f.release.Assets[name] = asset
+				}
+			}
 			var requests []string
 			dest := filepath.Join(t.TempDir(), "bundle.tar.gz")
 			if err := f.client(t, &requests).downloadBundle(context.Background(), f.release, "amd64", source, dest); err != nil {
@@ -278,11 +285,12 @@ func TestUpdateDownloadBundle(t *testing.T) {
 			if err != nil || info.Mode().Perm() != 0o600 {
 				t.Fatalf("bundle permissions: %v, %v", info, err)
 			}
-			wantBundle := updateDownloadBase + "/v0.9.2/proxyscene_bundle_linux_amd64.tar.gz"
+			base := updateDownloadBase
 			if source == "mirror" {
-				wantBundle = updateMirrorBase + "/v0.9.2/proxyscene_bundle_linux_amd64.tar.gz"
+				base = updateMirrorBase
 			}
-			if len(requests) != 2 || requests[0] != updateDownloadBase+"/v0.9.2/checksums.txt" || requests[1] != wantBundle {
+			wantBundle := base + "/v0.9.2/proxyscene_bundle_linux_amd64.tar.gz"
+			if len(requests) != 2 || requests[0] != base+"/v0.9.2/checksums.txt" || requests[1] != wantBundle {
 				t.Fatalf("incorrect trust/download sources: %v", requests)
 			}
 		})

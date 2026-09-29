@@ -115,6 +115,8 @@ jobs:
           shellcheck install.sh scripts/*.sh
           sudo -- bash scripts/install-test.sh
           sudo -- bash scripts/bootstrap-test.sh
+      - name: Mirror bootstrap regression tests
+        run: sudo -- python3 -I -B scripts/bootstrap-install-test.py
       - name: Mirror publication tests
         run: python3 -B -m unittest discover -s scripts -p '*mirror*test.py' -v
       - name: Hermes installation permission tests

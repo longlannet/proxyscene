@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Prepare and verify byte-identical mirrors of immutable GitHub releases.
 
-The mirror is a transport, not a release trust root. This module never executes
-or extracts downloaded assets. GitHub metadata and SHA256 digests authenticate
-the exact release set. Optional API authentication is never sent to asset hosts.
+Publication is bound to immutable GitHub releases. Clients can trust the mirror
+without accessing GitHub: an independently published metadata sidecar carries
+the verified identity, notes and asset digests. This module never executes or
+extracts assets. Optional API authentication is never sent to asset hosts.
 
 CLI prepare writes RECORD outside DIRECTORY. CLI verify downloads the public
 version into OUTPUT (exactly eleven assets), and writes OUTPUT.result.json next
-to that directory. --stable additionally verifies root/latest.json; there is no
-mutable root/install.sh. All output paths must be new.
+to that directory. Every verification checks metadata/TAG.json; --stable also
+checks root/latest.json. The fixed bootstrap script is deployed separately by
+the site administrator. All output paths must be new.
 """
 
 import argparse
@@ -36,6 +38,7 @@ API_BASE = "https://api.github.com/repos/" + REPOSITORY
 RELEASE_BASE = "https://github.com/" + REPOSITORY + "/releases/download"
 MIRROR_BASE = "https://dl.ll.cd/proxyscene"
 MAX_METADATA_BYTES = 1024 * 1024
+MAX_NOTES_BYTES = 64 * 1024
 MAX_ASSET_BYTES = 256 * 1024 * 1024
 MAX_RELEASE_BYTES = 512 * 1024 * 1024
 MAX_API_TOKEN_BYTES = 4096
@@ -52,7 +55,7 @@ TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z"
 SOURCE_PATTERN = re.compile(r"xray_source_v[0-9]+(?:\.[0-9]+)+\.tar\.gz\Z")
 SHA_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
-INFO_KEYS = frozenset(("tag", "version", "commit", "release_id", "published_at", "assets"))
+INFO_KEYS = frozenset(("tag", "version", "commit", "release_id", "published_at", "notes", "assets"))
 
 
 def validate_tag(tag):
@@ -87,7 +90,7 @@ def _asset_names(names):
     if len(names) != 11 or not FIXED_ASSETS.issubset(names):
         raise MirrorError("release must contain the exact eleven supported assets")
     extra = set(names) - FIXED_ASSETS
-    if len(extra) != 1 or not SOURCE_PATTERN.fullmatch(next(iter(extra))):
+    if len(extra) != 1 or len(next(iter(extra))) > 128 or not SOURCE_PATTERN.fullmatch(next(iter(extra))):
         raise MirrorError("release must contain exactly one versioned Xray source archive")
 
 
@@ -103,8 +106,14 @@ def _validate_info(info):
         raise MirrorError("release record version and tag disagree")
     if not isinstance(info["commit"], str) or not COMMIT_PATTERN.fullmatch(info["commit"]):
         raise MirrorError("invalid release commit")
-    _positive_integer(info["release_id"], "release ID")
+    _positive_integer(info["release_id"], "release ID", 2**63 - 1)
     _timestamp(info["published_at"])
+    notes = info["notes"]
+    try:
+        if not isinstance(notes, str) or len(notes.encode("utf-8")) > MAX_NOTES_BYTES:
+            raise MirrorError("release notes exceed the UTF-8 size limit or are not text")
+    except UnicodeError as exc:
+        raise MirrorError("release notes must be valid UTF-8 text") from exc
     assets = info["assets"]
     if not isinstance(assets, dict) or not all(isinstance(name, str) for name in assets):
         raise MirrorError("invalid release asset map")
@@ -259,7 +268,7 @@ def release_info(tag, token=None):
         raise MirrorError("GitHub returned a different release tag")
     if release.get("immutable") is not True or release.get("draft") is not False or release.get("prerelease") is not False:
         raise MirrorError("GitHub release must be immutable, public, and stable")
-    _positive_integer(release.get("id"), "release ID")
+    _positive_integer(release.get("id"), "release ID", 2**63 - 1)
     _timestamp(release.get("published_at"))
     raw_assets = release.get("assets")
     if not isinstance(raw_assets, list) or len(raw_assets) != 11:
@@ -287,7 +296,8 @@ def release_info(tag, token=None):
     if reference.get("ref") != "refs/tags/" + tag or not isinstance(target, dict) or target.get("type") != "commit":
         raise MirrorError("release tag must point directly to a commit")
     return _validate_info({"tag": tag, "version": tag[1:], "commit": target.get("sha"),
-                           "release_id": release["id"], "published_at": release["published_at"], "assets": assets})
+                           "release_id": release["id"], "published_at": release["published_at"],
+                           "notes": release.get("body") if release.get("body") is not None else "", "assets": assets})
 
 
 def _read_asset(path, expected_size, collect=False):
@@ -370,6 +380,19 @@ def manifest_bytes(info):
                             "release_id": info["release_id"], "published_at": info["published_at"]})
 
 
+def metadata_bytes(info):
+    """Canonical mirror-only client metadata; never add it to release assets."""
+    _validate_info(info)
+    value = {"schema_version": 1, **{key: info[key] for key in
+             ("tag", "version", "commit", "release_id", "published_at", "notes")},
+             "assets": {name: {"sha256": item["sha256"], "size": item["size"]}
+                        for name, item in sorted(info["assets"].items())}}
+    raw = _canonical_json(value)
+    if len(raw) > MAX_METADATA_BYTES:
+        raise MirrorError("public release metadata exceeds its size limit")
+    return raw
+
+
 def _same_release(expected, current):
     if expected != current:
         raise MirrorError("GitHub release identity or asset metadata changed")
@@ -443,6 +466,12 @@ def verify_public(tag, directory, output, stable=False, token=None):
     verify_directory(info, output)
     for name in info["assets"]:
         _same_file_bytes(directory / name, output / name, info["assets"][name]["size"])
+    with tempfile.TemporaryDirectory(prefix="proxyscene-mirror-metadata-") as temporary:
+        metadata = Path(temporary) / "release.json"
+        _download_url(MIRROR_BASE + "/metadata/" + tag + ".json", metadata,
+                      MAX_METADATA_BYTES, mirror=True, deadline=deadline)
+        if metadata.read_bytes() != metadata_bytes(info):
+            raise MirrorError("public release metadata does not match the exact canonical GitHub release")
     if stable:
         with tempfile.TemporaryDirectory(prefix="proxyscene-mirror-latest-") as temporary:
             latest = Path(temporary) / "latest.json"
@@ -454,7 +483,8 @@ def verify_public(tag, directory, output, stable=False, token=None):
     verify_directory(info, directory)
     verify_directory(info, output)
     result = {"tag": tag, "commit": info["commit"], "release_id": info["release_id"],
-              "asset_count": len(info["assets"]), "all_bytes_match": True, "stable_verified": bool(stable)}
+              "asset_count": len(info["assets"]), "all_bytes_match": True, "metadata_verified": True,
+              "stable_verified": bool(stable)}
     _write_new(result_path, _canonical_json(result))
     return result
 

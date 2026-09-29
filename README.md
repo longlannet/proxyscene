@@ -17,7 +17,7 @@
 - 单二进制 Go 管理程序，安装后命令为 `proxyscene`。
 - Release 的 `checksums.txt` 覆盖版本化 `install.sh`、管理程序包、离线 bundle 和固定 Xray 对应源码归档；安装器解析 `latest` 后固定到一个明确 tag，再按 SHA256 校验下载内容。
 - 支持离线安装：先用 Release checksum 校验自包含 bundle，解压后显式运行 `install.sh --offline`；包内 manifest 会在复制前复核全部组件。
-- 支持内置检查更新与手动升级：显示正式版本和更新说明，验证 GitHub 发布身份后，从 `dl.ll.cd` 或 GitHub 下载完整 bundle，并复用安装器升级。
+- 支持内置检查更新与手动升级：显示正式版本和更新说明，默认从 `dl.ll.cd` 获取版本、校验清单和完整 bundle，全程无需 GitHub；也可显式选择 GitHub。升级复用原安装器。
 - GitHub Actions 从 `main` 手动发起发布，交叉编译 amd64/arm64/386/armv7；检查通过并发布 GitHub immutable Latest、完成发布后校验，再同步并验收 `dl.ll.cd`。
 - 支持 Xray 主服务和开机恢复服务的 systemd 管理。
 - 支持三类代理场景：
@@ -98,9 +98,34 @@ proxyscene/
 
 > 迁移说明：`v0.7.1` 是旧的 mutable Release，新的 SHA256 + immutable 模型从 `v0.8.0` 起生效。新安装器会有意拒绝 `immutable=false` 的 `v0.7.1`；请使用明确的 `v0.8.0` 或更高版本，不要让 `latest` 意外解析到旧版本。
 
-### 方式一：固定版本镜像 bundle 安装或升级
+### 推荐：固定镜像安装入口（无需访问 GitHub）
 
-推荐从 `https://dl.ll.cd/proxyscene/<release-tag>/` 下载完整 bundle，安装和升级使用同一流程；目标版本须已完成镜像发布。镜像保存 GitHub Release 的全部 11 项资产，内容逐字节一致。Release 身份和 checksum 仍从 GitHub 获取，不信任镜像自报的 checksum。
+从 v0.11.0 起，下面这段命令安装镜像已完成发布的稳定版本；同一个入口可用于后续升级。需要 Linux/systemd、root 或 sudo，以及 Bash、curl、Python 3.8+、jq、flock 和常用 GNU 工具。缺少工具时会明确提示，不会隐式下载 Go 或 Node.js。
+
+```bash
+sudo bash -c '
+set -euo pipefail
+umask 077
+bootstrap_dir=$(mktemp -d /root/proxyscene-bootstrap.XXXXXXXX)
+cleanup() { rm -rf -- "$bootstrap_dir"; }
+trap cleanup EXIT
+curl -q -fsSL --proto "=https" --proto-redir "=https" --max-redirs 0 \
+  --connect-timeout 10 --max-time 60 \
+  https://dl.ll.cd/proxyscene/install.sh -o "$bootstrap_dir/install.sh"
+test -s "$bootstrap_dir/install.sh"
+bash "$bootstrap_dir/install.sh"
+'
+```
+
+脚本完整下载成功后才执行，保留终端输入。需要固定版本时，将最后的执行行改为 `bash "$bootstrap_dir/install.sh" --version v0.11.0`。入口先读取一次镜像 `latest.json`，再固定 tag 并验证 `metadata/<tag>.json`、`checksums.txt` 和当前架构 bundle，最后调用包内安装器；不会访问 GitHub、跟随镜像重定向、混用不同版本或自动降级。首次安装和已有程序替换都在安装锁内复核前态。
+
+这一便捷入口明确信任 `dl.ll.cd` 的 HTTPS、服务器及受控发布流程。SHA256 检查文件完整性，不提供独立发布者签名；首次下载的引导脚本本身也依赖镜像站信任。GitHub 的构建、测试和发布身份检查在发布服务器端完成。GitHub 已发布、镜像尚未完成同步时，入口仍选择镜像已完成发布的版本。缺少依赖时按提示使用系统包管理器准备；安装程序资产仅从镜像获取。
+
+下面保留需要访问 GitHub 的手动核验方式，供明确选择该信任来源或安装旧版本时使用。
+
+### 手动方式一：固定版本镜像 bundle 安装或升级
+
+此手动方式从 `https://dl.ll.cd/proxyscene/<release-tag>/` 下载完整 bundle，安装和升级使用同一流程；目标版本须已完成镜像发布。镜像保存 GitHub Release 的全部 11 项资产，内容逐字节一致。Release 身份和 checksum 仍从 GitHub 获取，不信任镜像自报的 checksum。
 
 在联网机器上把 `<release-tag>` 替换为明确版本，并按目标架构选择 bundle。整个下载和校验过程在同一个严格退出的 root shell 中进行，任何一步失败都会终止本段命令。下载目录随机生成，权限为 root-only；记录成功后输出的 `STAGE` 路径。
 
@@ -135,7 +160,7 @@ BOOTSTRAP
 ```
 <!-- /bootstrap:offline-download -->
 
-镜像根目录仅提供 `latest.json` 作为版本发现入口；它包含 `version`、`tag`、`base_url`、`commit`、`release_id` 和 `published_at`，不能替代 GitHub 身份与 checksum 验证。确认版本后仍在上面的命令中填写明确 tag；根目录不提供可变的 `install.sh`。如果 GitHub API 或该 tag 的 canonical checksum 不可访问，本流程会终止，不能仅凭镜像完成认证。可在能访问 GitHub 的机器上完成下载验证，再安全传输整个 staging 目录用于离线安装。
+这个手动流程使用 `latest.json` 作为版本发现入口；它包含 `version`、`tag`、`base_url`、`commit`、`release_id` 和 `published_at`，不能替代 GitHub 身份与 checksum 验证。确认版本后仍在上面的命令中填写明确 tag；固定根入口 `install.sh` 使用上文说明的镜像信任方式，和本节 GitHub 手动核验方式分别使用。如果 GitHub API 或该 tag 的 canonical checksum 不可访问，本流程会终止，不能仅凭镜像完成认证。可在能访问 GitHub 的机器上完成下载验证，再安全传输整个 staging 目录用于离线安装。
 
 将整个 staging 目录传到目标机的 `/root` 下，保留 root 所有权、目录 `0700` 和文件 `0600` 权限，或在同一台机器继续。把下段的版本、架构和 `<staging-directory>` 替换为实际值。下段会重新核对 Release 身份和归档 SHA256，通过后才解压执行；不依赖上一次 shell 的校验结果。
 
@@ -178,7 +203,7 @@ bundle 内含 `install.sh`、管理程序、固定版本 Xray、项目及第三�
 
 升级兼容性：此版本移除了 Shadowsocks `none/plain`，且 VLESS/Trojan 明文传输仅允许上游内建的私有/保留地址与本地域名。新导入和启用会明确拒绝不兼容节点；旧节点记录仍可读取、删除和替换。若当前正在使用上述模式，请在升级前切换到 TLS/REALITY 或支持的 AEAD 节点。
 
-### 方式二：固定 Release 联机安装
+### 手动方式二：固定 Release 联机安装（需要 GitHub）
 
 从同一个明确 tag 下载安装器和 checksum。下载、校验、展示和执行使用 root-only staging 中的同一个文件，并在同一个严格退出的 shell 中进行；校验失败时不会继续执行安装器。
 
@@ -211,7 +236,7 @@ BOOTSTRAP
 
 从 `v0.8.0` 起，安装器内部也可使用 `latest`；它会先通过 GitHub API 把 `latest` 解析为明确 tag，随后只从该 tag 下载。上面的 bootstrap 仍要求显式版本，便于人工确认目标。联机安装使用自定义管理程序镜像时，必须设置明确 `PROXYSCENE_VERSION`，并让 `PROXYSCENE_BASE_URL` 直接指向该 tag 的资产目录，例如 `https://dl.ll.cd/proxyscene/v0.9.2`（须已镜像该版本）。该变量只改变管理程序归档来源；`checksums.txt` 始终来自 `PROXYSCENE_REPO` 对应固定 tag 的 GitHub Release，Xray 仍走安装器原有下载路径。需要同时从镜像取得管理程序与 Xray 时，使用方式一的完整 bundle。
 
-### 方式三：从源码安装
+### 手动方式三：从源码安装
 
 进入可信源码 checkout 后强制源码编译：
 
@@ -369,9 +394,11 @@ sudo proxyscene update --source github       # 从 GitHub 下载 bundle
 sudo proxyscene update --source mirror       # 从 dl.ll.cd 下载 bundle（默认）
 ```
 
-`--check` 不需要 root，不安装文件或修改配置。实际升级需要 root，默认下载 `dl.ll.cd` 上对应固定 tag 的 bundle；两种下载来源都必须先通过 GitHub 验证，不支持自定义仓库、下载地址或仅凭镜像认证。GitHub 不可访问、镜像尚未发布目标版本或任何校验失败时，命令会终止；可以用 `--source github` 明确选择 GitHub 下载。
+`--check` 不需要 root，不安装文件或修改配置。默认 `mirror` 模式的版本索引、元数据、校验清单、bundle 和安装前复核全部通过固定 `https://dl.ll.cd/proxyscene` 获取，不访问 GitHub，也不回退到 GitHub。只有明确使用 `--source github` 时，才使用 GitHub 的最新正式 immutable Release、tag/commit 和资产 digest 校验。
 
-检查会固定 GitHub 的最新正式 immutable Release，核对 tag 对应 commit、11 项资产及其 GitHub SHA256 digest。升级时再从 GitHub 下载并验证 `checksums.txt` 和安装包摘要。下载后还会限制解压路径、文件类型与大小，验证包内 manifest、程序架构及 Go 模块身份；版本和 commit 由已验证的 GitHub 发布身份与完整归档 SHA256 绑定。通过后调用包内安装器完成升级。更新说明只作显示，不执行其中的命令。
+镜像检查读取一次 `latest.json`，锁定 tag、commit、Release ID 和发布时间，再核对服务器发布的 `metadata/<tag>.json`。元数据包含精确的 11 项资产大小及 SHA256 和更新说明；下载后同时核对 `checksums.txt`、bundle SHA256、解压路径/文件类型/大小、内部 manifest、程序架构和 Go 模块身份。安装前复核同一固定版本的元数据，失败即终止。更新说明仅显示，不执行。镜像模式的信任来源是 dl.ll.cd 及其受控发布流程，不是独立发布者签名。
+
+v0.10.0 的旧自更新仍依赖 GitHub；首次升级到 v0.11.0 可使用上面的固定镜像入口，之后默认自更新也无需 GitHub。
 
 自动升级只接受高于当前版本的正式稳定版本，没有强制降级参数。`dev`、缺少 commit 或从已配置安装路径之外运行的程序不能自动安装更新；应先使用经过验证的 Release bundle 完成安装。相同版本的 commit 身份不一致也会拒绝继续。升级前还会检查正在运行的程序与安装文件是否一致；安装器取得安装锁后再次核对原程序 SHA256，防止另一个进程已经升级后，旧进程又覆盖它。
 
@@ -951,7 +978,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ./dist/proxyscene ./cmd/pro
 
 ## 发布 Release
 
-正式发布默认同时包含 GitHub 和 `dl.ll.cd`，依次完成。GitHub 发布不需要签名私钥或签名 Secret；镜像使用本项目专用的 SSH 部署 Secret。首次发布前，仓库管理员必须先在 GitHub Settings 启用 **immutable releases**，并在发起工作流前用具备 Administration 读取权限的账号确认设置仍为 `enabled=true`。GitHub Actions 的 `GITHUB_TOKEN` 没有 Administration 权限，不能可靠读取该仓库设置；工作流会在发布后强制验证 Release 的 `immutable=true`。安装器也会拒绝可变 Release，防止发布后资产和同一份 checksum 被一起替换。
+正式发布默认同时包含 GitHub 和 `dl.ll.cd`，依次完成。GitHub 发布不需要签名私钥或签名 Secret；镜像使用本项目专用的 SSH 部署 Secret。首次发布前，仓库管理员必须先在 GitHub Settings 启用 **immutable releases**，并在发起工作流前用具备 Administration 读取权限的账号确认设置仍为 `enabled=true`。GitHub Actions 的 `GITHUB_TOKEN` 没有 Administration 权限，不能可靠读取该仓库设置；工作流会在发布后强制验证 Release 的 `immutable=true`。GitHub 直连安装器和发布端拒绝可变 Release；默认镜像入口的信任边界见上文。
 
 先在目标提交中准备 `docs/releases/vMAJOR.MINOR.PATCH.md`，首行必须是 `# proxyscene vMAJOR.MINOR.PATCH`，写明升级要求、依赖版本和兼容限制。工作流会把这份经过审阅的说明传给发布 job，并在发布后核对公开正文。
 
@@ -963,7 +990,7 @@ gh workflow run Release --ref main -f version=v0.9.2
 
 不要预先创建或推送 tag。工作流首先要求仓库变量 `PROXYSCENE_RELEASE_MIRROR_CONFIGURED=true`；未配置或停用镜像时，在构建和创建 GitHub Release 前失败。工作流只接受严格的稳定版本，在固定且仍为当前 `main` 的 commit 上运行模块、格式、普通测试、竞态、静态和漏洞检查，两次四架构构建、产物校验，以及 Debian systemd 安装、v0.8.0/v0.9.2 升级和事务故障恢复 canary；v0.7.1 则验证缺少历史运行配置时的安全拒绝。发布 job 是唯一拥有 `contents: write` 的 job：它先确认目标 tag 和 Release 都不存在，再创建 draft、上传全部构建产物，最后发布并标记为 Latest。随后只读 job 会要求 Release 已 immutable 且为 Latest，比较 GitHub SHA256 digest，重新下载全部资产逐字节比较，并校验 `checksums.txt`。
 
-上述 GitHub 发布和只读验证全部成功后，正式 Release 必须调用 `mirror-publish.yml` 完成镜像发布。接收端验证并发布固定版本目录，CI 再匿名下载并逐字节比对全部 11 项资产，最后原子更新防降级的 `latest.json` 并再次验收。镜像失败时整个发布仍未完成，已发布的 immutable GitHub Release 保留；修复后从 `main` 单独运行 `Mirror release` 并输入相同 tag 重试；该入口也调用相同 worker 和专用 Secret 映射，无需重建或重发 GitHub Release。部署和故障恢复见 [镜像发布说明](docs/mirror-publishing.md)。
+上述 GitHub 发布和只读验证全部成功后，正式 Release 必须调用 `mirror-publish.yml` 完成镜像发布。接收端验证并发布固定版本目录及独立的版本元数据，CI 再匿名下载并逐字节比对全部 11 项资产和元数据，最后原子更新防降级的 `latest.json` 并再次验收。镜像失败时整个发布仍未完成，已发布的 immutable GitHub Release 保留；修复后从 `main` 单独运行 `Mirror release` 并输入相同 tag 重试；该入口也调用相同 worker 和专用 Secret 映射，无需重建或重发 GitHub Release。部署和故障恢复见 [镜像发布说明](docs/mirror-publishing.md)。
 
 如果创建 draft、上传资产或发布期间中断，不要直接盲目重跑完整 workflow。先在 GitHub 核对同名 tag、draft/Release 和资产是否存在；确认残留内容及目标 commit 后，人工删除未发布的残留 draft/tag，或仅重跑尚未执行的只读验证。工作流不会自动删除发布对象。
 

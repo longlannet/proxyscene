@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
 	"syscall"
@@ -87,7 +86,13 @@ func (a *App) updateCommand(args []string) error {
 func (a *App) runUpdate(options updateOptions) (bool, error) {
 	client := newUpdateClient()
 	defer client.http.CloseIdleConnections()
-	return a.checkAndUpdate(options, client.latest, func(release updateRelease) (bool, error) {
+	return a.runUpdateWithClient(options, client)
+}
+
+func (a *App) runUpdateWithClient(options updateOptions, client *updateClient) (bool, error) {
+	return a.checkAndUpdate(options, func(ctx context.Context) (updateRelease, error) {
+		return client.latestForSource(ctx, options.Source)
+	}, func(release updateRelease) (bool, error) {
 		return a.applyUpdate(options, release, client)
 	})
 }
@@ -106,7 +111,12 @@ func (a *App) checkAndUpdate(options updateOptions, latest func(context.Context)
 	if err != nil {
 		return false, err
 	}
-	fmt.Printf("当前版本：%s\n最新正式版本：%s\n更新说明：https://github.com/%s/releases/tag/%s\n", sanitizeDisplayText(VersionString(), 200), release.Tag, updateRepository, release.Tag)
+	fmt.Printf("当前版本：%s\n最新正式版本：%s\n", sanitizeDisplayText(VersionString(), 200), release.Tag)
+	if options.Source == "github" {
+		fmt.Printf("更新来源：GitHub\n更新说明：https://github.com/%s/releases/tag/%s\n", updateRepository, release.Tag)
+	} else {
+		fmt.Println("更新来源：dl.ll.cd（以下更新说明来自镜像版本元数据）")
+	}
 	if release.Notes != "" {
 		notes := release.Notes
 		if len(notes) > 16384 {
@@ -129,7 +139,7 @@ func (a *App) checkAndUpdate(options updateOptions, latest func(context.Context)
 		return false, err
 	}
 	if comparison == 0 && release.Commit != Commit {
-		return false, fmt.Errorf("同一版本的 commit 与 GitHub 不一致，拒绝自动升级")
+		return false, fmt.Errorf("同一版本的 commit 与所选发行来源不一致，拒绝自动升级")
 	}
 	if comparison <= 0 {
 		if comparison == 0 {
@@ -140,7 +150,11 @@ func (a *App) checkAndUpdate(options updateOptions, latest func(context.Context)
 		return false, nil
 	}
 	if options.Check {
-		fmt.Println("有新版本；执行 sudo proxyscene update 可下载并升级")
+		if options.Source == "github" {
+			fmt.Println("有新版本；执行 sudo proxyscene update --source github 可下载并升级")
+		} else {
+			fmt.Println("有新版本；执行 sudo proxyscene update 可从 dl.ll.cd 下载并升级")
+		}
 		return false, nil
 	}
 	return apply(release)
@@ -283,13 +297,8 @@ func (a *App) applyUpdate(options updateOptions, release updateRelease, client *
 	if err := validateUpdateBundleIdentity(bundleDir, arch); err != nil {
 		return false, err
 	}
-	// A moving Latest must not silently install a now-superseded selection.
-	latest, err := client.latest(ctx)
-	if err != nil {
+	if err := client.revalidate(ctx, release); err != nil {
 		return false, err
-	}
-	if !reflect.DeepEqual(latest, release) {
-		return false, fmt.Errorf("下载期间 GitHub 最新版本身份发生变化，请重新检查更新")
 	}
 	return a.installPreparedUpdate(options, release, bundleDir, expected, arch, runUpdateInstaller)
 }

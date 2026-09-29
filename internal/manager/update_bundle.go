@@ -41,7 +41,7 @@ func (r *updateTarReader) Read(p []byte) (int, error) {
 }
 
 // extractUpdateBundle accepts only the release bundle's flat, exact layout.
-// The caller must first verify the archive against GitHub's release checksum
+// The caller must first verify the archive against the selected release source's checksum
 // and supply a nonexistent destination in a trusted private staging directory.
 func extractUpdateBundle(archive, destination, arch string) (bundleDir string, err error) {
 	if _, _, err := updateELFArchitecture(arch); err != nil {
@@ -233,7 +233,7 @@ func validateUpdateBundleIdentity(bundleDir, arch string) error {
 	return validateUpdateELF(filepath.Join(bundleDir, "xray"), arch)
 }
 
-// Validate build metadata without executing the downloaded program. GitHub's
+// Validate build metadata without executing the downloaded program. The selected release source's
 // verified archive checksum binds its contents to the release tag and commit.
 // Release builds use -trimpath, which intentionally omits -ldflags from build
 // info: this check cannot independently recover the linked Version or Commit.

@@ -190,6 +190,20 @@ def release_usage(directory: Path, owner: int) -> int:
     return total
 
 
+def metadata_usage(directory: Path, owner: int) -> int:
+    total = allocated_bytes(require_directory(directory, owner, 0o755))
+    count = 0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            count += 1
+            if count > MAX_PROJECT_VERSIONS or not entry.name.endswith(".json"):
+                fail("unexpected release metadata path or count")
+            tag = release.validate_tag(entry.name[:-5])
+            require_directory(PROJECT_ROOT / tag, owner, 0o755)
+            total += allocated_bytes(require_file(directory / entry.name, owner, (0o644,), MAX_METADATA_BYTES))
+    return total
+
+
 def require_project_budget(
     owner: int, additional: int = 0, new_version: bool = False, already_allocated: bool = False
 ) -> None:
@@ -200,6 +214,8 @@ def require_project_budget(
             path = PROJECT_ROOT / entry.name
             if entry.name == "latest.json":
                 total += allocated_bytes(require_file(path, owner, (0o644,), MAX_METADATA_BYTES))
+            elif entry.name == "metadata":
+                total += metadata_usage(path, owner)
             else:
                 release.validate_tag(entry.name)
                 versions += 1
@@ -282,6 +298,53 @@ def verify_published(info: dict, owner: int) -> Path:
     return directory
 
 
+def verify_metadata(info: dict, owner: int) -> Path:
+    directory = PROJECT_ROOT / "metadata"
+    require_directory(directory, owner, 0o755)
+    path = directory / (info["tag"] + ".json")
+    expected = release.metadata_bytes(info)
+    require_file(path, owner, (0o644,), MAX_METADATA_BYTES)
+    _, actual = release._read_asset(path, len(expected), collect=True)
+    if actual != expected:
+        fail("refusing to mutate metadata for an existing release")
+    return path
+
+
+def publish_metadata(info: dict, owner: int) -> None:
+    """Fill a missing sidecar after asset commit without rewriting old releases."""
+    directory = PROJECT_ROOT / "metadata"
+    destination = directory / (info["tag"] + ".json")
+    if destination.exists() or destination.is_symlink():
+        verify_metadata(info, owner)
+        fsync_directory(directory)
+        fsync_directory(PROJECT_ROOT)
+        return
+    candidate = release.metadata_bytes(info)
+    # Account for allocation overhead as well as the sidecar and its directory.
+    additional = len(candidate) + 8192
+    require_project_budget(owner, additional)
+    require_incoming_budget(owner, additional)
+    with private_stage(owner) as stage:
+        temporary = stage / "metadata.json"
+        with exact_umask(0):
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(candidate)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o644)
+            os.fsync(stream.fileno())
+        if release.release_info(info["tag"]) != info:
+            fail("GitHub release identity changed before metadata publication")
+        if not directory.exists() and not directory.is_symlink():
+            with exact_umask(0):
+                directory.mkdir(mode=0o755)
+            fsync_directory(PROJECT_ROOT)
+        require_directory(directory, owner, 0o755)
+        rename_noreplace(temporary, destination)
+        fsync_directory(directory)
+        fsync_directory(stage)
+
+
 def sync_release(tag: str, owner: int) -> dict:
     info = release.release_info(tag)
     destination = PROJECT_ROOT / tag
@@ -289,6 +352,7 @@ def sync_release(tag: str, owner: int) -> dict:
         verify_published(info, owner)
         # Also repair durability after a previous rename succeeded but fsync failed.
         fsync_directory(PROJECT_ROOT)
+        publish_metadata(info, owner)
         return info
     size = sum(asset["size"] for asset in info["assets"].values()) + MAX_METADATA_BYTES
     require_project_budget(owner, size, new_version=True)
@@ -317,6 +381,7 @@ def sync_release(tag: str, owner: int) -> dict:
         rename_noreplace(payload, destination)
         fsync_directory(PROJECT_ROOT)
         fsync_directory(stage)
+    publish_metadata(info, owner)
     return info
 
 
@@ -358,6 +423,7 @@ def promote_release(tag: str, owner: int) -> dict:
     if release.release_info("latest") != info:
         fail("requested release is not the exact GitHub Latest")
     verify_published(info, owner)
+    verify_metadata(info, owner)
     candidate = release.manifest_bytes(info)
     current = current_manifest(owner)
     if current is not None:

@@ -29,14 +29,14 @@ class Fixture(unittest.TestCase):
         self.files["checksums.txt"] = self.checksums()
         self.info = {
             "tag": "v0.9.0", "version": "0.9.0", "commit": "a" * 40,
-            "release_id": 1234, "published_at": "2020-01-02T03:04:05Z",
+            "release_id": 1234, "published_at": "2020-01-02T03:04:05Z", "notes": "修复与更新\n",
             "assets": {name: {"sha256": sha(data), "size": len(data),
                               "url": mirror.RELEASE_BASE + "/v0.9.0/" + name}
                        for name, data in self.files.items()},
         }
         self.release = {
             "id": self.info["release_id"], "tag_name": self.info["tag"], "immutable": True,
-            "draft": False, "prerelease": False, "published_at": self.info["published_at"],
+            "draft": False, "prerelease": False, "published_at": self.info["published_at"], "body": self.info["notes"],
             "assets": [{"name": name, "size": item["size"], "digest": "sha256:" + item["sha256"],
                         "browser_download_url": item["url"], "id": index, "state": "uploaded",
                         "url": mirror.API_BASE + "/releases/assets/" + str(index)}
@@ -64,6 +64,8 @@ class Fixture(unittest.TestCase):
         self.requests.append((url, max_bytes, kwargs))
         if url == mirror.MIRROR_BASE + "/latest.json":
             data = mirror.manifest_bytes(self.info)
+        elif url == mirror.MIRROR_BASE + "/metadata/" + self.info["tag"] + ".json":
+            data = mirror.metadata_bytes(self.info)
         else:
             data = self.files[url.rsplit("/", 1)[1]]
         self.assertLessEqual(len(data), max_bytes)
@@ -91,7 +93,7 @@ class IdentityTests(Fixture):
 
     def test_rejects_untrusted_release_state(self):
         for field, value in (("immutable", False), ("immutable", "true"), ("draft", True), ("prerelease", True),
-                             ("tag_name", "v0.8.0"), ("id", True), ("id", 0),
+                             ("tag_name", "v0.8.0"), ("id", True), ("id", 0), ("id", 2**63),
                              ("published_at", "2099-01-01T00:00:00Z"), ("published_at", "2020-02-31T00:00:00Z")):
             with self.subTest(field=field, value=value):
                 original = self.release[field]
@@ -109,13 +111,14 @@ class IdentityTests(Fixture):
 
     def test_asset_set_cannot_be_changed(self):
         original = copy.deepcopy(self.release["assets"])
-        for kind in ("missing", "extra", "duplicate", "source-path", "second-source"):
+        for kind in ("missing", "extra", "duplicate", "source-path", "second-source", "long-source"):
             self.release["assets"] = copy.deepcopy(original)
             if kind == "missing": self.release["assets"].pop()
             if kind == "extra": self.release["assets"].append(copy.deepcopy(original[0]))
             if kind == "duplicate": self.release["assets"][-1] = copy.deepcopy(original[0])
             if kind == "source-path": self.release["assets"][0]["name"] = "../install.sh"
             if kind == "second-source": self.release["assets"][0]["name"] = "xray_source_v26.9.8.tar.gz"
+            if kind == "long-source": self.release["assets"][-1]["name"] = "xray_source_v" + "9" * 128 + ".9.tar.gz"
             with self.subTest(kind=kind), self.assertRaises(mirror.MirrorError): self.read_info()
 
     def test_asset_digest_size_and_origin_are_mandatory(self):
@@ -146,6 +149,28 @@ class IdentityTests(Fixture):
     def test_json_duplicate_keys_and_multiple_documents_fail(self):
         for raw in (b'{"immutable":true,"immutable":false}', b'{}\n{}', b'[]', b'{"x":NaN}', b'\xff'):
             with self.subTest(raw=raw), self.assertRaises(mirror.MirrorError): mirror._decode_json(raw)
+
+    def test_public_metadata_is_exact_without_urls_and_includes_notes(self):
+        raw = mirror.metadata_bytes(self.read_info())
+        value = json.loads(raw)
+        self.assertEqual(set(value), {"schema_version", "tag", "version", "commit", "release_id", "published_at", "notes", "assets"})
+        self.assertEqual(value["schema_version"], 1)
+        self.assertEqual(value["notes"], "修复与更新\n")
+        self.assertLess(len(raw), mirror.MAX_METADATA_BYTES)
+        self.assertEqual(len(value["assets"]), 11)
+        self.assertTrue(all(set(asset) == {"sha256", "size"} for asset in value["assets"].values()))
+        self.assertNotIn(b"github.com", raw)
+
+    def test_release_notes_are_bounded_utf8_text(self):
+        for notes in ([], 123, "x" * (mirror.MAX_NOTES_BYTES + 1), "中" * (mirror.MAX_NOTES_BYTES // 3 + 1), "\ud800"):
+            with self.subTest(notes=repr(notes)[:40]):
+                self.release["body"] = notes
+                with self.assertRaises(mirror.MirrorError):
+                    self.read_info()
+        self.release["body"] = None
+        self.assertEqual(self.read_info()["notes"], "")
+        self.release["body"] = "x" * mirror.MAX_NOTES_BYTES
+        self.assertEqual(self.read_info()["notes"], self.release["body"])
 
     def test_manifest_is_exact_and_does_not_trust_supplied_base_url(self):
         expected = (b'{"version":"0.9.0","tag":"v0.9.0","base_url":"https://dl.ll.cd/proxyscene/v0.9.0",'
@@ -244,7 +269,7 @@ class LifecycleTests(Fixture):
         with self.assertRaises(mirror.MirrorError):
             mirror.prepare("v0.9.0", self.root / "other", self.root / "other" / "record.json")
 
-    def test_public_verify_and_stable_only_fetch_latest_index(self):
+    def test_public_verify_includes_metadata_and_stable_index(self):
         source = self.write_assets()
         output = self.root / "public"
         with mock.patch.object(mirror, "release_info", return_value=self.info), mock.patch.object(mirror, "_download_url", side_effect=self.fake_download):
@@ -253,7 +278,8 @@ class LifecycleTests(Fixture):
         self.assertTrue(result["stable_verified"])
         self.assertEqual(len(list(output.iterdir())), 11)
         self.assertTrue((self.root / "public.result.json").is_file())
-        self.assertEqual(len(self.requests), 12)
+        self.assertEqual(len(self.requests), 13)
+        self.assertTrue(result["metadata_verified"])
         self.assertTrue(all(options.get("mirror") is True and set(options) == {"mirror", "deadline"} for _, _, options in self.requests))
         self.assertNotIn(mirror.MIRROR_BASE + "/install.sh", [url for url, _, _ in self.requests])
 
@@ -265,6 +291,25 @@ class LifecycleTests(Fixture):
         with mock.patch.object(mirror, "release_info", return_value=self.info), mock.patch.object(mirror, "_download_url", side_effect=corrupt), self.assertRaises(mirror.MirrorError):
             mirror.verify_public("v0.9.0", source, self.root / "public")
         self.assertFalse((self.root / "public.result.json").exists())
+
+    def test_public_metadata_identity_notes_asset_or_encoding_drift_fails(self):
+        source = self.write_assets()
+        for fault in ("commit", "notes", "digest", "url", "extra", "encoding"):
+            def corrupt_metadata(url, destination, limit, **kwargs):
+                self.fake_download(url, destination, limit, **kwargs)
+                if "/metadata/" in url:
+                    data = json.loads(mirror.metadata_bytes(self.info))
+                    if fault == "commit": data["commit"] = "b" * 40
+                    if fault == "notes": data["notes"] = "changed"
+                    if fault == "digest": data["assets"]["install.sh"]["sha256"] = "b" * 64
+                    if fault == "url": data["assets"]["install.sh"]["url"] = "https://evil.example"
+                    if fault == "extra": data["extra"] = True
+                    raw = mirror._canonical_json(data)
+                    if fault == "encoding": raw += b"\n"
+                    Path(destination).write_bytes(raw)
+            with self.subTest(fault=fault), mock.patch.object(mirror, "release_info", return_value=self.info), mock.patch.object(mirror, "_download_url", side_effect=corrupt_metadata), self.assertRaisesRegex(mirror.MirrorError, "public release metadata"):
+                mirror.verify_public("v0.9.0", source, self.root / fault)
+            self.assertFalse((self.root / (fault + ".result.json")).exists())
 
     def test_stable_manifest_semantic_or_byte_drift_fails(self):
         source = self.write_assets()
