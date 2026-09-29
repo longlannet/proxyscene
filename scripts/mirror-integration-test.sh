@@ -6,7 +6,7 @@ set -euo pipefail
   exit 2
 }
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-TAG=${PROXYSCENE_MIRROR_TEST_TAG:-v0.9.2}
+TAG=${PROXYSCENE_MIRROR_TEST_TAG:-v0.10.0}
 [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ && ${#TAG} -le 128 ]]
 EVIDENCE=${PROXYSCENE_MIRROR_TEST_EVIDENCE:-$(mktemp -d /tmp/proxyscene-mirror-integration.XXXXXXXX)}
 mkdir -p -- "$EVIDENCE"
@@ -19,7 +19,7 @@ CONTAINER="proxyscene-mirror-test-$TEST_ID"
 docker ps -aq --no-trunc | sort > "$EVIDENCE/container-ids-before.txt"
 docker image ls -q --no-trunc | sort -u > "$EVIDENCE/image-ids-before.txt"
 sha256sum "$ROOT/scripts/mirror-receiver.py" "$ROOT/scripts/mirror_release.py" \
-  "$ROOT/deploy/nginx/proxyscene.conf" > "$EVIDENCE/source-before.sha256"
+  "$ROOT/scripts/bootstrap-install.sh" "$ROOT/deploy/nginx/proxyscene.conf" > "$EVIDENCE/source-before.sha256"
 cleanup() {
   local result=$? cleanup_failed=0
   trap - EXIT INT TERM
@@ -56,6 +56,7 @@ docker run -d --init --name "$CONTAINER" --label "io.proxyscene.mirror-test=$TES
 docker exec "$CONTAINER" mkdir -p /inputs /evidence
 docker cp "$ROOT/scripts/mirror-receiver.py" "$CONTAINER:/inputs/mirror-receiver.py"
 docker cp "$ROOT/scripts/mirror_release.py" "$CONTAINER:/inputs/mirror_release.py"
+docker cp "$ROOT/scripts/bootstrap-install.sh" "$CONTAINER:/inputs/bootstrap-install.sh"
 docker cp "$ROOT/deploy/nginx/proxyscene.conf" "$CONTAINER:/inputs/proxyscene.conf"
 printf 'Preparing disposable SSH and HTTPS services...\n'
 docker exec -i "$CONTAINER" bash -s > "$EVIDENCE/setup.log" 2>&1 <<'SETUP'
@@ -68,7 +69,7 @@ apt-get install -y --no-install-recommends ca-certificates curl nginx openssh-se
 useradd --create-home --shell /bin/sh psmirror
 passwd -l psmirror
 install -d -m 0755 /usr/local/libexec/proxyscene-mirror /www /www/wwwroot /www/wwwroot/dl.ll.cd
-install -m 0644 /inputs/mirror-receiver.py /inputs/mirror_release.py /usr/local/libexec/proxyscene-mirror/
+install -m 0644 /inputs/mirror-receiver.py /inputs/mirror_release.py /inputs/bootstrap-install.sh /usr/local/libexec/proxyscene-mirror/
 install -d -o psmirror -g www-data -m 0755 /www/wwwroot/dl.ll.cd/proxyscene
 install -d -o psmirror -g psmirror -m 0700 /var/lib/proxyscene-mirror /home/psmirror/.ssh
 install -d -m 0700 /run/mirror-test
@@ -175,9 +176,35 @@ command('sync', 'proxyscene-mirror sync ' + tag)
 assets = sorted((root / tag).iterdir())
 assert len(assets) == 11
 before = {p.name: [p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()] for p in assets}
+metadata_path = root / 'metadata' / (tag + '.json')
+metadata = metadata_path.read_bytes()
+metadata_inode = metadata_path.stat().st_ino
+parsed_metadata = json.loads(metadata)
+assert set(parsed_metadata) == {'schema_version', 'tag', 'version', 'commit', 'release_id', 'published_at', 'notes', 'assets'}
+assert parsed_metadata['schema_version'] == 1 and parsed_metadata['tag'] == tag
+assert set(parsed_metadata['assets']) == {p.name for p in assets}
+assert all(set(item) == {'sha256', 'size'} for item in parsed_metadata['assets'].values())
 command('sync-retry', 'proxyscene-mirror sync ' + tag)
 assert before == {p.name: [p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()] for p in assets}
+assert metadata_path.read_bytes() == metadata and metadata_path.stat().st_ino == metadata_inode
+# Simulate upgrading an older mirror that already published the immutable assets.
+# The same sync must fill the new sidecar without replacing any release file.
+metadata_path.unlink()
+command('promote-without-metadata-rejected', 'proxyscene-mirror promote ' + tag, False)
+command('legacy-metadata-backfill', 'proxyscene-mirror sync ' + tag)
+assert metadata_path.read_bytes() == metadata
+assert before == {p.name: [p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()] for p in assets}
 assert not list(Path('/var/lib/proxyscene-mirror').glob('stage-*'))
+bootstrap_path = Path('/usr/local/libexec/proxyscene-mirror/bootstrap-install.sh')
+bootstrap = bootstrap_path.read_bytes()
+bootstrap_stat = bootstrap_path.stat()
+assert bootstrap_stat.st_uid == 0 and bootstrap_stat.st_mode & 0o7777 == 0o644
+assert bootstrap_path.parent.stat().st_uid == 0
+blocked = subprocess.run(['runuser', '-u', 'psmirror', '--', 'test', '-w', str(bootstrap_path)], check=False)
+assert blocked.returncode == 1
+blocked = subprocess.run(['runuser', '-u', 'psmirror', '--', 'test', '-w', str(bootstrap_path.parent)], check=False)
+assert blocked.returncode == 1
+checks.append({'name': 'root-owned-bootstrap-cannot-be-written-by-publisher', 'exit': 0})
 with open('/var/lib/proxyscene-mirror/.deploy.lock', 'rb') as lock:
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     locked = command('concurrent-sync-rejected', 'proxyscene-mirror sync ' + tag, False)
@@ -229,7 +256,19 @@ status, headers, body = request('/proxyscene/latest.json')
 assert status == 200 and body == latest
 assert 'no-store' in headers.get('cache-control', '') and 'no-cache' in headers['cache-control']
 assert headers.get('x-content-type-options') == 'nosniff' and 'content-encoding' not in headers
-for path in ['/proxyscene', '/proxyscene/', '/proxyscene/install.sh', '/proxyscene/.secret',
+for path, expected, mutable in [('/proxyscene/install.sh', bootstrap, True),
+                                ('/proxyscene/metadata/' + tag + '.json', metadata, False)]:
+    status, headers, body = request(path)
+    assert status == 200 and body == expected, path
+    assert headers.get('x-content-type-options') == 'nosniff' and 'content-encoding' not in headers, path
+    assert ('no-store' in headers.get('cache-control', '')) == mutable, path
+    assert ('immutable' in headers.get('cache-control', '')) != mutable, path
+    status, headers, body = request(path, 'HEAD')
+    assert status == 200 and not body and int(headers['content-length']) == len(expected), path
+for path in ['/proxyscene', '/proxyscene/', '/proxyscene/.secret',
+             '/proxyscene/metadata/', '/proxyscene/metadata/v01.2.3.json',
+             '/proxyscene/metadata/' + tag + '.json/extra', '/proxyscene/metadata/unknown.json',
+             '/proxyscene/metadata/v999.999.999.json', '/proxyscene/install.sh/extra',
              '/proxyscene/' + tag + '/', '/proxyscene/' + tag + '/.hidden',
              '/proxyscene/v01.2.3/install.sh', '/proxyscene/' + tag + '/unknown.txt',
              '/proxyscene/v999.999.999/install.sh']:
@@ -237,32 +276,45 @@ for path in ['/proxyscene', '/proxyscene/', '/proxyscene/install.sh', '/proxysce
     assert status == 404, (path, status)
     assert 'immutable' not in headers.get('cache-control', ''), path
 for method in ['POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS']:
-    for path in ['/proxyscene/latest.json', '/proxyscene/' + tag + '/install.sh']:
+    for path in ['/proxyscene/latest.json', '/proxyscene/install.sh',
+                 '/proxyscene/metadata/' + tag + '.json', '/proxyscene/' + tag + '/install.sh']:
         status, headers, body = request(path, method)
         assert status in (403, 404, 405), (path, method, status)
 # Verify existing forbidden objects cannot be served, then restore the exact
 # public bytes before the final integrity and cleanup assertions.
-script = root / tag / 'install.sh'
-saved = Path('/run/mirror-test/install.sh.saved')
-script.rename(saved)
+for script, url in [(root / tag / 'install.sh', '/proxyscene/' + tag + '/install.sh'),
+                    (metadata_path, '/proxyscene/metadata/' + tag + '.json')]:
+    saved = Path('/run/mirror-test/' + script.name + '.saved')
+    script.rename(saved)
+    try:
+        script.symlink_to(saved)
+        assert request(url)[0] == 404
+        script.unlink()
+        script.mkdir()
+        assert request(url)[0] == 404
+        script.rmdir()
+    finally:
+        if script.is_symlink(): script.unlink()
+        if script.is_dir(): script.rmdir()
+        saved.rename(script)
+saved = Path('/run/mirror-test/bootstrap.saved')
+bootstrap_path.rename(saved)
 try:
-    script.symlink_to(saved)
-    assert request('/proxyscene/' + tag + '/install.sh')[0] == 404
-    script.unlink()
-    script.mkdir()
-    assert request('/proxyscene/' + tag + '/install.sh')[0] == 404
-    script.rmdir()
+    bootstrap_path.symlink_to(saved)
+    assert request('/proxyscene/install.sh')[0] in (403, 404)
 finally:
-    if script.is_symlink(): script.unlink()
-    if script.is_dir(): script.rmdir()
-    saved.rename(script)
+    bootstrap_path.unlink()
+    saved.rename(bootstrap_path)
 assert before == {p.name: [p.stat().st_ino, hashlib.sha256(p.read_bytes()).hexdigest()] for p in assets}
 assert (root / 'latest.json').read_bytes() == latest
+assert metadata_path.read_bytes() == metadata
+assert bootstrap_path.read_bytes() == bootstrap
 assert not list(Path('/var/lib/proxyscene-mirror').glob('stage-*'))
+(evidence / 'metadata.json').write_bytes(metadata)
 (evidence / 'http-responses.json').write_text(json.dumps(responses, indent=2) + '\n')
 (evidence / 'asset-identities.json').write_text(json.dumps(before, indent=2) + '\n')
 (evidence / 'checks.json').write_text(json.dumps(checks, indent=2) + '\n')
-print('PASS nginx-eleven-assets-headers-methods-paths-symlinks', flush=True)
+print('PASS nginx-eleven-assets-metadata-bootstrap-headers-methods-paths-symlinks', flush=True)
 print('MIRROR_INTEGRATION_OK', flush=True)
 TESTS
 cat "$EVIDENCE/tests.log"

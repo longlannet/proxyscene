@@ -607,6 +607,19 @@ assert_fails "missing updater hash" parse_args --offline --expected-manager-sha2
 assert_fails "malformed updater hash" parse_args --offline --expected-manager-sha256 abc
 assert_fails "duplicate updater hash" parse_args --offline --expected-manager-sha256 "$XRAY_SHA256_AMD64" --expected-manager-sha256 "$XRAY_SHA256_AMD64"
 assert_fails "online updater precondition" parse_args --expected-manager-sha256 "$XRAY_SHA256_AMD64"
+assert_fails "online absence precondition" parse_args --expected-manager-absent
+assert_fails "duplicate absence precondition" parse_args --offline --expected-manager-absent --expected-manager-absent
+assert_fails "conflicting installation preconditions" parse_args --offline --expected-manager-absent --expected-manager-sha256 "$XRAY_SHA256_AMD64"
+(
+  INSTALL_BIN="$update_guard_dir/absent-manager"
+  parse_args --offline --expected-manager-absent
+  verify_expected_manager
+  printf 'concurrently installed manager\n' > "$INSTALL_BIN"
+  assert_fails "concurrent first installation" verify_expected_manager
+  rm "$INSTALL_BIN"
+  ln -s missing "$INSTALL_BIN"
+  assert_fails "dangling installation symlink" verify_expected_manager
+)
 # Exercise main's ordering without installing or creating any system file.
 (
   parse_args() { OFFLINE_REQUESTED=1; EXPECTED_MANAGER_SHA256="$XRAY_SHA256_AMD64"; }

@@ -1,6 +1,6 @@
 # 发布到 dl.ll.cd
 
-proxyscene 正式发布默认同时包含 GitHub 和 `https://dl.ll.cd/proxyscene`，先完成 GitHub 检查和发布，再发布镜像。镜像保存 GitHub 已公开、稳定且不可变 Release 的原始资产，不重建程序，不改写安装器。GitHub 仍是版本身份与 SHA256 的信任来源；镜像不是独立签名系统。
+proxyscene 正式发布默认同时包含 GitHub 和 `https://dl.ll.cd/proxyscene`，先完成 GitHub 检查和发布，再发布镜像。镜像保存 GitHub 已公开、稳定且不可变 Release 的原始资产，不重建程序，不改写安装器。发布端继续以 GitHub 验证版本身份和 SHA256；安装及默认自更新客户端信任镜像 HTTPS 和受控发布流程，无需访问 GitHub。镜像不提供独立发布者签名。
 
 ## 发布流程
 
@@ -8,8 +8,8 @@ proxyscene 正式发布默认同时包含 GitHub 和 `https://dl.ll.cd/proxyscen
 2. GitHub Actions 完成全部构建、测试、漏洞扫描、双重构建比对和 systemd canary 门禁，然后创建并公开 GitHub immutable Latest。
 3. GitHub 发布后验证确认 tag、commit、不可变状态、Latest、正文及全部资产 digest 和下载字节。仅当这些检查全部成功，才自动启动必须执行的镜像 job。
 4. 镜像工作流从固定 GitHub 仓库验证 tag、commit、Release ID、不可变状态和精确 11 项资产；下载并核对 GitHub digest、实际大小及 `checksums.txt`。
-5. 专用 SSH 接收端执行 `proxyscene-mirror sync vMAJOR.MINOR.PATCH`。服务器独立从 GitHub 拉取并校验相同资产，在私有暂存目录准备完整版本，以不覆盖的原子目录重命名提交。
-6. 工作流从公开 HTTPS 镜像下载全部 11 项文件，与原始 GitHub 下载逐字节比较。
+5. 专用 SSH 接收端执行 `proxyscene-mirror sync vMAJOR.MINOR.PATCH`。服务器独立从 GitHub 拉取并校验相同资产，在私有暂存目录准备完整版本，以不覆盖的原子目录重命名提交；另原子发布 `metadata/<tag>.json`，保存 schema_version=1、版本身份、更新说明和原 11 项资产的大小/SHA256。
+6. 工作流从公开 HTTPS 镜像下载全部 11 项文件，与原始 GitHub 下载逐字节比较，并核对公开版本元数据。
 7. 仅当选中 tag 仍是 GitHub Latest，才执行 `proxyscene-mirror promote TAG`。服务器重新核对 GitHub Latest、本地完整版本及单调版本顺序，原子更新 `latest.json`；工作流再次验收。
 
 镜像失败时整个发布仍未完成，不会删除或重建已经发布的 GitHub Release；修复后从 `main` 单独运行 `Mirror release`，输入相同 tag 重试。该入口也可归档已发布的旧版本，但不能降低 Latest。已存在的版本只能以完全相同内容幂等重试，不能覆盖或修补公开的半成品目录。格式损坏或不规范的现存 `latest.json` 会阻断更新，不能被当作首次发布。已有索引用于记录本地版本高水位；同一 tag 的身份信息不能改写，新 tag 则独立按 GitHub 身份与资产重新验证。
@@ -29,7 +29,7 @@ gh workflow run 'Mirror release' --ref main -f tag=v0.9.2
 | 路径 | 属主与权限 | 用途 |
 | --- | --- | --- |
 | `/usr/local/libexec/proxyscene-mirror/` | root:root 0755 | 可信接收端代码目录 |
-| 其中 `mirror-receiver.py`、`mirror_release.py` | root:root 0644 | 来自经过测试的同一仓库提交 |
+| 其中 `mirror-receiver.py`、`mirror_release.py`、`bootstrap-install.sh` | root:root 0644 | 来自经过测试的同一仓库提交 |
 | `/www/wwwroot/dl.ll.cd/proxyscene/` | psmirror:www 0755 | 公开版本及 Latest 索引 |
 | `/var/lib/proxyscene-mirror/` | psmirror:psmirror 0700 | 私有暂存、持久发布锁 |
 | `/home/psmirror/.ssh/` | psmirror:psmirror 0700 | 专用公钥目录 |
@@ -53,7 +53,11 @@ restrict,command="/usr/bin/python3 -I /usr/local/libexec/proxyscene-mirror/mirro
 
 该文件只增加 `/proxyscene` 路由，不改其它项目：固定 tag 文件长期 immutable 缓存；`latest.json` 禁缓存；禁止符号链接、目录索引、隐藏文件、非白名单路径和写方法。先执行实际 nginx 的 `-t`，成功后才 reload。保持原站点 TLS 和证书配置。
 
-不维护可变的根目录 `install.sh`。用户通过明确版本目录下载脚本或 bundle，并按 README 从 GitHub 验证；`latest.json` 只用于发现版本。这样只有一个稳定版提交点，不会出现独立更新脚本与索引相互错配。
+根目录 `install.sh` 是固定引导入口，Nginx 精确 alias 到 `/usr/local/libexec/proxyscene-mirror/bootstrap-install.sh`（root:root 0644）；发布账号不能修改它。入口文件完整下载后才执行，客户端仅访问 dl.ll.cd。它不写入默认版本号，正常发版只通过 `latest.json` 切换版本；引导逻辑修改经过仓库 CI 后单独原子部署，禁止缓存。首次执行该入口意味着信任镜像域名及服务器。
+
+`metadata/` 是独立的版本清单目录，保持公开版本目录和 GitHub Release 的 11 项原资产不变。升级接收端时先暂停镜像门禁，持有现有 `/var/lib/proxyscene-mirror/.deploy.lock` 的 flock（不能删除或重建锁文件），备份并原子替换相邻模块及引导脚本；释放部署锁后，以 `psmirror` 身份执行现有 Latest 的同 tag `sync`，补齐缺失清单。随后验证 Nginx 配置并 reload。已有版本内容和冲突清单不能覆盖；补齐并完成公开验证后恢复镜像门禁。引导入口支持 v0.11.0 起的安装器；旧版本仍可使用 README 的明确版本安装方式。
+
+公开 `metadata/` 后，旧接收端的目录校验不再兼容新布局。需要撤回固定安装入口时，可以还原 Nginx 入口配置，但应保留新版接收端及其配套模块；不能回退到旧接收端或删除已公开元数据。
 
 ## GitHub 配置
 
@@ -79,7 +83,7 @@ python3 -I scripts/mirror_release.py verify --tag v0.9.2 \
   --directory /tmp/proxyscene-canonical --output /tmp/proxyscene-public --stable
 ```
 
-验收结果写入 `<output>.result.json`，不混入 11 项资产目录。工作流保留相同结果及版本记录。接收端中断、磁盘不足、现存目录冲突或公开验收失败时，先保留证据并核查错误；不可为了重试删除或覆盖一个已经公开的版本。版本同步成功而 Latest 未更新时，可重复同版本工作流，已有完整版本会通过幂等检查。
+验收结果写入 `<output>.result.json`，不混入 11 项资产目录。工作流保留相同结果及版本记录。接收端中断、磁盘不足、现存目录冲突或公开验收失败时，先保留证据并核查错误；不可为了重试删除或覆盖一个已经公开的版本。版本及元数据同步成功而 Latest 未更新时，可重复同版本工作流，已有完整版本会通过幂等检查。
 
 生产接入前运行隔离验收。它需要 Docker 权限、已存在的 Debian 13 镜像，以及容器访问 Debian 软件源和 GitHub；不会自动拉取镜像：
 

@@ -27,7 +27,7 @@ def fixture(tag="v0.9.0"):
         for name, blob in sorted(blobs.items())
     )
     info = {"tag": tag, "version": tag[1:], "commit": "a" * 40, "release_id": 123,
-            "published_at": "2026-01-01T00:00:00Z", "assets": {
+            "published_at": "2026-01-01T00:00:00Z", "notes": "Fixture release notes\n", "assets": {
                 name: {"sha256": hashlib.sha256(blob).hexdigest(), "size": len(blob),
                        "url": f"{release.RELEASE_BASE}/{tag}/{name}"}
                 for name, blob in blobs.items()}}
@@ -182,6 +182,101 @@ class ReceiverTests(unittest.TestCase):
             self.call()
         self.assertFalse(binary.exists())
         self.assertEqual(len(self.downloads), 1)
+
+    def test_metadata_publishes_once_outside_exact_asset_directory(self):
+        self.call()
+        sidecar = self.project / "metadata/v0.9.0.json"
+        self.assertEqual(sidecar.read_bytes(), release.metadata_bytes(self.info))
+        self.assertEqual(sidecar.stat().st_mode & 0o7777, 0o644)
+        self.assertEqual(sidecar.parent.stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(len(list((self.project / "v0.9.0").iterdir())), 11)
+        before = sidecar.stat().st_ino
+        self.call()
+        self.assertEqual(sidecar.stat().st_ino, before)
+        self.assert_clean()
+
+    def test_existing_legacy_release_can_fill_missing_metadata_without_rewriting_assets(self):
+        self.call()
+        sidecar = self.project / "metadata/v0.9.0.json"
+        sidecar.unlink()
+        sidecar.parent.rmdir()
+        before = {p.name: p.stat().st_ino for p in (self.project / "v0.9.0").iterdir()}
+        self.call()
+        self.assertEqual(sidecar.read_bytes(), release.metadata_bytes(self.info))
+        self.assertEqual(before, {p.name: p.stat().st_ino for p in (self.project / "v0.9.0").iterdir()})
+        self.assertEqual(self.downloads, ["v0.9.0"])
+        self.assert_clean()
+
+    def test_missing_or_modified_metadata_cannot_promote_or_overwrite(self):
+        self.call()
+        sidecar = self.project / "metadata/v0.9.0.json"
+        original = sidecar.read_bytes()
+        sidecar.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.call("promote")
+        self.assertFalse((self.project / "latest.json").exists())
+        sidecar.write_bytes(original.replace(b"Fixture", b"Changed"))
+        sidecar.chmod(0o644)
+        changed = sidecar.read_bytes()
+        for verb in ("sync", "promote"):
+            with self.subTest(verb=verb), self.assertRaises(release.MirrorError):
+                self.call(verb)
+            self.assertEqual(sidecar.read_bytes(), changed)
+            self.assertFalse((self.project / "latest.json").exists())
+        self.assert_clean()
+
+    def test_metadata_rejects_symlink_hardlink_fifo_and_unexpected_paths(self):
+        self.call()
+        sidecar = self.project / "metadata/v0.9.0.json"
+        external = self.root / "metadata-original"
+        sidecar.rename(external)
+        for kind in ("symlink", "hardlink", "fifo", "mode"):
+            with self.subTest(kind=kind):
+                if kind == "symlink": sidecar.symlink_to(external)
+                elif kind == "hardlink": os.link(external, sidecar)
+                elif kind == "fifo": os.mkfifo(sidecar, 0o644)
+                else:
+                    sidecar.write_bytes(external.read_bytes())
+                    sidecar.chmod(0o666)
+                with self.assertRaises((receiver.ReceiverError, OSError)):
+                    self.call()
+                sidecar.unlink()
+        external.rename(sidecar)
+        for name in ("v01.2.3.json", "v99.0.0.json", "extra", "install.sh"):
+            path = sidecar.parent / name
+            path.write_bytes(b"{}")
+            path.chmod(0o644)
+            with self.subTest(name=name), self.assertRaises((release.MirrorError, OSError)):
+                self.call()
+            path.unlink()
+        self.call()
+
+    def test_metadata_cannot_publish_after_upstream_changes(self):
+        original = receiver.publish_metadata
+        def changed(info, owner):
+            self.info["release_id"] += 1
+            return original(info, owner)
+        with mock.patch.object(receiver, "publish_metadata", side_effect=changed), self.assertRaisesRegex(receiver.ReceiverError, "identity changed before metadata"):
+            self.call()
+        self.assertTrue((self.project / "v0.9.0").is_dir())
+        self.assertFalse((self.project / "metadata/v0.9.0.json").exists())
+        self.assertFalse((self.project / "latest.json").exists())
+        self.assert_clean()
+
+    def test_metadata_commit_before_fsync_retry_preserves_inode(self):
+        original = receiver.fsync_directory
+        sidecar = self.project / "metadata/v0.9.0.json"
+        def interrupted(path):
+            if path == sidecar.parent and sidecar.exists():
+                raise OSError("metadata power loss")
+            original(path)
+        with mock.patch.object(receiver, "fsync_directory", side_effect=interrupted), self.assertRaisesRegex(OSError, "metadata power loss"):
+            self.call()
+        before = sidecar.stat().st_ino
+        self.call()
+        self.assertEqual(sidecar.stat().st_ino, before)
+        self.assertEqual(self.downloads, ["v0.9.0"])
+        self.assert_clean()
 
     def test_download_failure_leaves_no_public_tree_or_staging(self):
         def fail_download(info, directory):

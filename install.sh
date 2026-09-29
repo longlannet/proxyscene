@@ -66,6 +66,7 @@ BUILD_FROM_SOURCE="${PROXYSCENE_BUILD_FROM_SOURCE:-0}"
 
 OFFLINE_REQUESTED=0
 EXPECTED_MANAGER_SHA256=""
+EXPECTED_MANAGER_ABSENT=0
 SHOW_HELP=0
 RESOLVED_MANAGER_VERSION=""
 TX_DIR=""
@@ -146,6 +147,10 @@ parse_args() {
         EXPECTED_MANAGER_SHA256="$2"
         shift
         ;;
+      --expected-manager-absent)
+        [[ "$EXPECTED_MANAGER_ABSENT" == "0" ]] || fatal "--expected-manager-absent 不能重复"
+        EXPECTED_MANAGER_ABSENT=1
+        ;;
       -*)
         fatal "未知选项：$1"
         ;;
@@ -157,6 +162,10 @@ parse_args() {
   done
   [[ -z "$EXPECTED_MANAGER_SHA256" || "$OFFLINE_REQUESTED" == "1" ]] \
     || fatal "--expected-manager-sha256 仅用于 --offline 自更新"
+  [[ "$EXPECTED_MANAGER_ABSENT" == "0" || "$OFFLINE_REQUESTED" == "1" ]] \
+    || fatal "--expected-manager-absent 仅用于 --offline 首次安装"
+  [[ "$EXPECTED_MANAGER_ABSENT" == "0" || -z "$EXPECTED_MANAGER_SHA256" ]] \
+    || fatal "安装前态不能同时指定程序缺失和 SHA256"
 }
 
 require_root() {
@@ -685,6 +694,11 @@ acquire_install_lock() {
 # A CLI option (rather than an environment hint) makes older installers fail
 # closed if they do not implement this precondition.
 verify_expected_manager() {
+  if [[ "$EXPECTED_MANAGER_ABSENT" == "1" ]]; then
+    [[ ! -e "$INSTALL_BIN" && ! -L "$INSTALL_BIN" ]] \
+      || fatal "下载期间管理程序已被安装，本次安装未执行；请重新运行安装入口"
+    return 0
+  fi
   [[ -n "$EXPECTED_MANAGER_SHA256" ]] || return 0
   validate_root_regular_file "$INSTALL_BIN" "自更新前的管理程序"
   local actual
