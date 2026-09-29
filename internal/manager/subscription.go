@@ -171,11 +171,17 @@ func (a *App) updateSubscriptions(selector string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), maxSubscriptionUpdateTime)
 	defer cancel()
-	allowHTTP := envBool("PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION", false)
-	client := subscriptionHTTPClient(allowHTTP, envBool("PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION", false))
-	defer client.CloseIdleConnections()
-	return a.updateSubscriptionsWithDownloader(selector, func(raw string) (preparedSubscription, error) {
-		return downloadAndPrepareSubscriptionWithContext(ctx, raw, allowHTTP, client)
+	snapshot, err := a.loadStore()
+	if err != nil {
+		return err
+	}
+	downloader, err := a.subscriptionDownloaderForStore(snapshot)
+	if err != nil {
+		return err
+	}
+	defer downloader.Close()
+	return a.updateSubscriptionsFromSnapshot(snapshot, selector, func(raw string) (preparedSubscription, error) {
+		return downloader.Prepare(ctx, raw)
 	})
 }
 
@@ -184,6 +190,10 @@ func (a *App) updateSubscriptionsWithDownloader(selector string, download func(s
 	if err != nil {
 		return err
 	}
+	return a.updateSubscriptionsFromSnapshot(snapshot, selector, download)
+}
+
+func (a *App) updateSubscriptionsFromSnapshot(snapshot *Store, selector string, download func(string) (preparedSubscription, error)) error {
 	urls, err := selectSubscriptionURLs(snapshot, selector)
 	if err != nil {
 		return err
@@ -221,7 +231,7 @@ func (a *App) updateSubscriptionsWithDownloader(selector string, download func(s
 
 func validateSubscriptionRefresh(prepared preparedSubscription) error {
 	if len(prepared.Nodes) == 0 || prepared.Invalid != 0 || prepared.Incomplete {
-		return fmt.Errorf("订阅 %s 内容为空或含无效/无法完整识别的条目，本次更新未提交", subscriptionID(prepared.URL)[:16])
+		return fmt.Errorf("订阅 %s 内容为空或含无效/无法完整识别的条目，本次更新未提交（%s）", subscriptionID(prepared.URL)[:16], prepared.diagnosticSummary())
 	}
 	return nil
 }
@@ -356,6 +366,11 @@ func (a *App) commitPreparedSubscriptions(st *Store, prepared []preparedSubscrip
 		return err
 	}
 	fmt.Printf("订阅同步完成：新增 %d 个，已有 %d 个，移除 %d 个，跳过无效 %d 个\n", changes.Added, changes.Existing, changes.Removed, changes.Invalid)
+	for _, sub := range prepared {
+		if sub.Invalid > 0 || sub.Incomplete || sub.Format != "" {
+			fmt.Printf("订阅 %s：%s\n", subscriptionID(sub.URL)[:16], sub.diagnosticSummary())
+		}
+	}
 	if changes.Retained > 0 {
 		fmt.Printf("保留 %d 个已不在订阅中但仍被选中的节点；请手动选择替代节点，下次更新再清理\n", changes.Retained)
 	}

@@ -6,18 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net"
-	"net/http"
 	"net/netip"
 	"net/url"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 	"unicode"
 )
@@ -55,6 +50,9 @@ func protocolFromURL(raw string) string {
 	s := strings.ToLower(raw[:i])
 	if s == "shadowsocks" {
 		return "ss"
+	}
+	if s == "hy2" {
+		return "hysteria2"
 	}
 	return s
 }
@@ -197,6 +195,8 @@ func parseNode(raw string) (*parsedNode, error) {
 		return parseTrojan(raw)
 	case "ss":
 		return parseSS(raw)
+	case "hysteria2":
+		return parseHysteria2(raw)
 	default:
 		return nil, fmt.Errorf("不支持的节点协议：%s", protocolFromURL(raw))
 	}
@@ -231,9 +231,9 @@ func parseVLESS(raw string) (*parsedNode, error) {
 		return nil, fmt.Errorf("VLESS 查询参数格式无效")
 	}
 	if err := rejectUnknownQueryParams(q,
-		"type", "network", "security", "sni", "serverName", "fp", "alpn",
+		"type", "network", "security", "sni", "serverName", "servername", "fp", "alpn",
 		"pbk", "sid", "spx", "encryption", "flow",
-		"host", "path", "headerType", "serviceName", "mode", "authority", "extra", "ed", "eh"); err != nil {
+		"host", "path", "headerType", "serviceName", "mode", "authority", "extra", "x_padding_bytes", "ed", "eh"); err != nil {
 		return nil, fmt.Errorf("VLESS 查询参数无效：%w", err)
 	}
 	network, err := transportNetworkFromQuery(q)
@@ -251,15 +251,15 @@ func parseVLESS(raw string) (*parsedNode, error) {
 		return nil, fmt.Errorf("VLESS security 参数无效：%w", err)
 	}
 	encryption := firstNonEmpty(q.Get("encryption"), "none")
-	if encryption != "none" {
-		return nil, fmt.Errorf("VLESS encryption 当前仅支持 none")
+	if err := validateVLESSEncryption(encryption); err != nil {
+		return nil, err
 	}
 	flow := q.Get("flow")
 	if flow != "" && flow != "xtls-rprx-vision" && flow != "xtls-rprx-vision-udp443" {
 		return nil, fmt.Errorf("VLESS flow 无效")
 	}
-	if flow != "" && security == "none" {
-		return nil, fmt.Errorf("VLESS flow 必须配合 TLS 或 REALITY")
+	if flow != "" && security == "none" && encryption == "none" {
+		return nil, fmt.Errorf("VLESS flow 必须配合 TLS、REALITY 或 VLESS Encryption")
 	}
 	stream := map[string]any{"network": network, "security": security}
 	if security == "tls" {
@@ -333,8 +333,17 @@ func parseVMess(raw string) (*parsedNode, error) {
 	if tlsMode == "tls" {
 		security = "tls"
 	}
-	if security != "tls" && anyMapStringValue(v, "sni", "fp", "alpn") {
-		return nil, fmt.Errorf("VMess sni/fp/alpn 仅能配合 TLS")
+	if security != "tls" {
+		if anyMapStringValue(v, "fp", "alpn") {
+			return nil, fmt.Errorf("VMess fp/alpn 仅能配合 TLS")
+		}
+		// Some generators retain SNI when TLS is disabled. Validate the
+		// redundant name, but never enable TLS merely because it is present.
+		if sni := stringVal(v, "sni"); sni != "" {
+			if err := validateNodeHost(sni); err != nil {
+				return nil, fmt.Errorf("VMess 冗余 sni 无效：%w", err)
+			}
+		}
 	}
 	stream := map[string]any{"network": network, "security": security}
 	if security == "tls" {
@@ -363,6 +372,9 @@ func parseVMess(raw string) (*parsedNode, error) {
 		"ed":          []string{stringVal(v, "ed")},
 		"eh":          []string{stringVal(v, "eh")},
 	}
+	if padding, exists := v["x_padding_bytes"]; exists {
+		q.Set("x_padding_bytes", padding.(string))
+	}
 	transportType := stringVal(v, "type")
 	switch strings.ToLower(network) {
 	case "grpc":
@@ -373,6 +385,11 @@ func parseVMess(raw string) (*parsedNode, error) {
 		q.Set("mode", firstNonEmpty(stringVal(v, "mode"), transportType))
 	case "", "tcp", "raw":
 		q.Set("headerType", transportType)
+		if strings.EqualFold(transportType, "none") {
+			if err := discardVMessRawHeaderPlaceholders(q); err != nil {
+				return nil, err
+			}
+		}
 	default:
 		if transportType != "" && !strings.EqualFold(transportType, "none") {
 			q.Set("headerType", transportType)
@@ -416,8 +433,8 @@ func parseTrojan(raw string) (*parsedNode, error) {
 		return nil, fmt.Errorf("无效的 Trojan 查询参数格式")
 	}
 	if err := rejectUnknownQueryParams(q,
-		"type", "network", "security", "sni", "serverName", "peer", "fp", "alpn",
-		"pbk", "sid", "spx", "host", "path", "headerType", "serviceName", "mode", "authority", "extra", "ed", "eh"); err != nil {
+		"type", "network", "security", "sni", "serverName", "servername", "peer", "fp", "alpn",
+		"pbk", "sid", "spx", "host", "path", "headerType", "serviceName", "mode", "authority", "extra", "x_padding_bytes", "ed", "eh"); err != nil {
 		return nil, fmt.Errorf("无效的 Trojan 查询参数：%w", err)
 	}
 	network, err := transportNetworkFromQuery(q)
@@ -431,7 +448,7 @@ func parseTrojan(raw string) (*parsedNode, error) {
 	if err := rejectUnusedSecurityParams(q, security, true); err != nil {
 		return nil, fmt.Errorf("无效的 Trojan security 参数：%w", err)
 	}
-	serverName, err := consistentQueryValue(q, "sni", "serverName", "peer")
+	serverName, err := consistentQueryValue(q, "sni", "serverName", "servername", "peer")
 	if err != nil {
 		return nil, fmt.Errorf("检测到 Trojan TLS serverName 参数冲突")
 	}
@@ -480,15 +497,18 @@ func parseSS(raw string) (*parsedNode, error) {
 		if fragmentStart := strings.IndexByte(query, '#'); fragmentStart >= 0 {
 			query = query[:fragmentStart]
 		}
-		values, err := url.ParseQuery(query)
+		values, err := parseStrictQuery(query)
 		if err != nil {
 			return nil, fmt.Errorf("SS 查询参数无效")
 		}
 		if values.Get("plugin") != "" {
 			return nil, fmt.Errorf("不支持带 plugin 的 SS 节点")
 		}
-		if err := rejectUnknownQueryParams(values, "plugin"); err != nil {
+		if err := rejectUnknownQueryParams(values, "plugin", "type"); err != nil {
 			return nil, fmt.Errorf("SS 查询参数无效：%w", err)
+		}
+		if transport := strings.ToLower(values.Get("type")); transport != "" && transport != "tcp" && transport != "raw" {
+			return nil, fmt.Errorf("SS type 仅支持 tcp/raw")
 		}
 	}
 	body := payloadAfterScheme(raw)
@@ -537,7 +557,10 @@ func parseSS(raw string) (*parsedNode, error) {
 	}
 	method := strings.ToLower(strings.TrimSpace(up[0]))
 	if !validShadowsocksMethod(method) {
-		return nil, fmt.Errorf("SS method 不受当前 Xray 支持")
+		return nil, fmt.Errorf("SS method 不受当前 proxyscene 支持")
+	}
+	if err := validateShadowsocksPassword(method, up[1]); err != nil {
+		return nil, err
 	}
 	addr, portText, err := net.SplitHostPort(hostport)
 	if err != nil {
@@ -619,7 +642,7 @@ func validateNodeUUID(id string) error {
 }
 
 func buildTLSClientSettings(q url.Values, fallbackServerName string) (map[string]any, error) {
-	serverName, err := consistentQueryValue(q, "sni", "serverName")
+	serverName, err := consistentQueryValue(q, "sni", "serverName", "servername")
 	if err != nil {
 		return nil, err
 	}
@@ -675,7 +698,7 @@ func buildRealityClientSettings(q url.Values) (map[string]any, error) {
 			return nil, fmt.Errorf("shortId 必须是十六进制")
 		}
 	}
-	serverName, err := consistentQueryValue(q, "sni", "serverName")
+	serverName, err := consistentQueryValue(q, "sni", "serverName", "servername")
 	if err != nil {
 		return nil, err
 	}
@@ -720,6 +743,9 @@ func validVMessCipher(value string) bool {
 }
 
 func validShadowsocksMethod(value string) bool {
+	if validShadowsocks2022Method(value) {
+		return true
+	}
 	switch value {
 	case "aes-128-gcm", "aead_aes_128_gcm",
 		"aes-256-gcm", "aead_aes_256_gcm",
@@ -742,8 +768,13 @@ func addTransport(stream map[string]any, network string, q url.Values) error {
 	switch network {
 	case "", "tcp", "raw":
 		stream["network"] = "raw"
-		if err := rejectTransportParams(q, "headerType", "host", "path"); err != nil {
+		if err := rejectTransportParams(q, "headerType", "host", "path", "mode"); err != nil {
 			return err
+		}
+		// mode=multi is a known generator remnant on RAW. All other modes
+		// still fail here, and gRPC retains its separate multiMode semantics.
+		if mode := strings.ToLower(strings.TrimSpace(q.Get("mode"))); mode != "" && mode != "multi" {
+			return fmt.Errorf("RAW 仅兼容冗余 mode=multi")
 		}
 		headerType := strings.ToLower(strings.TrimSpace(q.Get("headerType")))
 		switch headerType {
@@ -830,7 +861,7 @@ func addTransport(stream map[string]any, network string, q url.Values) error {
 		stream["grpcSettings"] = settings
 	case "xhttp", "splithttp":
 		stream["network"] = "xhttp"
-		if err := rejectTransportParams(q, "host", "path", "mode", "extra"); err != nil {
+		if err := rejectTransportParams(q, "host", "path", "mode", "extra", "x_padding_bytes"); err != nil {
 			return err
 		}
 		host := q.Get("host")
@@ -854,12 +885,12 @@ func addTransport(stream map[string]any, network string, q url.Values) error {
 		if mode != "" {
 			settings["mode"] = mode
 		}
-		if extra := q.Get("extra"); extra != "" {
-			var object map[string]any
-			if err := json.Unmarshal([]byte(extra), &object); err != nil || object == nil {
-				return fmt.Errorf("XHTTP extra 必须是 JSON 对象")
-			}
-			settings["extra"] = json.RawMessage(extra)
+		extra, err := parseXHTTPExtra(q)
+		if err != nil {
+			return err
+		}
+		if len(extra) != 0 {
+			settings["extra"] = extra
 		}
 		stream["xhttpSettings"] = settings
 	case "h2", "h3", "http", "quic":
@@ -871,7 +902,7 @@ func addTransport(stream map[string]any, network string, q url.Values) error {
 }
 
 var transportParameterNames = []string{
-	"headerType", "host", "path", "seed", "quicSecurity", "key", "serviceName", "mode", "authority", "extra", "ed", "eh",
+	"headerType", "host", "path", "seed", "quicSecurity", "key", "serviceName", "mode", "authority", "extra", "x_padding_bytes", "ed", "eh",
 }
 
 func rejectTransportParams(q url.Values, allowed ...string) error {
@@ -896,35 +927,9 @@ func httpLikeTransportSettings(q url.Values, earlyData bool) (map[string]any, er
 	if err := validateTransportPath(path); err != nil {
 		return nil, err
 	}
-	pathURL, err := url.Parse(path)
+	path, err := normalizeHTTPEarlyData(path, q.Get("ed"), earlyData)
 	if err != nil {
-		return nil, fmt.Errorf("transport path 无效")
-	}
-	pathQuery, err := url.ParseQuery(pathURL.RawQuery)
-	if err != nil {
-		return nil, fmt.Errorf("transport path query 无效")
-	}
-	for _, key := range []string{"ed", "eh"} {
-		if _, exists := pathQuery[key]; exists {
-			return nil, fmt.Errorf("transport path 不能直接包含 %s 参数", key)
-		}
-	}
-	if ed := strings.TrimSpace(q.Get("ed")); ed != "" {
-		if !earlyData {
-			return nil, fmt.Errorf("当前 transport 不支持 early data")
-		}
-		value, err := strconv.ParseUint(ed, 10, 32)
-		if err != nil || value == 0 {
-			return nil, fmt.Errorf("early data 参数无效")
-		}
-		// Xray v26.3.27 no longer exposes maxEarlyData/earlyDataHeaderName
-		// fields. Its WS and HTTPUpgrade loaders consume `ed` from the path
-		// query itself, so preserve the share-link value in exactly that form.
-		u := pathURL
-		values := pathQuery
-		values.Set("ed", strconv.FormatUint(value, 10))
-		u.RawQuery = values.Encode()
-		path = u.String()
+		return nil, err
 	}
 	settings := map[string]any{"path": path}
 	if host != "" {
@@ -1108,7 +1113,7 @@ func consistentQueryValue(q url.Values, keys ...string) (string, error) {
 }
 
 func rejectUnusedSecurityParams(q url.Values, security string, allowPeer bool) error {
-	tlsOrReality := []string{"sni", "serverName", "fp"}
+	tlsOrReality := []string{"sni", "serverName", "servername", "fp"}
 	if allowPeer {
 		tlsOrReality = append(tlsOrReality, "peer")
 	}
@@ -1152,7 +1157,7 @@ func rejectUnknownVMessFields(values map[string]any) error {
 		"v": true, "ps": true, "add": true, "id": true, "scy": true,
 		"net": true, "type": true, "host": true, "path": true, "tls": true,
 		"sni": true, "alpn": true, "fp": true, "serviceName": true,
-		"mode": true, "authority": true, "extra": true, "ed": true, "eh": true,
+		"mode": true, "authority": true, "extra": true, "x_padding_bytes": true, "ed": true, "eh": true,
 	}
 	for key, value := range values {
 		if key == "port" || key == "aid" {
@@ -1458,13 +1463,6 @@ func (a *App) useNodeInStore(st *Store, id, scope string) error {
 	return nil
 }
 
-type preparedSubscription struct {
-	URL        string
-	Nodes      []preparedNode
-	Invalid    int
-	Incomplete bool // Loose first imports are allowed; destructive refresh requires a complete URI list.
-}
-
 func (a *App) importSubscriptionWithLock(sub string) error {
 	if err := requireRoot(); err != nil {
 		return err
@@ -1473,7 +1471,7 @@ func (a *App) importSubscriptionWithLock(sub string) error {
 	if err != nil {
 		return err
 	}
-	prepared, err := a.downloadAndPrepareSubscription(sub)
+	prepared, err := a.downloadAndPrepareSubscriptionForStore(sub, snapshot)
 	if err != nil {
 		return err
 	}
@@ -1489,72 +1487,6 @@ func (a *App) importSubscriptionWithLock(sub string) error {
 	})
 }
 
-func (a *App) downloadAndPrepareSubscription(sub string) (preparedSubscription, error) {
-	allowHTTP := envBool("PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION", false)
-	allowPrivate := envBool("PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION", false)
-	client := subscriptionHTTPClient(allowHTTP, allowPrivate)
-	defer client.CloseIdleConnections()
-	return downloadAndPrepareSubscriptionWithClient(sub, allowHTTP, client)
-}
-
-func downloadAndPrepareSubscriptionWithClient(sub string, allowHTTP bool, client *http.Client) (preparedSubscription, error) {
-	return downloadAndPrepareSubscriptionWithContext(context.Background(), sub, allowHTTP, client)
-}
-
-func downloadAndPrepareSubscriptionWithContext(ctx context.Context, sub string, allowHTTP bool, client *http.Client) (preparedSubscription, error) {
-	sub = strings.TrimSpace(sub)
-	if sub == "" {
-		return preparedSubscription{}, fmt.Errorf("订阅链接不能为空")
-	}
-	if len(sub) > maxSubscriptionURLBytes {
-		return preparedSubscription{}, fmt.Errorf("订阅链接过长，最多 %d 字节", maxSubscriptionURLBytes)
-	}
-	subURL, err := url.Parse(sub)
-	if err != nil || subURL.Host == "" || subURL.Hostname() == "" {
-		return preparedSubscription{}, fmt.Errorf("订阅链接必须是有效的 https 地址")
-	}
-	subURL.Scheme = strings.ToLower(subURL.Scheme)
-	switch subURL.Scheme {
-	case "https":
-	case "http":
-		if !allowHTTP {
-			return preparedSubscription{}, fmt.Errorf("订阅链接必须使用 https；如确需导入明文 HTTP 订阅，请设置 PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1")
-		}
-		fmt.Println("警告：正在导入明文 HTTP 订阅，内容可能被中间人篡改")
-	default:
-		return preparedSubscription{}, fmt.Errorf("订阅链接必须是 https 地址")
-	}
-	canonicalURL := subURL.String()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, canonicalURL, nil)
-	if err != nil {
-		return preparedSubscription{}, fmt.Errorf("订阅链接无效")
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		// net/http errors normally include the complete URL. Subscription URLs
-		// commonly carry bearer tokens, so never wrap or return the transport error.
-		return preparedSubscription{}, fmt.Errorf("订阅下载失败（目标主机 %s）", safeSubscriptionHost(subURL))
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 || resp.StatusCode == http.StatusPartialContent {
-		return preparedSubscription{}, fmt.Errorf("订阅下载失败：HTTP 状态码 %d", resp.StatusCode)
-	}
-	if resp.Header.Get("Content-Range") != "" {
-		return preparedSubscription{}, fmt.Errorf("订阅响应不完整，拒绝导入或更新")
-	}
-	if resp.ContentLength > maxSubscriptionBytes {
-		return preparedSubscription{}, fmt.Errorf("订阅内容过大，超过 %d 字节", maxSubscriptionBytes)
-	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes+1))
-	if err != nil {
-		return preparedSubscription{}, fmt.Errorf("读取订阅内容失败")
-	}
-	if int64(len(b)) > maxSubscriptionBytes {
-		return preparedSubscription{}, fmt.Errorf("订阅内容过大，超过 %d 字节", maxSubscriptionBytes)
-	}
-	return prepareSubscriptionBody(canonicalURL, b)
-}
-
 func safeSubscriptionHost(u *url.URL) string {
 	host := sanitizeNodeName(u.Hostname())
 	if host == "node" {
@@ -1563,196 +1495,8 @@ func safeSubscriptionHost(u *url.URL) string {
 	return host
 }
 
-func prepareSubscriptionBody(sub string, body []byte) (preparedSubscription, error) {
-	deadline := time.Now().Add(maxSubscriptionProcessingTime)
-	text := string(body)
-	urls, tooMany := extractNodeURLsLimited(text, maxSubscriptionNodes)
-	if tooMany {
-		return preparedSubscription{}, fmt.Errorf("订阅节点数超过上限 %d", maxSubscriptionNodes)
-	}
-	if len(urls) == 0 {
-		if time.Now().After(deadline) {
-			return preparedSubscription{}, fmt.Errorf("订阅处理超时")
-		}
-		if decoded, err := decodeBase64URL(strings.TrimSpace(string(body))); err == nil {
-			text = string(decoded)
-			urls, tooMany = extractNodeURLsLimited(text, maxSubscriptionNodes)
-			if tooMany {
-				return preparedSubscription{}, fmt.Errorf("订阅节点数超过上限 %d", maxSubscriptionNodes)
-			}
-		}
-	}
-	prepared := preparedSubscription{URL: sub, Nodes: make([]preparedNode, 0, len(urls)), Incomplete: !slices.Equal(strings.Fields(text), urls)}
-	for _, raw := range urls {
-		if time.Now().After(deadline) {
-			return preparedSubscription{}, fmt.Errorf("订阅处理超时")
-		}
-		node, err := prepareNode(raw)
-		if err != nil {
-			prepared.Invalid++
-			continue
-		}
-		prepared.Nodes = append(prepared.Nodes, node)
-	}
-	if len(prepared.Nodes) == 0 {
-		return preparedSubscription{}, fmt.Errorf("订阅中没有可导入节点")
-	}
-	return prepared, nil
-}
-
 func (a *App) mergePreparedSubscription(st *Store, prepared preparedSubscription) error {
 	return a.commitPreparedSubscriptions(st, []preparedSubscription{prepared})
-}
-
-// extractNodeURLs 从订阅文本中提取节点链接。协议 scheme 前要求一个边界（行首或
-// 空白/引号/括号等），避免把 "xvless://..." 这类词中出现的 scheme 误当成链接。
-// 注意：URL 字符集仍保留逗号，因为部分链接的查询参数（如 ws host 列表）合法含逗号；
-// 订阅标准是按行分隔，逗号拼接属非标准用法。
-var nodeURLPattern = regexp.MustCompile(`(?i)(?:^|[\s'"<>(){}])((?:vless|vmess|trojan|ss|shadowsocks)://[^\s<>'"]+)`)
-
-func extractNodeURLsLimited(s string, limit int) ([]string, bool) {
-	matchLimit := limit
-	if limit >= 0 {
-		matchLimit++
-	}
-	matches := nodeURLPattern.FindAllStringSubmatch(s, matchLimit)
-	tooMany := limit >= 0 && len(matches) > limit
-	if tooMany {
-		matches = matches[:limit]
-	}
-	urls := make([]string, 0, len(matches))
-	for _, m := range matches {
-		raw := strings.TrimRight(m[1], ".,;，；。)]}>")
-		if raw != "" {
-			urls = append(urls, raw)
-		}
-	}
-	return urls, tooMany
-}
-
-// subscriptionHTTPClient 构造抓取订阅用的 HTTP 客户端，带两层 SSRF 防护：
-//  1. CheckRedirect 在每一跳重新校验协议，禁止 https 被重定向降级到非允许协议；
-//  2. Dialer.Control 在 DNS 解析后、连接前校验目标 IP，默认拒绝环回/私网/链路本地/
-//     CGNAT 等非公网地址（含云元数据 169.254.169.254），可防 DNS rebinding。
-//     如确需抓取部署在内网的订阅，设置 PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1。
-func subscriptionHTTPClient(allowHTTP, allowPrivate bool) *http.Client {
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	if !allowPrivate {
-		dialer.Control = func(network, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return err
-			}
-			ip := net.ParseIP(host)
-			if ip == nil {
-				return fmt.Errorf("无法解析订阅目标地址：%s", address)
-			}
-			if !isPublicIP(ip) {
-				return fmt.Errorf("订阅目标指向非公网地址，已拒绝（如确需可设 PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1）：%s", host)
-			}
-			return nil
-		}
-	}
-	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: &http.Transport{DialContext: dialer.DialContext},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Subscription paths and queries often contain credentials. Never send
-			// their source URL as Referer, even for a same-origin redirect.
-			req.Header.Del("Referer")
-			if len(via) == 0 || !sameSubscriptionOrigin(req.URL, via[0].URL) {
-				req.Header.Del("Authorization")
-				req.Header.Del("Proxy-Authorization")
-				req.Header.Del("Cookie")
-			}
-			if len(via) >= 10 {
-				return fmt.Errorf("订阅重定向次数过多")
-			}
-			scheme := strings.ToLower(req.URL.Scheme)
-			if scheme == "https" || (allowHTTP && scheme == "http") {
-				return nil
-			}
-			return fmt.Errorf("订阅重定向到不允许的协议：%s", scheme)
-		},
-	}
-}
-
-func sameSubscriptionOrigin(a, b *url.URL) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	return strings.EqualFold(a.Scheme, b.Scheme) &&
-		strings.EqualFold(a.Hostname(), b.Hostname()) &&
-		effectiveURLPort(a) == effectiveURLPort(b)
-}
-
-func effectiveURLPort(u *url.URL) string {
-	if port := u.Port(); port != "" {
-		return port
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "http":
-		return "80"
-	case "https":
-		return "443"
-	default:
-		return ""
-	}
-}
-
-// isPublicIP 报告 ip 是否为可路由的公网地址。
-func isPublicIP(ip net.IP) bool {
-	addr, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return false
-	}
-	addr = addr.Unmap()
-	if !addr.IsGlobalUnicast() {
-		return false
-	}
-	for _, prefix := range nonPublicSubscriptionPrefixes {
-		if prefix.Contains(addr) {
-			return false
-		}
-	}
-	return true
-}
-
-var nonPublicSubscriptionPrefixes = []netip.Prefix{
-	// IPv4 special-use, private, documentation, benchmarking and reserved space.
-	netip.MustParsePrefix("0.0.0.0/8"),
-	netip.MustParsePrefix("10.0.0.0/8"),
-	netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("127.0.0.0/8"),
-	netip.MustParsePrefix("169.254.0.0/16"),
-	netip.MustParsePrefix("172.16.0.0/12"),
-	netip.MustParsePrefix("192.0.0.0/24"),
-	netip.MustParsePrefix("192.0.2.0/24"),
-	netip.MustParsePrefix("192.31.196.0/24"),
-	netip.MustParsePrefix("192.52.193.0/24"),
-	netip.MustParsePrefix("192.88.99.0/24"),
-	netip.MustParsePrefix("192.168.0.0/16"),
-	netip.MustParsePrefix("192.175.48.0/24"),
-	netip.MustParsePrefix("198.18.0.0/15"),
-	netip.MustParsePrefix("198.51.100.0/24"),
-	netip.MustParsePrefix("203.0.113.0/24"),
-	netip.MustParsePrefix("224.0.0.0/4"),
-	netip.MustParsePrefix("240.0.0.0/4"),
-	// IPv6 local, transition, special protocol, documentation and reserved space.
-	netip.MustParsePrefix("::/128"),
-	netip.MustParsePrefix("::1/128"),
-	netip.MustParsePrefix("64:ff9b::/96"),
-	netip.MustParsePrefix("64:ff9b:1::/48"),
-	netip.MustParsePrefix("100::/64"),
-	netip.MustParsePrefix("2001::/23"),
-	netip.MustParsePrefix("2001:db8::/32"),
-	netip.MustParsePrefix("2002::/16"),
-	netip.MustParsePrefix("3fff::/20"),
-	netip.MustParsePrefix("5f00::/16"),
-	netip.MustParsePrefix("fc00::/7"),
-	netip.MustParsePrefix("fe80::/10"),
-	netip.MustParsePrefix("fec0::/10"),
-	netip.MustParsePrefix("ff00::/8"),
 }
 
 func containsString(values []string, want string) bool {
@@ -1764,35 +1508,20 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
-func (a *App) runSpeedTests(nodes []Node) []SpeedResult {
-	return runSpeedTestsWith(nodes, a.testNode)
+func (a *App) runSpeedTests(nodes []Node) ([]SpeedResult, error) {
+	signalCtx, stop := nodeProbeSignalContext()
+	defer stop()
+	ctx, cancel := context.WithTimeout(signalCtx, nodeProbeBatchTimeout)
+	defer cancel()
+	return runNodeProbeBatch(ctx, nodes, a.probeNode)
 }
 
 func runSpeedTestsWith(nodes []Node, test func(Node) error) []SpeedResult {
-	// 并发测速，限制并发上限，避免 N 个节点串行各等 5s 超时导致整体阻塞 N*5s。
-	results := make([]SpeedResult, len(nodes))
-	sem := make(chan struct{}, 10)
-	var wg sync.WaitGroup
-	for i := range nodes {
-		// 在循环体内先占用信号量再起 goroutine：否则会先为每个节点各起一个 goroutine
-		// 再在内部阻塞等待信号量，使存活 goroutine 数随（可由订阅影响的）节点数线性增长，
-		// 失去并发上限的意义。这样可把同时存活的 goroutine 真正限制在信号量容量内。
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(i int, n Node) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			start := time.Now()
-			err := test(n)
-			r := SpeedResult{NodeID: n.ID, Target: "节点地址 TCP 连通性", LatencyMS: time.Since(start).Milliseconds(), Success: err == nil, TestedAt: time.Now()}
-			if err != nil {
-				r.Error = err.Error()
-			}
-			results[i] = r
-		}(i, nodes[i])
-	}
-	wg.Wait()
-	return results
+	return runNodeProbes(context.Background(), nodes, func(_ context.Context, n Node) (time.Duration, error) {
+		start := time.Now()
+		err := test(n)
+		return time.Since(start), err
+	})
 }
 
 func printSpeedResults(nodes []Node, results []SpeedResult) {
@@ -1869,8 +1598,11 @@ func (a *App) speedTestWithLock() error {
 	if err != nil {
 		return err
 	}
-	results := a.runSpeedTests(nodes)
+	results, err := a.runSpeedTests(nodes)
 	printSpeedResults(nodes, results)
+	if err != nil {
+		return err
+	}
 	return a.withStoreLock(func() error {
 		st, err := a.loadStore()
 		if err != nil {
@@ -1919,8 +1651,11 @@ func (a *App) autoSelectWithLock(scope string) error {
 	if err != nil {
 		return err
 	}
-	results := a.runSpeedTests(nodes)
+	results, err := a.runSpeedTests(nodes)
 	printSpeedResults(nodes, results)
+	if err != nil {
+		return err
+	}
 	return a.withStoreLock(func() error {
 		st, err := a.loadStore()
 		if err != nil {

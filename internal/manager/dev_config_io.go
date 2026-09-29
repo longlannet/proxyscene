@@ -33,54 +33,56 @@ var (
 // readDevConfig pins every directory below the recorded home and never follows
 // the final name. In particular, a root npm invocation must not read a .npmrc
 // symlink or an unrelated owner's file and subsequently copy its contents.
-func readDevConfig(user string, identity *persistedUserIdentity, path string) ([]byte, bool, os.FileMode, error) {
+func readDevConfig(user string, identity *persistedUserIdentity, path string) ([]byte, bool, *userFileMetadata, error) {
 	current, err := verifyPersistedUserIdentity(user, identity, devLookupUserIdentity)
 	if err != nil {
-		return nil, false, 0, err
+		return nil, false, nil, err
 	}
 	clean, dirFD, err := openUserFileDirForIdentity(user, current, path, false)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, false, 0o600, nil
+		return nil, false, nil, nil
 	}
 	if err != nil {
-		return nil, false, 0, err
+		return nil, false, nil, err
 	}
 	defer syscall.Close(dirFD)
 	return readDevConfigAt(dirFD, filepath.Base(clean), identity.UID)
 }
 
-func readDevConfigAt(dirFD int, name string, uid int) ([]byte, bool, os.FileMode, error) {
+func readDevConfigAt(dirFD int, name string, uid int) ([]byte, bool, *userFileMetadata, error) {
 	fd, err := syscall.Openat(dirFD, name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if errors.Is(err, syscall.ENOENT) {
-		return nil, false, 0o600, nil
+		if err := ensureDevConfigNoQuarantine(dirFD); err != nil {
+			return nil, false, nil, err
+		}
+		return nil, false, nil, nil
 	}
 	if err != nil {
-		return nil, false, 0, err
+		return nil, false, nil, err
 	}
 	file := os.NewFile(uintptr(fd), name)
 	defer file.Close()
-	info, err := file.Stat()
+	metadata, err := readUserFileMetadata(fd)
 	if err != nil {
-		return nil, false, 0, err
+		return nil, false, nil, err
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !info.Mode().IsRegular() || int(stat.Uid) != uid {
-		return nil, false, 0, fmt.Errorf("用户配置必须是记录用户拥有的非符号链接普通文件：%s", name)
-	}
-	if info.Size() > maxDevConfigBytes {
-		return nil, false, 0, fmt.Errorf("用户配置超过大小限制：%s", name)
+	if metadata.UID != uid {
+		return nil, false, nil, fmt.Errorf("用户配置必须是记录用户拥有的非符号链接普通文件：%s", name)
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxDevConfigBytes+1))
 	if err != nil {
-		return nil, false, 0, err
+		return nil, false, nil, err
 	}
 	if int64(len(data)) > maxDevConfigBytes {
-		return nil, false, 0, fmt.Errorf("用户配置超过大小限制：%s", name)
+		return nil, false, nil, fmt.Errorf("用户配置超过大小限制：%s", name)
 	}
-	return data, true, info.Mode().Perm(), nil
+	if err := metadata.verifyFD(fd, true); err != nil {
+		return nil, false, nil, err
+	}
+	return data, true, metadata, nil
 }
 
-func commitDevConfig(user string, identity *persistedUserIdentity, path string, before, after []byte, exists bool, mode os.FileMode) error {
+func commitDevConfig(user string, identity *persistedUserIdentity, path string, before, after []byte, exists bool, metadata *userFileMetadata) error {
 	if bytes.Equal(before, after) {
 		return nil
 	}
@@ -89,9 +91,9 @@ func commitDevConfig(user string, identity *persistedUserIdentity, path string, 
 	}
 	var err error
 	if exists {
-		err = writeUserFileAtomicCASPersisted(user, identity, devLookupUserIdentity, path, before, after, mode)
+		err = writeUserFileAtomicCASMetadataPersisted(user, identity, devLookupUserIdentity, path, before, after, metadata)
 	} else {
-		err = writeUserFileAtomicCreatePersisted(user, identity, devLookupUserIdentity, path, after, mode)
+		err = writeDevConfigCreatePersisted(user, identity, path, after)
 	}
 	if err != nil {
 		return errors.Join(errDevConfigMutationUncertain, err)
@@ -264,7 +266,7 @@ func mutateDevNPMConfig(user string, identity *persistedUserIdentity, key string
 		return fmt.Errorf("不支持的 npm 配置键")
 	}
 	path := filepath.Join(identity.Home, ".npmrc")
-	data, exists, mode, err := readDevConfig(user, identity, path)
+	data, exists, metadata, err := readDevConfig(user, identity, path)
 	if err != nil {
 		return err
 	}
@@ -302,7 +304,7 @@ func mutateDevNPMConfig(user string, identity *persistedUserIdentity, key string
 	if !optionalStringsEqual(check.values[key], desired) {
 		return fmt.Errorf("npm 用户配置写入值无法无损表达")
 	}
-	if err := commitDevConfig(user, identity, path, data, updated.Bytes(), exists, mode); err != nil {
+	if err := commitDevConfig(user, identity, path, data, updated.Bytes(), exists, metadata); err != nil {
 		return err
 	}
 	actual, err := readDevNPMConfig(user, identity, key)
@@ -447,7 +449,7 @@ func mutateDevGitConfig(user string, identity *persistedUserIdentity, location d
 		if err := devValidateGitTopology(user, identity, location); err != nil {
 			return err
 		}
-		data, exists, mode, err := readDevConfig(user, identity, path)
+		data, exists, metadata, err := readDevConfig(user, identity, path)
 		if err != nil {
 			return err
 		}
@@ -507,7 +509,7 @@ func mutateDevGitConfig(user string, identity *persistedUserIdentity, location d
 		if err := devValidateGitTopology(user, identity, location); err != nil {
 			return err
 		}
-		if err := commitDevConfig(user, identity, path, data, updated, exists, mode); err != nil {
+		if err := commitDevConfig(user, identity, path, data, updated, exists, metadata); err != nil {
 			return err
 		}
 		committed = true

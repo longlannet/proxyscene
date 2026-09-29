@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -77,7 +76,7 @@ func (a *App) ensureXrayInstalled() error {
 	if !ok || stat.Uid != 0 {
 		return fmt.Errorf("该 Xray 文件必须属于 root：%s", path)
 	}
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return fmt.Errorf("安全打开 Xray 文件失败：%w", err)
 	}
@@ -261,19 +260,10 @@ func (a *App) checkXrayConfigAt(path string) error {
 }
 
 func (a *App) testNode(n Node) error {
-	pn, err := parseRuntimeNode(n.RawURL)
-	if err != nil {
-		return err
-	}
-	if pn.EndpointHost == "" || pn.EndpointPort <= 0 {
-		return fmt.Errorf("节点缺少可测速地址")
-	}
-	endpoint := net.JoinHostPort(pn.EndpointHost, itoa(pn.EndpointPort))
-	conn, err := net.DialTimeout("tcp", endpoint, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("无法连接节点地址：%s", endpoint)
-	}
-	return conn.Close()
+	ctx, cancel := nodeProbeSignalContext()
+	defer cancel()
+	_, err := a.probeNode(ctx, n)
+	return err
 }
 
 func (a *App) testProxy() error {

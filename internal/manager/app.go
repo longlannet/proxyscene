@@ -81,8 +81,8 @@ func (a *App) help() {
 	fmt.Println("  proxyscene subscription update --all      更新全部订阅")
 	fmt.Println("  proxyscene node rename '节点ID' '新备注'")
 	fmt.Println("  proxyscene node remove '节点ID'      删除节点（别名：delete）")
-	fmt.Println("  proxyscene node test               对所有节点做 TCP 连通性/延迟测试")
-	fmt.Println("  proxyscene node auto [范围]         按 TCP 延迟自动选用节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
+	fmt.Println("  proxyscene node test               通过各节点请求 HTTPS，检测连通性和延迟")
+	fmt.Println("  proxyscene node auto [范围]         按代理请求延迟自动选用可用节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
 	fmt.Println("  proxyscene node use '节点ID' [范围] 使用指定节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
 	fmt.Println("  proxyscene test                    通过全局代理测试连通性")
 	fmt.Println("  proxyscene status                  查看状态")
@@ -175,7 +175,7 @@ func (a *App) install(raw string, promptNode bool) error {
 	}
 	if raw == "" && promptNode {
 		var err error
-		raw, err = menuInput("请输入节点链接（VLESS / VMess / Trojan / Shadowsocks，留空跳过，q 取消初始化）: ")
+		raw, err = menuInput("请输入节点链接（VLESS / VMess / Trojan / Shadowsocks / Hysteria2，留空跳过，q 取消初始化）: ")
 		if err != nil {
 			return err
 		}

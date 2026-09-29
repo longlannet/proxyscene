@@ -25,7 +25,7 @@
   - 开发代理：为目标用户设置 git/npm 代理，并在关闭时恢复。
   - Telegram 服务代理：为 Hermes systemd 服务注入专用环境，并事务化托管用户级 OpenClaw 的 Telegram 配置。
 - 支持多节点管理：添加、删除、改名、列表、订阅导入与更新、测速、自动选择。
-- 支持基础节点协议解析：VLESS、VMess、Trojan、Shadowsocks。
+- 支持节点协议解析：VLESS（含 VLESS Encryption）、VMess、Trojan、Shadowsocks（含 2022）、Hysteria2。
 - 支持按场景选择不同节点。
 - 状态文件带进程锁，避免多个管理进程并发写入造成覆盖。
 - Xray 配置写入前会进行配置测试。
@@ -201,7 +201,7 @@ bundle 内含 `install.sh`、管理程序、固定版本 Xray、项目及第三�
 
 当前固定 Xray 为官方 `v26.9.9`（上游标记为预发布版），以获得更新的 Go 工具链和依赖；构建流程固定其提交、四架构归档 SHA256 和对应源码，并检查配置兼容性与已知漏洞。
 
-升级兼容性：此版本移除了 Shadowsocks `none/plain`，且 VLESS/Trojan 明文传输仅允许上游内建的私有/保留地址与本地域名。新导入和启用会明确拒绝不兼容节点；旧节点记录仍可读取、删除和替换。若当前正在使用上述模式，请在升级前切换到 TLS/REALITY 或支持的 AEAD 节点。
+升级兼容性：固定核心移除了 Shadowsocks `none/plain`，且未使用 VLESS Encryption 的 VLESS、Trojan 明文传输仅允许上游内建的私有/保留地址与本地域名。新导入和启用会明确拒绝不兼容节点；旧节点记录仍可读取、删除和替换。若当前正在使用上述模式，请在升级前切换到 TLS/REALITY 或支持的 AEAD 节点。
 
 ### 手动方式二：固定 Release 联机安装（需要 GitHub）
 
@@ -447,7 +447,7 @@ sudo proxyscene recover
 
 `boot-restore` 遇到未完成运行事务时，同样先执行固定恢复，完成后立即返回，本次不再协调其他场景。没有未完成事务时，才按已保存配置规划正常开机恢复。
 
-节点改名、保存 TCP 测试结果和订阅更新属于状态编辑，保留原有运行配置，不因本次环境变量而迁移代理设置。它们也会在存在未完成运行事务时拒绝提交。旧状态若缺少历史 `RuntimeConfig`，但仍有开启场景、核心配置或接管记录，运行变更会拒绝猜测；应先核验旧配置和备份，而不是补入当前环境参数后重试。只有旧场景 journal、没有完整运行事务记录的异常，`recover` 也不会自动推导历史计划。
+节点改名、保存代理测试结果和订阅更新属于状态编辑，保留原有运行配置，不因本次环境变量而迁移代理设置。它们也会在存在未完成运行事务时拒绝提交。旧状态若缺少历史 `RuntimeConfig`，但仍有开启场景、核心配置或接管记录，运行变更会拒绝猜测；应先核验旧配置和备份，而不是补入当前环境参数后重试。只有旧场景 journal、没有完整运行事务记录的异常，`recover` 也不会自动推导历史计划。
 
 ### 节点管理
 
@@ -457,11 +457,13 @@ sudo proxyscene recover
 sudo proxyscene node
 ```
 
-节点菜单提供查看、选用、添加、TCP 测试、按 TCP 延迟选用、改名和删除。节点可用列表序号、完整 ID 或唯一短 ID 选择；列表同时标注默认节点和各场景的实际用途。订阅导入已集中在主菜单的「订阅管理」。
+节点菜单提供查看、选用、添加、代理连通性测试、按代理请求延迟选用、改名和删除。节点可用列表序号、完整 ID 或唯一短 ID 选择；列表同时标注默认节点和各场景的实际用途。订阅导入已集中在主菜单的「订阅管理」。
 
 选用节点时先选节点、再选作用范围，并预览受影响的场景后确认。添加节点默认只保存，首个节点会成为默认节点；已有节点时，可另行确认同时修改默认节点。删除会先展示默认节点及场景的变化，删除最后一个节点会关闭所有代理场景，默认不执行。交互期间节点或配置被其他命令改变时，提交会拒绝旧的选择，需重新查看并确认。
 
-TCP 测试测量节点地址的连接延迟，不代表代理能正常出网或实际带宽。「按 TCP 延迟选用」会先测试，再展示候选节点和影响范围，确认后才切换。
+节点测试为每个节点启动独立的临时 Xray 实例，通过该节点实际请求 HTTPS，检查认证、TLS 和转发是否成功。延迟只计算代理请求阶段，包含握手及目标响应时间，不包含临时核心启动时间；不测带宽。「按代理请求延迟选用」会先测试，再展示候选节点和影响范围，确认后才切换。测试过程不切换正在使用的节点或重启主服务。
+
+每批最多同时测试 3 个节点，总预算为 2 分钟；单个临时核心启动最多 5 秒，代理请求最多 10 秒。只有证书校验通过、HTTP 2xx 且完整响应不超过 64 KiB 的请求才算成功，不跟随重定向。自定义 `PROXYSCENE_TEST_URL` 时请选择返回较小内容的 HTTPS 检测地址。取消操作或耗尽总预算后不保存本次结果、不切换节点；正常结束、超时或收到中断/终止信号后会回收临时进程与配置。
 
 查看节点列表：
 
@@ -528,9 +530,21 @@ sudo proxyscene subscription update --all    # 更新全部订阅
 
 单个订阅也可以用唯一的 ID 前缀或完整 ID 指定。列表展示短 ID 和主机名，不显示带 token 的订阅地址。首次通过 `node import --stdin` 导入会记录节点来源；再次导入同一订阅链接会执行更新。
 
+订阅导入和更新始终先直连，不继承 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`。直连遇到网络错误、读取失败或失败 HTTP 状态码时，如果全局代理场景已经开启，则使用已保存的全局 HTTP 监听地址重试一次，并显示回退提示；全局场景关闭时不会自动开启，也不会借用开发/Telegram 代理。每条下载路径最多 30 秒，整次导入或更新最多 2 分钟。
+
+代理回退仍验证 HTTPS 证书，保留重定向、响应完整性、大小和私网地址限制。程序先在本机解析并检查目标 IP，再通过全局代理连接该 IP，保持原域名的 TLS 和 HTTP 校验；本机 DNS 无法解析或仅返回受限地址时，代理回退不能修复 DNS。解析错误、超限或不完整响应、安全策略拒绝不会通过另一条路径绕过。
+
+失败提示会区分下载错误与节点内容错误，并给出识别/接受/失败数量、未知协议数量和最多 5 条脱敏原因，不回显节点链接或凭据。首次部分导入会显示跳过原因；更新仍要求内容完整，不能用跳过坏节点的方式覆盖旧订阅。
+
+兼容明确的 `servername` / `serverName` / `sni` 别名、TCP/RAW 的生成器残留 `mode=multi`、SS 的默认 `type=tcp/raw`、WS/HTTPUpgrade path 内的 early-data `ed`，以及 XHTTP 的 `x_padding_bytes`。等价字段不一致、同名参数重复、非法数值仍会拒绝；不会因为残留 SNI 自动开启 TLS，也不会删除有意义的加密或 early-data 配置。XHTTP 独立 `downloadSettings` 暂不支持，避免固定核心配置检查未能发现的运行时错误；padding 最大为 64 KiB；session ID 最长 64 字节、上传块最大 4 MiB，并限制排队、等待和 XMUX 并发，防止不可信订阅造成过量分配或计算。`extra` 中重复的 host/path/mode 仅在与外层配置一致时接受。VLESS Encryption 的 padding 间隔上界合计不超过 60 秒。旧版保存的受限传输配置仍可查看和删除，但不能重新导入或启用。
+
+Hysteria2 支持 `hysteria2://` 与 `hy2://`，由同一个 Xray 核心运行，支持 SNI、salamander 混淆、`mport` / `ports` 跳端口、`hop-interval` / `hopInterval` 间隔，以及 `upmbps` / `downmbps` 或带单位的 `up` / `down` 带宽参数。跳端口间隔为 5–86400 的整数秒，默认 30 秒；带宽使用十进制单位，0 表示自动协商，非零范围为 524288–10¹² bps。等价参数必须一致，强制 TLS 证书校验。Hysteria2 与其他协议一起参加真实 HTTPS 代理测试和自动择优。
+
+协议边界：当前固定核心不支持 TUIC，本程序也未接入 WireGuard、SSR、Hysteria v1 或 SS 外部插件。Clash 节点中的 `udp: false`、已启用的 TFO/MPTCP、Host 以外的自定义 WS 请求头和跳过证书验证等无法保持原意的配置会明确拒绝；支持 `udp: true` 和关闭的 TFO/MPTCP。
+
 更新按节点链接同步：已有链接保留节点 ID、自定义备注和场景绑定，新链接加入节点列表。地址或密码变化按新节点处理，不根据同名备注猜测替换关系。一个节点可以来自多个订阅，只有所有来源都不再提供它，且它未被默认节点或任意场景选中时，才会自动删除。手动添加的节点和未记录来源的旧节点始终保留；已选中但订阅中已下线的节点会保留并提醒，手动切换后可在下次更新时清理。
 
-更新接受完整的节点 URI 列表或其 Base64 编码，不支持 Clash YAML；首次导入仍可从文本中提取节点链接。更新全部会先下载并校验全部订阅，再一次性保存。任一下载失败、内容为空、列表含无效条目或解析失败，均不修改节点和订阅状态；下载期间状态被其他命令修改时也会拒绝提交，需重试。单次更新的下载总时限为 2 分钟，条目总数上限为 4096（包括跨订阅重复条目），超额可分别更新。HTTP 和私网订阅仍使用下文的显式兼容开关。
+导入与更新接受完整的节点 URI 列表、Clash/Mihomo YAML（包含 `proxies` 列表）以及这些内容的 Base64 编码；首次导入仍可从普通文本中提取节点链接。YAML 只导入上述五类协议的节点，忽略顶层规则、分组、脚本和外部 provider 配置，不执行脚本或下载 provider。无法表达的节点参数会给出脱敏原因；不支持 YAML 别名、合并引用、重复字段或多文档。更新全部会先下载并校验全部订阅，再一次性保存。任一下载失败、内容为空、列表含无效条目或解析失败，均不修改节点和订阅状态；下载期间状态被其他命令修改时也会拒绝提交，需重试。单次更新的下载总时限为 2 分钟，条目总数上限为 4096（包括跨订阅重复条目），超额可分别更新。HTTP 和私网订阅仍使用下文的显式兼容开关。
 
 订阅更新需手动触发，不定时运行，也不自动测速或切换节点。写入节点来源信息后，旧版程序无法读取新状态；需要降级时，应使用升级前的整套备份，并按原有运行时恢复要求操作。
 
@@ -599,6 +613,8 @@ sudo proxyscene dev off
 程序会备份原始配置，并记录本程序写入过的开发代理地址；如果开启期间调整了开发代理端口，关闭时也会识别并清理这些已记录的 managed 值，尽量避免误删用户手工配置。npm 对无路径代理 URL 自动补出的单个尾 `/` 会按同一受管值处理，其他差异仍视为管理员修改。
 
 为保证 Git 配置能精确恢复，目标用户只能存在一个常规文件形式的 global 配置（`~/.gitconfig` 或 `~/.config/git/config`），且其中不能使用 `include`/`includeIf`；双 global 文件、符号链接/特殊文件或 include 拓扑会在任何写入前失败关闭。每次 Git 修改会持有实际配置文件的 `.lock`，覆盖读取、比较和提交，并保留已经完成的同键新增值。遇到其它 Git 写入者的锁会停止并保留恢复记录，待写入结束后重试。重复 `dev on` 或开机恢复遇到管理员改值、Git 受管值之外的追加值时，会保留配置并拒绝覆盖；请先 `dev off` 完成保守恢复，再 `dev on` 重新采集原值。
+
+修改已有 Git/npm 配置时保留原 UID、GID 和文件权限；新建配置使用 0600。并发更改文件内容或权限会拒绝提交。带显式 ACL 的已有配置暂不接管，以免改变访问范围；遇到提示时请先核对原有权限策略。
 
 npm 只读取并原子修改记录用户的 `~/.npmrc`，不会以 root 运行 npm 配置命令，也不会读取当前项目的 `.npmrc` 或执行其中的重定向设置。其它原始配置行保留；代理键存在数组、环境变量插值或无法精确解释的值时会拒绝接管。项目级/全局级 npm 配置仍按 npm 自身优先级工作，项目代理可覆盖这里管理的用户级代理。所有跨用户工具命令在记录家目录中运行，使用显式最小环境，避免继承调用者凭据和运行时注入变量。
 
@@ -835,7 +851,7 @@ sudo XRAY_RELEASE_BASE=https://mirror.example/xray/v26.9.9 bash ./install.sh
 | `PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION` | `0` | 默认拒绝明文 HTTP 订阅；确需导入 HTTP 订阅时设为 `1`，程序会打印风险警告。 |
 | `PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION` | `0` | 默认拒绝订阅链接解析到环回/私网/链路本地/CGNAT 等非公网地址（含重定向跳转），以防 SSRF；订阅托管在内网时设为 `1`。 |
 | `PROXYSCENE_ALLOW_PUBLIC_BIND` | `0` | 代理监听地址默认只允许环回。本地 HTTP/SOCKS 入站无认证，绑定 `0.0.0.0` 或公网 IP 会形成开放代理；确需对外监听时设为 `1`。 |
-| `PROXYSCENE_TEST_URL` | `https://www.google.com/generate_204` | `proxyscene test` 通过全局代理测试连通性时请求的地址；必须是 http(s) URL，可改为在你的网络环境下更可达的目标。 |
+| `PROXYSCENE_TEST_URL` | `https://www.google.com/generate_204` | 节点测试、自动择优及 `proxyscene test` 请求的目标地址。节点测试要求 HTTPS，禁止链接凭据；可改为在你的网络环境下更可达的目标。全局代理测试保留 HTTP(S) 兼容。 |
 
 监听地址、端口、Xray 服务用户、开发目标用户、Telegram 目标、OpenClaw 接管开关和公开监听开关会在成功的运行变更中写入 `state.json`；仅编辑节点备注、测速结果或订阅时保留原运行配置。后续普通命令会先读取这些值，再应用本次显式提供且有效的环境覆盖；`boot-restore` 和卸载只使用已提交的持久化值。定位目录/二进制/unit 名称仍由 restore unit 保存，订阅安全开关和测试 URL 不持久化。
 
@@ -1033,7 +1049,7 @@ sudo PROXYSCENE_DEV_TARGET_USER=alice proxyscene dev on
 
 ### 修改端口后不生效
 
-用环境变量执行一次会协调相应场景的管理命令；节点改名、TCP 测试和订阅更新不会应用端口覆盖。例如：
+用环境变量执行一次会协调相应场景的管理命令；节点改名、代理测试和订阅更新不会应用端口覆盖。例如：
 
 ```bash
 sudo PROXYSCENE_GLOBAL_HTTP_PORT=7898 proxyscene global on
@@ -1045,7 +1061,7 @@ sudo PROXYSCENE_GLOBAL_HTTP_PORT=7898 proxyscene global on
 
 - 当前全局代理主要通过环境变量和 apt 配置实现，不是完整透明代理。
 - 当前节点解析覆盖常见基础链接，复杂客户端私有参数可能需要后续扩展。
-- 节点测速是节点地址 TCP 连通性测试，不等同于完整代理链路测速。
+- 节点测速通过各节点实际请求 HTTPS；结果反映到指定目标的代理连通性和请求延迟，不代表带宽或对所有网站的可用性。
 - Hermes 通过 systemd 注入 `TELEGRAM_PROXY`；用户级 OpenClaw 则会修改 `openclaw.json` 的
   `channels.telegram.proxy`，因此配置文件的键序和缩进可能规范化，但其他 JSON 值会保留。
 - Telegram 接管以“能证明实际运行时会消费所改配置”为前提。Hermes 的 Telegram `NO_PROXY` 绕过、任何有效
@@ -1077,13 +1093,17 @@ shellcheck ./install.sh ./scripts/*.sh
 sudo -- bash ./scripts/install-test.sh
 ```
 
-`scripts/verify-release-artifacts.sh` 读取 `DIST`、`VERSION`、`COMMIT` 和 `SOURCE_DATE_EPOCH`，可校验指定架构或默认四架构的完整 Release 产物。每个架构的 Xray 还会按固定 ELF SHA256、实际 Go 版本、精确源码提交/module sum 和完整依赖清单进行绑定，再扫描全部实际导入包；受影响的导入包会阻断构建，不设置漏洞忽略名单。官方裁剪符号的二进制扫描报告作为保守模块告警清单保留，不能将未导入包直接视为已证明可达。每个 Release 还包含架构无关的 `xray_source_v26.9.9.tar.gz`：它保存精确 Xray commit 及 ELF 中全部 47 个模块的 Go proxy source zip、go.mod、info、module sum 和独立 SHA256；verifier 会把该清单与 bundle 内实际 Xray ELF 逐项比较。`scripts/systemd-integration-test.sh` 会启动 systemd PID 1 的一次性 Debian 容器并执行真实安装/升级/卸载，只能显式设置 `PROXYSCENE_CONTAINER_TEST=1` 后传入当前 amd64 bundle 和已固定 SHA256 的 v0.7.1 或 v0.8.0 amd64 bundle；普通 CI 只检查它的语法和 ShellCheck，不在 runner 或宿主机执行安装，正式 Release 的只读 build job 则把它作为发布前强制门禁。测试按精确容器名和本轮唯一 label 清理容器；固定 Debian 镜像引用只有在运行前不存在、可证明是本轮新拉取时才尝试删除。
+`scripts/verify-release-artifacts.sh` 读取 `DIST`、`VERSION`、`COMMIT` 和 `SOURCE_DATE_EPOCH`，可校验指定架构或默认四架构的完整 Release 产物。每个架构的 Xray 还会按固定 ELF SHA256、实际 Go 版本、精确源码提交/module sum 和完整依赖清单进行绑定，再扫描全部实际导入包；受影响的导入包会阻断构建，不设置漏洞忽略名单。官方裁剪符号的二进制扫描报告作为保守模块告警清单保留，不能将未导入包直接视为已证明可达。每个 Release 还包含架构无关的 `xray_source_v26.9.9.tar.gz`：它保存精确 Xray commit 及 ELF 中全部 47 个模块的 Go proxy source zip、go.mod、info、module sum 和独立 SHA256；verifier 会把该清单与 bundle 内实际 Xray ELF 逐项比较。`scripts/systemd-integration-test.sh` 会启动 systemd PID 1 的一次性 Debian 容器并执行真实安装/升级/卸载，只能显式设置 `PROXYSCENE_CONTAINER_TEST=1` 后传入当前 amd64 bundle 和已固定 SHA256 的 v0.7.1、v0.8.0、v0.9.2 或 v0.11.0 amd64 bundle；普通 CI 只检查它的语法和 ShellCheck，不在 runner 或宿主机执行安装，正式 Release 的只读 build job 则把它作为发布前强制门禁。测试按精确容器名和本轮唯一 label 清理容器；固定 Debian 镜像引用只有在运行前不存在、可证明是本轮新拉取时才尝试删除。
+
+CI 和正式发布使用 bundle 中的固定 Xray 运行完整 manager race 测试，另以 root 验证节点检测降权及开发配置元数据保留。v0.11.0 升级演练保留已保存订阅和开启中的全局代理，并检查订阅刷新与节点测试不会改变主服务进程、配置或无关服务。
+
+`scripts/mirror-candidate-integration-test.py` 在一次性 systemd 容器中使用官方 v0.11.0 和候选版本的完整资产，准备本地 TLS 镜像后断开容器外网，验证固定入口首次安装、运行中自更新、完整性检查、防降级及并发拒绝。它只操作本轮临时容器，结束后核对容器与镜像库存；正式发布在公开版本前执行。
 
 ## 安全与敏感信息
 
 请不要把以下内容提交到 GitHub issue、pull request、截图或日志中：
 
-- 真实 VLESS、VMess、Trojan、Shadowsocks 节点链接。
+- 真实 VLESS、VMess、Trojan、Shadowsocks、Hysteria2 节点链接。
 - 订阅链接。
 - 运行期生成的 `state.json`、`config.json`、`runtime-transition.json`、`core-loaded.json`、`dev-proxy-backup.json`、所有 `*-proxy-journal.json` 及其备份。
 - Telegram Bot Token、访问令牌、私钥或其他服务凭据。

@@ -9,6 +9,7 @@ readonly BASELINE_CONTAINER_BUNDLE="/artifacts/baseline-amd64-bundle.tar.gz"
 readonly V071_BUNDLE_SHA256="08a12e5716166c76095c54f6ea8227db8f623a719051479ceb7d6720c5c0da38"
 readonly V080_BUNDLE_SHA256="6f650d09dcb67d1f745b2e381e6358b2821253edea8b365415f9922e0bbe171a"
 readonly V092_BUNDLE_SHA256="0464e87cb15fbcfd6f967202d805f2d699952a5c12053b9392d1025d34368cdc"
+readonly V0110_BUNDLE_SHA256="2301d6fad5db8bf33d10de1ad8aead70e790b8b32cacab94643c0bcb4389a195"
 
 log() {
   printf '\n==> %s\n' "$*"
@@ -26,6 +27,7 @@ upgrade_baseline_identity() {
     "$V071_BUNDLE_SHA256") printf '%s\n' 'v0.7.1 1.22.12' ;;
     "$V080_BUNDLE_SHA256") printf '%s\n' 'v0.8.0 1.26.5' ;;
     "$V092_BUNDLE_SHA256") printf '%s\n' 'v0.9.2 1.27.1' ;;
+    "$V0110_BUNDLE_SHA256") printf '%s\n' 'v0.11.0 1.27.1' ;;
     *) fail "unsupported upgrade baseline bundle SHA256: $1" ;;
   esac
 }
@@ -546,6 +548,69 @@ runtime_transaction_canary() {
   printf 'CORE_UNLOADED_OVERRIDE_REFUSAL_VERIFIED real_systemd=1\n'
 }
 
+# Exercise the installed binary while its production global proxy stays active.
+# The reserved documentation node cannot carry traffic; a recorded HTTPS request
+# failure proves that the isolated core actually started, without a public node.
+subscription_and_probe_canary() {
+  local test_root="$1" state="$2" snapshot path snapshot_name service
+  local pid invocation executable fixture_pid fixture_invocation
+  snapshot="$test_root/subscription-probe-runtime"
+  install -d -m 0700 "$snapshot"
+  pid="$(systemctl show --property=MainPID --value proxyscene.service)"
+  invocation="$(systemctl show --property=InvocationID --value proxyscene.service)"
+  executable="$(stat -Lc '%d:%i' "/proc/$pid/exe")"
+  fixture_pid="$(systemctl show --property=MainPID --value proxyscene-subscription-fixture.service)"
+  fixture_invocation="$(systemctl show --property=InvocationID --value proxyscene-subscription-fixture.service)"
+  for path in /opt/proxyscene/config.json /opt/proxyscene/core-loaded.json \
+    /etc/systemd/system/proxyscene.service /etc/systemd/system/proxyscene-restore.service \
+    /etc/profile.d/proxyscene-global-proxy.sh /etc/apt/apt.conf.d/99proxyscene-global-proxy \
+    /opt/proxyscene/global-proxy-journal.json /opt/proxyscene/global-proxy-journal.json.bak; do
+    snapshot_name="${path//\//_}"
+    cp -p -- "$path" "$snapshot/$snapshot_name"
+  done
+  jq -S 'del(.generation, .speed_results)' "$state" > "$snapshot/state.json"
+  log "saved subscription refresh and isolated node probe preserve the active global service"
+  # Even poisoned environment proxies must not affect the direct-first fetch.
+  env PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1 PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1 \
+    HTTP_PROXY=http://127.0.0.1:1 HTTPS_PROXY=http://127.0.0.1:1 ALL_PROXY=http://127.0.0.1:1 \
+    http_proxy=http://127.0.0.1:1 https_proxy=http://127.0.0.1:1 all_proxy=http://127.0.0.1:1 \
+    NO_PROXY= no_proxy= PROXYSCENE_GLOBAL_HTTP_PORT=17999 \
+    /usr/local/bin/proxyscene subscription update --all
+  env PROXYSCENE_TEST_URL=https://example.com/ PROXYSCENE_GLOBAL_HTTP_PORT=17999 \
+    /usr/local/bin/proxyscene node test
+  assert_json "$state" \
+    '(.speed_results | length == 1) and all(.speed_results[]; .success == false and .target == "节点实际 HTTPS 代理请求" and (.error | startswith("节点 HTTPS 代理请求失败")))' \
+    "isolated core reached the real HTTPS request phase"
+  jq -S 'del(.generation, .speed_results)' "$state" > "$snapshot/state-after.json"
+  cmp -- "$snapshot/state.json" "$snapshot/state-after.json" \
+    || fail "subscription refresh or probe changed saved node, subscription, or runtime settings"
+  for path in /opt/proxyscene/config.json /opt/proxyscene/core-loaded.json \
+    /etc/systemd/system/proxyscene.service /etc/systemd/system/proxyscene-restore.service \
+    /etc/profile.d/proxyscene-global-proxy.sh /etc/apt/apt.conf.d/99proxyscene-global-proxy \
+    /opt/proxyscene/global-proxy-journal.json /opt/proxyscene/global-proxy-journal.json.bak; do
+    snapshot_name="${path//\//_}"
+    cmp -- "$snapshot/$snapshot_name" "$path" || fail "probe or refresh changed runtime file: $path"
+    assert_eq "$(stat -c '%u:%g:%a' "$snapshot/$snapshot_name")" \
+      "$(stat -c '%u:%g:%a' "$path")" "probe or refresh retained metadata: $path"
+  done
+  assert_eq "$pid" "$(systemctl show --property=MainPID --value proxyscene.service)" "probe preserved global PID"
+  assert_eq "$invocation" "$(systemctl show --property=InvocationID --value proxyscene.service)" "probe preserved global invocation"
+  assert_eq "$executable" "$(stat -Lc '%d:%i' "/proc/$pid/exe")" "probe preserved global executable"
+  assert_eq "$fixture_pid" "$(systemctl show --property=MainPID --value proxyscene-subscription-fixture.service)" "probe preserved unrelated PID"
+  assert_eq "$fixture_invocation" "$(systemctl show --property=InvocationID --value proxyscene-subscription-fixture.service)" "probe preserved unrelated invocation"
+  for service in proxyscene.service proxyscene-subscription-fixture.service; do
+    service_is_active "$service" || fail "probe stopped active service: $service"
+  done
+  if find /tmp -maxdepth 1 -name 'proxyscene-node-probe-*' -print -quit | grep -q .; then
+    fail "node probe left private temporary state"
+  fi
+  if pgrep -f '^/proc/self/fd/3 run -format json -config stdin:$' >/dev/null; then
+    fail "node probe left an isolated core process"
+  fi
+  assert_no_path /opt/proxyscene/runtime-transition.json
+  printf 'NODE_PROBE_ACTIVE_SERVICE_ISOLATION_VERIFIED global_unchanged=1 unrelated_unchanged=1 cleanup=1\n'
+}
+
 inside_container() {
   local current_archive="$1"
   local old_archive="$2"
@@ -557,7 +622,7 @@ inside_container() {
   local upgrade_pid upgrade_invocation upgrade_executable legacy_snapshot path snapshot_name
   local oc_user oc_uid oc_group openclaw_config hermes_before openclaw_before count_after telegram_before
   local failure_output global_profile_original global_profile_concurrent global_apt_original
-  local legacy_drop_in legacy_env legacy_state_tmp
+  local legacy_drop_in legacy_env legacy_state_tmp subscription_url
   local -a fault_env
 
   [[ "${PROXYSCENE_CONTAINER_TEST:-0}" == "1" ]] \
@@ -776,7 +841,7 @@ FAULT_SYSTEMCTL
     cd "$old_dir"
     case "$baseline_version" in
       v0.7.1) ./install.sh --offline "$node_url" ;;
-      v0.8.0|v0.9.2)
+      v0.8.0|v0.9.2|v0.11.0)
         ./install.sh --offline
         printf '%s\n' "$node_url" | /usr/local/bin/proxyscene node add --stdin
         ;;
@@ -803,12 +868,28 @@ FAULT_SYSTEMCTL
       assert_json "$old_state" '.runtime_config == null' "v0.7.1 has no persisted runtime configuration"
       upgraded_global_port="$custom_port"
       ;;
-    v0.8.0|v0.9.2)
+    v0.8.0|v0.9.2|v0.11.0)
       assert_json "$old_state" ".runtime_config.global_http_port == $custom_port" \
         "$baseline_version custom global port persisted before upgrade"
       upgraded_global_port="$custom_port"
       ;;
   esac
+
+  if [[ "$baseline_version" == v0.11.0 ]]; then
+    log "save a subscription through the official v0.11.0 manager before upgrade"
+    install -d -m 0700 "$test_root/subscription-fixture"
+    printf '%s\n' "$node_url" > "$test_root/subscription-fixture/nodes.txt"
+    systemd-run --unit=proxyscene-subscription-fixture.service --property=Type=exec \
+      /usr/bin/python3 -m http.server --bind 127.0.0.1 --directory "$test_root/subscription-fixture" 17897
+    wait_for "local subscription fixture" port_is_listening 17897
+    subscription_url='http://127.0.0.1:17897/nodes.txt'
+    printf '%s\n' "$subscription_url" | env PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1 \
+      PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1 /usr/local/bin/proxyscene node import --stdin
+    assert_json "$old_state" '.nodes | length == 1' "baseline subscription deduplicates the existing node"
+    assert_json "$old_state" '.subscriptions == ["http://127.0.0.1:17897/nodes.txt"]' "baseline saved subscription"
+    jq -S '{nodes, subscriptions, default_node_id, scene_nodes, scene_enabled, runtime_config}' \
+      "$old_state" > "$test_root/subscription-before-upgrade.json"
+  fi
 
   upgrade_pid="$(systemctl show --property=MainPID --value proxyscene.service)"
   upgrade_invocation="$(systemctl show --property=InvocationID --value proxyscene.service)"
@@ -904,6 +985,17 @@ FAULT_SYSTEMCTL
   assert_json /opt/proxyscene/config.json \
     ".inbounds[] | select(.tag == \"global-http\" and .port == $upgraded_global_port)" \
     "upgraded global inbound"
+
+  if [[ "$baseline_version" == v0.11.0 ]]; then
+    jq -S '{nodes, subscriptions, default_node_id, scene_nodes, scene_enabled, runtime_config}' \
+      "$old_state" > "$test_root/subscription-after-upgrade.json"
+    cmp -- "$test_root/subscription-before-upgrade.json" "$test_root/subscription-after-upgrade.json" \
+      || fail "v0.11.0 upgrade changed saved nodes, subscriptions or active runtime settings"
+    subscription_and_probe_canary "$test_root" "$old_state"
+    systemctl stop -- proxyscene-subscription-fixture.service
+    wait_for "stopped subscription fixture" port_is_not_listening 17897
+    printf 'SUBSCRIPTION_ACTIVE_GLOBAL_UPGRADE_VERIFIED baseline=%s\n' "$baseline_version"
+  fi
 
   runtime_transaction_canary "$test_root" "$fault_bin" "$upgraded_global_port"
 

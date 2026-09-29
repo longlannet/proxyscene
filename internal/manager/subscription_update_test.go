@@ -115,7 +115,7 @@ func TestSubscriptionUpdateFailureLeavesEntireBatchUntouched(t *testing.T) {
 				case "bad URI":
 					return prepareSubscriptionBody(raw, []byte(valid+"\ntrojan://invalid"))
 				case "unknown scheme":
-					return prepareSubscriptionBody(raw, []byte(valid+"\nhy2://secret@missing.example:443"))
+					return prepareSubscriptionBody(raw, []byte(valid+"\ntuic://secret@missing.example:443"))
 				case "HTML":
 					return prepareSubscriptionBody(raw, []byte("<html>\n"+valid+"\n</html>"))
 				default:
@@ -327,4 +327,62 @@ func TestSubscriptionCommandRejectsUnsupportedArguments(t *testing.T) {
 		}
 	}
 	assertSubscriptionStoreUnchanged(t, a, before)
+}
+
+func TestClashSubscriptionUpdateFailurePreservesEntireBatch(t *testing.T) {
+	valid := `{name: valid, type: trojan, server: new.example, port: 443, password: secret}`
+	for name, body := range map[string]string{
+		"bad node":              "proxies: [" + valid + ", {type: trojan, password: missing-server}]",
+		"unknown protocol":      "proxies: [" + valid + ", {type: tuic, password: secret}]",
+		"unsupported parameter": "proxies: [" + valid + ", {name: invalid, type: trojan, server: bad.example, port: 443, password: secret, skip-cert-verify: true}]",
+		"truncated list":        "proxies: [" + valid + ",",
+		"missing local proxies": "proxy-providers: {remote: {type: http, url: 'https://provider.example/sub'}}",
+		"duplicate keys":        "proxies: [" + valid + "]\nproxies: []",
+		"second document":       "proxies: [" + valid + "]\n---\nproxies: []",
+	} {
+		t.Run(name, func(t *testing.T) {
+			urls := []string{"https://one.example/sub", "https://two.example/sub"}
+			a, before := subscriptionUpdateFixture(t, urls...)
+			before.Nodes = append(before.Nodes, Node{ID: "obsolete", Name: "old", Protocol: "trojan", RawURL: "trojan://secret@old.example:443", SubscriptionManaged: true, SubscriptionIDs: []string{subscriptionID(urls[1])}})
+			if err := a.saveStore(before); err != nil {
+				t.Fatal(err)
+			}
+			err := a.updateSubscriptionsWithDownloader("--all", func(raw string) (preparedSubscription, error) {
+				if raw == urls[0] {
+					return prepareSubscriptionBody(raw, []byte("proxies: ["+valid+"]"))
+				}
+				return prepareSubscriptionBody(raw, []byte(body))
+			})
+			if err == nil {
+				t.Fatal("incomplete YAML batch committed")
+			}
+			assertSubscriptionStoreUnchanged(t, a, before)
+		})
+	}
+}
+
+func TestClashSubscriptionRefreshKeepsIdentityAcrossFormatting(t *testing.T) {
+	a, _ := subscriptionUpdateFixture(t, "https://one.example/sub")
+	bodies := []string{
+		`proxies: [{name: stable, type: trojan, server: stable.example, port: 443, password: secret}]`,
+		"proxies:\n - password: secret\n   port: '443'\n   server: stable.example\n   type: trojan\n   name: stable\n",
+	}
+	var originalID string
+	for index, body := range bodies {
+		if err := a.updateSubscriptionsWithDownloader("1", func(raw string) (preparedSubscription, error) { return prepareSubscriptionBody(raw, []byte(body)) }); err != nil {
+			t.Fatal(err)
+		}
+		st, err := a.loadStore()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(st.Nodes) != 2 {
+			t.Fatalf("node count after refresh: %d", len(st.Nodes))
+		}
+		if index == 0 {
+			originalID = st.Nodes[1].ID
+		} else if st.Nodes[1].ID != originalID {
+			t.Fatal("YAML formatting replaced the existing node")
+		}
+	}
 }
