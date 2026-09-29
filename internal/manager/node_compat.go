@@ -18,10 +18,20 @@ func parseRuntimeNode(raw string) (*parsedNode, error) {
 }
 
 func validateNodeRuntimeCompatibility(pn *parsedNode) error {
+	if err := validateNodeTransportRuntimeCompatibility(pn); err != nil {
+		return err
+	}
 	switch pn.Protocol {
 	case "vless", "trojan":
 		stream := pn.Outbound["streamSettings"].(map[string]any)
 		if stream["security"] == "none" && !xrayAllowsPlaintextHost(pn.EndpointHost) {
+			if pn.Protocol == "vless" {
+				server := pn.Outbound["settings"].(map[string]any)["vnext"].([]any)[0].(map[string]any)
+				user := server["users"].([]any)[0].(map[string]any)
+				if encryption, ok := user["encryption"].(string); ok && encryption != "none" && validateVLESSEncryption(encryption) == nil {
+					return nil
+				}
+			}
 			return fmt.Errorf("节点不兼容：Xray v26.9.9 不再支持公网明文 %s；请使用 TLS/REALITY 节点", pn.Protocol)
 		}
 	case "ss":

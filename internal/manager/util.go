@@ -285,7 +285,14 @@ func writeUserFileAtomicAtNoReplace(dirFD int, base string, data []byte, perm os
 }
 
 func writeUserFileAtomicAtMode(dirFD int, base string, data []byte, perm os.FileMode, uid, gid int, noReplace bool) error {
-	tmpName, tmpFD, err := createTempFileAt(dirFD, base, perm)
+	return writeUserFileAtomicAtModeChecked(dirFD, base, data, perm, uid, gid, noReplace, nil)
+}
+
+func writeUserFileAtomicAtModeChecked(dirFD int, base string, data []byte, perm os.FileMode, uid, gid int, noReplace bool, beforePublish func() error) error {
+	// Never expose credentials under the creator's group before Fchown, even
+	// when the destination is group-readable. Remove any inherited access ACL
+	// before writing so the requested POSIX permissions describe all readers.
+	tmpName, tmpFD, err := createTempFileAt(dirFD, base, 0o600)
 	if err != nil {
 		return err
 	}
@@ -296,6 +303,10 @@ func writeUserFileAtomicAtMode(dirFD int, base string, data []byte, perm os.File
 			_ = syscall.Unlinkat(dirFD, tmpName)
 		}
 	}()
+	if err := clearInheritedUserFileACL(int(f.Fd())); err != nil {
+		_ = f.Close()
+		return err
+	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
 		return err
@@ -303,6 +314,14 @@ func writeUserFileAtomicAtMode(dirFD int, base string, data []byte, perm os.File
 	if err := syscall.Fchown(int(f.Fd()), uid, gid); err != nil {
 		_ = f.Close()
 		return err
+	}
+	// Revalidate before making any credentials group-readable. A concurrent
+	// chmod/chgrp/ACL change must fail while the candidate is still private.
+	if beforePublish != nil {
+		if err := beforePublish(); err != nil {
+			_ = f.Close()
+			return err
+		}
 	}
 	if err := syscall.Fchmod(int(f.Fd()), uint32(perm.Perm())); err != nil {
 		_ = f.Close()
@@ -315,6 +334,11 @@ func writeUserFileAtomicAtMode(dirFD int, base string, data []byte, perm os.File
 	}
 	if err := f.Close(); err != nil {
 		return err
+	}
+	if beforePublish != nil {
+		if err := beforePublish(); err != nil {
+			return err
+		}
 	}
 	if noReplace {
 		err = unix.Renameat2(dirFD, tmpName, dirFD, base, unix.RENAME_NOREPLACE)
@@ -547,6 +571,10 @@ func writeUserFileAtomicCASPersisted(userName string, expectedIdentity *persiste
 }
 
 func writeUserFileAtomicCASWithIdentity(userName string, identity localUserIdentity, path string, expected, data []byte, perm os.FileMode) error {
+	return writeUserFileAtomicCASWithMetadata(userName, identity, path, expected, data, perm, nil)
+}
+
+func writeUserFileAtomicCASWithMetadata(userName string, identity localUserIdentity, path string, expected, data []byte, perm os.FileMode, metadata *userFileMetadata) error {
 	cleanPath, dirFD, err := openUserFileDirForIdentity(userName, identity, path, false)
 	if err != nil {
 		return err
@@ -558,7 +586,7 @@ func writeUserFileAtomicCASWithIdentity(userName string, identity localUserIdent
 	if claimErr != nil {
 		switch claimErr {
 		case unix.ENOENT, unix.EEXIST:
-			found, resume, replayErr := replayUserFileWriteQuarantine(dirFD, base, quarantinePath, expected, data)
+			found, resume, replayErr := replayUserFileWriteQuarantine(dirFD, base, quarantinePath, expected, data, metadata)
 			if replayErr != nil {
 				return replayErr
 			}
@@ -579,14 +607,26 @@ func writeUserFileAtomicCASWithIdentity(userName string, identity localUserIdent
 		userFileCASAfterQuarantine(cleanPath)
 	}
 
-	matched, err := readExpectedUserFileQuarantine(dirFD, quarantinePath, expected)
+	matched, err := readExpectedUserFileQuarantineWithMetadata(dirFD, quarantinePath, expected, metadata)
 	if err != nil {
 		return err
 	}
 	if !matched {
 		return fmt.Errorf("用户配置隔离文件在提交前消失，拒绝自动覆盖：%s", quarantinePath)
 	}
-	if err := writeUserFileAtomicAtNoReplace(dirFD, base, data, perm, identity.UID, identity.GID); err != nil {
+	uid, gid := identity.UID, identity.GID
+	var beforePublish func() error
+	if metadata != nil {
+		uid, gid, perm = metadata.UID, metadata.GID, metadata.Mode
+		beforePublish = func() error {
+			found, err := readExpectedUserFileQuarantineWithMetadata(dirFD, quarantinePath, expected, metadata)
+			if err == nil && !found {
+				return errUserFileChanged
+			}
+			return err
+		}
+	}
+	if err := writeUserFileAtomicAtModeChecked(dirFD, base, data, perm, uid, gid, true, beforePublish); err != nil {
 		if errors.Is(err, unix.EEXIST) {
 			if cleanupErr := removeUserFileQuarantine(dirFD, quarantinePath); cleanupErr != nil {
 				return errors.Join(errUserFileChanged, cleanupErr)
@@ -606,17 +646,20 @@ func writeUserFileAtomicCASWithIdentity(userName string, identity localUserIdent
 // the caller's expected value. In that case an absent final name resumes the
 // write, an already-desired final name completes cleanup, and any other final
 // name wins as a concurrent user update.
-func replayUserFileWriteQuarantine(dirFD int, base, quarantinePath string, expected, data []byte) (found, resume bool, err error) {
-	found, err = readExpectedUserFileQuarantine(dirFD, quarantinePath, expected)
+func replayUserFileWriteQuarantine(dirFD int, base, quarantinePath string, expected, data []byte, metadata *userFileMetadata) (found, resume bool, err error) {
+	found, err = readExpectedUserFileQuarantineWithMetadata(dirFD, quarantinePath, expected, metadata)
 	if err != nil || !found {
 		return found, false, err
 	}
-	current, readErr := readRegularFileAtNoFollow(dirFD, base, int64(len(data))+1)
+	current, readErr := readUserFileWithExpectedMetadata(dirFD, base, int64(len(data))+1, metadata, false)
 	if errors.Is(readErr, os.ErrNotExist) {
 		return true, true, nil
 	}
 	if readErr == nil && bytes.Equal(current, data) {
 		return true, false, removeUserFileQuarantine(dirFD, quarantinePath)
+	}
+	if metadata != nil && readErr != nil {
+		return true, false, errors.Join(errUserFileChanged, readErr)
 	}
 	cleanupErr := removeUserFileQuarantine(dirFD, quarantinePath)
 	if readErr != nil {
@@ -626,7 +669,11 @@ func replayUserFileWriteQuarantine(dirFD int, base, quarantinePath string, expec
 }
 
 func readExpectedUserFileQuarantine(dirFD int, quarantinePath string, expected []byte) (bool, error) {
-	current, err := readRegularFileAtNoFollow(dirFD, userFileQuarantineName, int64(len(expected))+1)
+	return readExpectedUserFileQuarantineWithMetadata(dirFD, quarantinePath, expected, nil)
+}
+
+func readExpectedUserFileQuarantineWithMetadata(dirFD int, quarantinePath string, expected []byte, metadata *userFileMetadata) (bool, error) {
+	current, err := readUserFileWithExpectedMetadata(dirFD, userFileQuarantineName, int64(len(expected))+1, metadata, true)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
 	}

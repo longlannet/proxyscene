@@ -22,8 +22,8 @@ func (a *App) nodeMenu() error {
 		fmt.Println("1. 查看节点列表")
 		fmt.Println("2. 选择使用节点")
 		fmt.Println("3. 添加节点")
-		fmt.Println("4. TCP 连通性/延迟测试")
-		fmt.Println("5. 按 TCP 延迟选用节点")
+		fmt.Println("4. 代理连通性/延迟测试")
+		fmt.Println("5. 按代理请求延迟选用节点")
 		fmt.Println("6. 修改节点备注")
 		fmt.Println("7. 删除节点")
 		fmt.Println("0. 返回")
@@ -336,15 +336,18 @@ func (a *App) menuAutoNode(st *Store) error {
 	if len(st.Nodes) == 0 {
 		return fmt.Errorf("没有可测试节点，请先添加节点或导入订阅")
 	}
-	fmt.Println("正在测试节点地址的 TCP 建连延迟；结果不代表代理出网或带宽。")
-	results := a.runSpeedTests(st.Nodes)
+	fmt.Println("正在通过各节点请求 HTTPS，检查代理连通性并测量请求延迟；这不是带宽测试。")
+	results, err := a.runSpeedTests(st.Nodes)
 	printSpeedResults(st.Nodes, results)
+	if err != nil {
+		return err
+	}
 	preview := cloneStore(st)
 	id := fastestNodeID(mergeSpeedResults(preview, st.Nodes, results))
 	if id == "" {
-		return fmt.Errorf("没有 TCP 连通的节点")
+		return fmt.Errorf("没有通过代理请求测试的节点")
 	}
-	fmt.Printf("本次 TCP 延迟最低的节点：%s\n", menuNodeLabel(st, id))
+	fmt.Printf("本次代理请求延迟最低的节点：%s\n", menuNodeLabel(st, id))
 	scope, err := menuPickNodeScope()
 	if err != nil {
 		return err

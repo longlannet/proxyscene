@@ -508,7 +508,7 @@ func TestProtocolFieldsFailClosed(t *testing.T) {
 		"vless://" + id + "@example.com:443?security=tls&pbk=ignored",
 		"vless://" + id + "@example.com:443?security=tls&alpn=h2,,http%2F1.1",
 		"vless://" + id + "@example.com:443?security=tls&type=raw&headerType=http&host=one.example,,two.example",
-		"vless://" + id + "@example.com:443?security=tls&type=ws&path=%2Fws%3Fed%3D2048",
+		"vless://" + id + "@example.com:443?security=tls&type=ws&path=%2Fws%3Fed%3D2048&ed=4096",
 		"vless://" + id + "@example.com:443?security=tls&type=httpupgrade&path=%2Fup%3Feh%3DSec-WebSocket-Protocol",
 		"trojan://secret@example.com:443?security=tls&unknown=value",
 		"trojan://secret@example.com:443/ignored?security=tls",
@@ -535,7 +535,7 @@ func TestVMessFieldsForOtherModesFailClosed(t *testing.T) {
 		"id": "11111111-1111-1111-1111-111111111111", "net": "tcp",
 	}
 	for name, mutate := range map[string]func(map[string]any){
-		"sni without tls":          func(v map[string]any) { v["sni"] = "tls.example.com" },
+		"invalid sni without tls":  func(v map[string]any) { v["sni"] = "bad host" },
 		"serviceName on raw":       func(v map[string]any) { v["serviceName"] = "ignored" },
 		"mode on websocket":        func(v map[string]any) { v["net"] = "ws"; v["mode"] = "multi" },
 		"serviceName on websocket": func(v map[string]any) { v["net"] = "ws"; v["serviceName"] = "ignored" },
@@ -821,6 +821,14 @@ func TestGeneratedTransportConfigsPassPinnedXray(t *testing.T) {
 			"net": "ws", "tls": "tls", "sni": "tls.example.com", "host": "cdn.example.com", "path": "/ws",
 		}),
 	}
+	cases["raw-generator-aliases"] = "vless://" + id + "@example.com:443?type=tcp&mode=multi&security=tls&sni=tls.example.com&servername=tls.example.com"
+	cases["websocket-path-early-data"] = "vless://" + id + "@example.com:443?type=ws&security=tls&path=" + url.QueryEscape("/ws?ed=2048&token=value") + "&ed=2048"
+	cases["httpupgrade-path-early-data"] = "vless://" + id + "@example.com:443?type=httpupgrade&security=tls&path=" + url.QueryEscape("/up?ed=2048")
+	cases["xhttp-padding-alias"] = "vless://" + id + "@example.com:443?type=xhttp&security=tls&x_padding_bytes=100-200&extra=" + url.QueryEscape(`{"xPaddingBytes":"100-200","scMaxBufferedPosts":2}`)
+	cases["vmess-raw-placeholders"] = vmessURL(t, map[string]any{
+		"v": "2", "add": "example.com", "port": 443, "id": id,
+		"net": "tcp", "type": "none", "tls": "", "sni": "tls.example.com", "host": "cdn.example.com", "path": "/unused",
+	})
 	key := make([]byte, 32)
 	for i := range key {
 		key[i] = 0xfb

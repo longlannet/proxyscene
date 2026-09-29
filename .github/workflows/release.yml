@@ -122,7 +122,7 @@ jobs:
       - name: Hermes installation permission tests
         run: sudo -- "$(command -v go)" test ./internal/manager -run '^TestHermes(System|Project|UserProject)' -count=1
       - name: Privileged transaction safety tests
-        run: sudo -- "$(command -v go)" test -race ./internal/manager -run '^Test(Core|Runtime|TelegramPlan|TelegramApply|TelegramCompensation|LegacyTelegramRelease|ModernTelegramExplicitRelease|HermesApplyCannotResumePendingRelease|OpenClawApplyCannotResumePendingRelease|ExistingInstall|NodeCommitWithoutScenes)' -count=1
+        run: sudo -- "$(command -v go)" test -race ./internal/manager -run '^Test(Core|Runtime|TelegramPlan|TelegramApply|TelegramCompensation|LegacyTelegramRelease|ModernTelegramExplicitRelease|HermesApplyCannotResumePendingRelease|OpenClawApplyCannotResumePendingRelease|ExistingInstall|NodeCommitWithoutScenes|DevConfigMetadata)' -count=1
       - name: Workflow validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
       - name: Require clean source before build
@@ -174,21 +174,31 @@ jobs:
           trap 'rm -rf "$verify_dir"' EXIT
           tar xzf dist/proxyscene_bundle_linux_amd64.tar.gz -C "$verify_dir"
           PROXYSCENE_TEST_XRAY="$verify_dir/proxyscene_bundle_linux_amd64/xray" \
-            go test ./internal/manager -run '^TestGeneratedTransportConfigsPassPinnedXray$'
-      - name: Disposable systemd install and baseline upgrade canaries
+            go test -race ./internal/manager -count=1
+          sudo -- env PROXYSCENE_TEST_XRAY="$verify_dir/proxyscene_bundle_linux_amd64/xray" \
+            "$(command -v go)" test -race ./internal/manager \
+            -run '^TestNodeProbeProductionTrustAndDroppedIdentity$' -count=1
+      - name: Disposable systemd and mirror install and baseline upgrade canaries
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           set -euo pipefail
           canary_dir="$(mktemp -d "${RUNNER_TEMP}/proxyscene-systemd-canary.XXXXXX")"
+          evidence_dir="${RUNNER_TEMP}/proxyscene-systemd-canary-evidence"
+          install -d -m 0700 "$evidence_dir"
           cleanup() {
             rm -rf -- "$canary_dir"
           }
           trap cleanup EXIT
-          versions=(v0.7.1 v0.8.0 v0.9.2)
+          versions=(v0.7.1 v0.8.0 v0.9.2 v0.11.0)
           digests=(
             08a12e5716166c76095c54f6ea8227db8f623a719051479ceb7d6720c5c0da38
             6f650d09dcb67d1f745b2e381e6358b2821253edea8b365415f9922e0bbe171a
             0464e87cb15fbcfd6f967202d805f2d699952a5c12053b9392d1025d34368cdc
+            2301d6fad5db8bf33d10de1ad8aead70e790b8b32cacab94643c0bcb4389a195
           )
           for i in "${!versions[@]}"; do
             old_bundle="$canary_dir/proxyscene_bundle_linux_amd64-${versions[$i]}.tar.gz"
@@ -197,9 +207,85 @@ jobs:
               --max-filesize 104857600 -o "$old_bundle" \
               "https://github.com/longlannet/proxyscene/releases/download/${versions[$i]}/proxyscene_bundle_linux_amd64.tar.gz"
             printf '%s  %s\n' "${digests[$i]}" "$old_bundle" | sha256sum -c -
+            canary_status=0
             PROXYSCENE_CONTAINER_TEST=1 bash scripts/systemd-integration-test.sh \
-              dist/proxyscene_bundle_linux_amd64.tar.gz "$old_bundle"
+              dist/proxyscene_bundle_linux_amd64.tar.gz "$old_bundle" 2>&1 \
+              | tee "$evidence_dir/${versions[$i]}.log" || canary_status=$?
+            printf '{"exit_code":%d}\n' "$canary_status" > "$evidence_dir/${versions[$i]}.json"
+            if (( canary_status != 0 )); then exit "$canary_status"; fi
+            if [[ "${versions[$i]}" == v0.11.0 ]]; then
+              mirror_status=0
+              PROXYSCENE_MIRROR_CONTAINER_TEST=1 python3 -I -B scripts/mirror-candidate-integration-test.py \
+                --candidate-dir dist --candidate-tag "$VERSION" --candidate-commit "$COMMIT" \
+                --baseline-bundle "$old_bundle" \
+                --evidence "${RUNNER_TEMP}/proxyscene-mirror-candidate-evidence" || mirror_status=$?
+              printf '{"exit_code":%d}\n' "$mirror_status" > "$evidence_dir/mirror.json"
+              if (( mirror_status != 0 )); then exit "$mirror_status"; fi
+            fi
           done
+      - name: Prepare minimal release canary summary
+        if: always()
+        shell: bash
+        env:
+          CANDIDATE_VERSION: ${{ inputs.version }}
+          CANDIDATE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          python3 -I -B - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          systemd = temporary / "proxyscene-systemd-canary-evidence"
+          mirror = temporary / "proxyscene-mirror-candidate-evidence"
+
+          def record(path):
+              try:
+                  value = json.loads(path.read_text())
+                  return value if isinstance(value, dict) else {}
+              except (OSError, ValueError):
+                  return {}
+
+          def exit_code(value):
+              return value if type(value) is int and 0 <= value <= 255 else None
+
+          def public_value(name, pattern):
+              value = os.environ.get(name, "")
+              return value if re.fullmatch(pattern, value) else None
+
+          summary = {
+              "candidate_tag": public_value("CANDIDATE_VERSION", r"v[0-9]+\.[0-9]+\.[0-9]+"),
+              "candidate_commit": public_value("CANDIDATE_COMMIT", r"[0-9a-f]{40}"),
+              "checks": [],
+          }
+          for tag in ("v0.7.1", "v0.8.0", "v0.9.2", "v0.11.0"):
+              code = exit_code(record(systemd / (tag + ".json")).get("exit_code"))
+              summary["checks"].append({"name": "systemd-baseline-" + tag,
+                  "executed": code is not None, "passed": code == 0, "exit_code": code})
+          result = record(mirror / "result.json")
+          code = exit_code(record(systemd / "mirror.json").get("exit_code"))
+          summary["checks"].append({"name": "mirror-candidate",
+              "executed": code is not None, "passed": code == 0 and result.get("passed") is True,
+              "exit_code": code, "inventory_restored": result.get("inventory_restored") is True})
+          for scenario in ("fresh", "upgrade"):
+              result = record(mirror / scenario / "result.json")
+              summary["checks"].append({"name": "mirror-" + scenario,
+                  "executed": bool(result), "passed": result.get("passed") is True,
+                  "container_removed": result.get("container_absent") is True})
+          # Construct every field above; never copy raw logs, paths, URLs,
+          # process details, or arbitrary strings into the published summary.
+          (temporary / "proxyscene-release-canary-summary.json").write_text(
+              json.dumps(summary, sort_keys=True, indent=2) + "\n")
+          PY
+      - name: Retain minimal release canary summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-canary-summary-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/proxyscene-release-canary-summary.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Require clean source after build
         shell: bash
         env:

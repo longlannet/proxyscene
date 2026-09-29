@@ -56,7 +56,7 @@ jobs:
       - name: Hermes installation permission tests
         run: sudo -- "$(command -v go)" test ./internal/manager -run '^TestHermes(System|Project|UserProject)' -count=1
       - name: Privileged transaction safety tests
-        run: sudo -- "$(command -v go)" test -race ./internal/manager -run '^Test(Core|Runtime|TelegramPlan|TelegramApply|TelegramCompensation|LegacyTelegramRelease|ModernTelegramExplicitRelease|HermesApplyCannotResumePendingRelease|OpenClawApplyCannotResumePendingRelease|ExistingInstall|NodeCommitWithoutScenes)' -count=1
+        run: sudo -- "$(command -v go)" test -race ./internal/manager -run '^Test(Core|Runtime|TelegramPlan|TelegramApply|TelegramCompensation|LegacyTelegramRelease|ModernTelegramExplicitRelease|HermesApplyCannotResumePendingRelease|OpenClawApplyCannotResumePendingRelease|ExistingInstall|NodeCommitWithoutScenes|DevConfigMetadata)' -count=1
       - name: Workflow validation
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color .github/workflows/*.yml
 
@@ -107,5 +107,8 @@ jobs:
           trap 'rm -rf "$verify_dir"' EXIT
           tar xzf dist/proxyscene_bundle_linux_amd64.tar.gz -C "$verify_dir"
           PROXYSCENE_TEST_XRAY="$verify_dir/proxyscene_bundle_linux_amd64/xray" \
-            go test ./internal/manager -run '^TestGeneratedTransportConfigsPassPinnedXray$'
+            go test -race ./internal/manager -count=1
+          sudo -- env PROXYSCENE_TEST_XRAY="$verify_dir/proxyscene_bundle_linux_amd64/xray" \
+            "$(command -v go)" test -race ./internal/manager \
+            -run '^TestNodeProbeProductionTrustAndDroppedIdentity$' -count=1
           echo "dry-run 产物校验通过"
