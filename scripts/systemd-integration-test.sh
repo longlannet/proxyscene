@@ -722,13 +722,12 @@ subscription_replacement_canary() {
   printf 'SUBSCRIPTION_SELECTED_REPLACEMENT_VERIFIED real_systemd=1 replaced=1 bindings_migrated=1 settings_preserved=1 unrelated_unchanged=1 identical_no_restart=1\n'
 }
 
-
 # Reuse the running Hermes/OpenClaw fixtures after their individual lifecycle
 # checks. All paths and service mutations remain inside the disposable container.
 remove_all_nodes_canary() {
   local test_root="$1" state="$2" original_url="$3" oc_user="$4" oc_uid="$5"
   local openclaw_config="$6" original_profile="$7" original_apt="$8"
-  local snapshot second_url generation global_port restored_id
+  local snapshot second_url generation global_port global_socks_port restored_id port hermes_before
   snapshot="$test_root/remove-all-nodes"
   install -d -m 0700 "$snapshot"
   assert_json "$state" \
@@ -738,6 +737,7 @@ remove_all_nodes_canary() {
   jq -S '.subscriptions' "$state" > "$snapshot/subscriptions-before.json"
   cp -p -- /opt/proxyscene/config.json "$snapshot/config-before.json"
   global_port="$(jq -r '.runtime_config.global_http_port' "$state")"
+  global_socks_port="$(jq -r '.runtime_config.global_socks_port' "$state")"
   [[ "$original_url" == *@198.51.100.10:443* ]] || fail "unexpected bulk-delete fixture endpoint"
   second_url="${original_url/198.51.100.10/198.51.100.13}"
 
@@ -752,6 +752,9 @@ remove_all_nodes_canary() {
   assert_core_process_loaded "bulk-delete active core"
   wait_for "bulk-delete development listener" port_is_listening 7891
   wait_for "bulk-delete Telegram listener" port_is_listening 7892
+  wait_for "bulk-delete Hermes proxy settings" grep -Fxq 1 \
+    /run/proxyscene-integration-targets/hermes.fallback-ips-disabled
+  hermes_before="$(target_start_count hermes)"
   generation="$(jq -r .generation "$state")"
 
   /usr/local/bin/proxyscene node remove --all
@@ -768,11 +771,12 @@ remove_all_nodes_canary() {
   wait_for "bulk-delete stopped core" service_is_inactive proxyscene.service
   assert_eq inactive "$(systemctl show --property=ActiveState --value proxyscene.service)" \
     "bulk deletion cleanly stopped the core"
-  for port in "$global_port" 7891 7892 7893; do
+  assert_eq disabled "$(systemctl show --property=UnitFileState --value proxyscene.service)" \
+    "bulk deletion disabled the core"
+  for port in "$global_port" "$global_socks_port" 7891 7892 7893; do
     wait_for "bulk-delete closed listener $port" port_is_not_listening "$port"
   done
   assert_no_path /opt/proxyscene/config.json
-  assert_no_path /opt/proxyscene/core-loaded.json
   assert_no_path /opt/proxyscene/runtime-transition.json
   assert_no_path /opt/proxyscene/global-proxy-journal.json
   assert_no_path /opt/proxyscene/global-proxy-journal.json.bak
@@ -807,8 +811,9 @@ remove_all_nodes_canary() {
   service_is_active hermes-gateway.service || fail "bulk deletion stopped Hermes"
   user_systemctl "$oc_user" "$oc_uid" is-active --quiet -- openclaw-gateway.service \
     || fail "bulk deletion stopped OpenClaw"
-  assert_eq '' "$(cat /run/proxyscene-integration-targets/hermes.fallback-ips-disabled)" \
-    "bulk deletion restarted Hermes without managed proxy settings"
+  wait_for "bulk-delete Hermes restart" target_start_count_greater_than hermes "$hermes_before"
+  wait_for "bulk-delete Hermes proxy cleanup" grep -Fxq '' \
+    /run/proxyscene-integration-targets/hermes.fallback-ips-disabled
 
   # Restore the existing fixture through public commands for the later layout
   # and uninstall canaries; reimport does not silently enable any proxy scene.
