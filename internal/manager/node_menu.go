@@ -25,9 +25,10 @@ func (a *App) nodeMenu() error {
 		fmt.Println("4. 代理连通性/延迟测试")
 		fmt.Println("5. 按代理请求延迟选用节点")
 		fmt.Println("6. 修改节点备注")
-		fmt.Println("7. 删除节点")
+		fmt.Println("7. 删除单个节点")
+		fmt.Println("8. 删除全部节点")
 		fmt.Println("0. 返回")
-		choice, err := menuInput("请输入选项 [0-7]，q 返回: ")
+		choice, err := menuInput("请输入选项 [0-8]，q 返回: ")
 		if errors.Is(err, errMenuCancelled) || choice == "0" {
 			return nil
 		}
@@ -49,8 +50,10 @@ func (a *App) nodeMenu() error {
 			err = a.menuRenameNode(st)
 		case "7":
 			err = a.menuRemoveNode(st)
+		case "8":
+			err = a.menuRemoveAllNodes(st)
 		default:
-			fmt.Println("无效选项，请输入 0-7。")
+			fmt.Println("无效选项，请输入 0-8。")
 		}
 		if err := reportMenuAction(err); err != nil {
 			return err
@@ -332,6 +335,27 @@ func (a *App) menuRemoveNode(st *Store) error {
 		return errMenuCancelled
 	}
 	return a.withMenuNodeSnapshot(st, func(current *Store) error { return a.removeNode(current, id) })
+}
+
+func (a *App) menuRemoveAllNodes(st *Store) error {
+	if len(st.Nodes) == 0 {
+		fmt.Println("节点列表为空，无需删除。")
+		return errMenuCancelled
+	}
+	preview := cloneStore(st)
+	removeAllNodesFromStore(preview)
+	fmt.Printf("即将删除全部 %d 个节点（包括手动添加和订阅导入的节点）。\n", len(st.Nodes))
+	fmt.Println("删除后所有代理场景均关闭，节点选择和测速记录将清空。")
+	fmt.Println("订阅地址保留，之后更新订阅可重新导入节点。")
+	printMenuNodeChanges(st, preview)
+	ok, err := menuConfirm("确认删除全部节点？")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errMenuCancelled
+	}
+	return a.withMenuNodeSnapshot(st, a.removeAllNodes)
 }
 
 func (a *App) menuAutoNode(st *Store) error {

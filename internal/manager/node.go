@@ -1262,7 +1262,13 @@ func (a *App) nodeCommand(args []string) error {
 		}
 		switch args[0] {
 		case "remove", "delete":
-			return a.removeNode(st, arg(args, 1))
+			if len(args) != 2 {
+				return fmt.Errorf("用法：node %s <节点ID> 或 node %s --all", args[0], args[0])
+			}
+			if args[1] == "--all" {
+				return a.removeAllNodes(st)
+			}
+			return a.removeNode(st, args[1])
 		case "rename":
 			return a.renameNode(st, arg(args, 1), arg(args, 2))
 		case "use":
@@ -1369,6 +1375,29 @@ func (a *App) removeNode(st *Store, id string) error {
 	return a.commitStoreMutation(st, func(candidate *Store) error {
 		return removeNodeFromStore(candidate, id)
 	}, mode)
+}
+
+func (a *App) removeAllNodes(st *Store) error {
+	if len(st.Nodes) == 0 {
+		fmt.Println("节点列表为空，无需删除。")
+		return nil
+	}
+	return a.commitStoreMutation(st, func(candidate *Store) error {
+		removeAllNodesFromStore(candidate)
+		return nil
+	}, storeRuntimeSyncAll)
+}
+
+// Keep subscriptions for later imports and TelegramTargets as cleanup evidence.
+// The runtime transaction releases scene ownership before stopping the core.
+func removeAllNodesFromStore(st *Store) {
+	st.Nodes = []Node{}
+	st.DefaultNodeID = ""
+	clear(st.SceneNodes)
+	clear(st.SpeedResults)
+	for _, scene := range []Scene{SceneGlobal, SceneDev, SceneTelegram} {
+		st.SceneEnabled[scene] = false
+	}
 }
 
 // removeNodeFromStore is shared with the menu preview so the confirmed fallback
