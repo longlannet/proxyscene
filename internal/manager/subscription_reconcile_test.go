@@ -21,7 +21,7 @@ func reconcileTestNode(t *testing.T, id string, managed bool, sources ...string)
 	}
 	node := Node{
 		ID: id, Name: id, Protocol: prepared.Parsed.Protocol, RawURL: prepared.RawURL,
-		CreatedAt: time.Unix(100, 0), UpdatedAt: time.Unix(200, 0), SubscriptionManaged: managed,
+		CreatedAt: time.Unix(100, 0).UTC(), UpdatedAt: time.Unix(200, 0).UTC(), SubscriptionManaged: managed,
 	}
 	for _, source := range sources {
 		node.SubscriptionIDs = append(node.SubscriptionIDs, subscriptionID(source))
