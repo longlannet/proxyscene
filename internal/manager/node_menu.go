@@ -117,7 +117,9 @@ func printMenuNodes(st *Store) {
 			usage = append(usage, menuSceneName(scene)+"（"+kind+"）")
 		}
 		if n.SubscriptionManaged && len(n.SubscriptionIDs) == 0 {
-			usage = append(usage, "订阅已移除，保留待切换")
+			usage = append(usage, "订阅已移除，下次更新替换")
+		} else if !n.SubscriptionManaged {
+			usage = append(usage, "手动/旧版，订阅不自动清理")
 		}
 		if len(usage) == 0 {
 			usage = append(usage, "备用")

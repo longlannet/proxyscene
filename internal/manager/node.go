@@ -1348,7 +1348,9 @@ func (a *App) listNodes(st *Store) error {
 			}
 		}
 		if n.SubscriptionManaged && len(n.SubscriptionIDs) == 0 {
-			usage = append(usage, "订阅已移除，保留待切换")
+			usage = append(usage, "订阅已移除，下次更新替换")
+		} else if !n.SubscriptionManaged {
+			usage = append(usage, "手动/旧版，订阅不自动清理")
 		}
 		usageText := strings.Join(usage, "、")
 		if usageText == "" {

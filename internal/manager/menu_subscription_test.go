@@ -21,7 +21,7 @@ func subscriptionMenuInputForTest(t *testing.T, input string) {
 }
 
 func TestMenuSubscriptionCancellationLeavesStateUntouched(t *testing.T) {
-	for _, input := range []string{"0\n", "q\n", "1\nq\n0\n", "2\nq\n0\n", "3\nn\n0\n", "3\n\n0\n", "3\nq\n0\n", "invalid\n0\n"} {
+	for _, input := range []string{"0\n", "q\n", "1\nq\n0\n", "2\nq\n0\n", "3\nn\n0\n", "3\n\n0\n", "3\nq\n0\n", "4\nq\n0\n", "4\n1\nq\n0\n", "4\n1\n1\nn\n0\n", "invalid\n0\n"} {
 		t.Run(input, func(t *testing.T) {
 			a, before := subscriptionUpdateFixture(t, "https://one.example/sub?token=SECRET")
 			subscriptionMenuInputForTest(t, input)
@@ -34,7 +34,7 @@ func TestMenuSubscriptionCancellationLeavesStateUntouched(t *testing.T) {
 }
 
 func TestMenuSubscriptionEOFStopsEveryPrompt(t *testing.T) {
-	for _, input := range []string{"", "1", "1\n", "2\n", "3\n", "3\ny"} {
+	for _, input := range []string{"", "1", "1\n", "2\n", "3\n", "3\ny", "4\n", "4\n1\n", "4\n1\n1\n"} {
 		t.Run(input, func(t *testing.T) {
 			a, before := subscriptionUpdateFixture(t, "https://one.example/sub?token=SECRET")
 			subscriptionMenuInputForTest(t, input)

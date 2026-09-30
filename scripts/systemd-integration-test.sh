@@ -568,7 +568,8 @@ subscription_and_probe_canary() {
     snapshot_name="${path//\//_}"
     cp -p -- "$path" "$snapshot/$snapshot_name"
   done
-  jq -S 'del(.generation, .speed_results)' "$state" > "$snapshot/state.json"
+  jq -S 'del(.generation, .speed_results) | .nodes |= map(del(.subscription_ids))' \
+    "$state" > "$snapshot/state.json"
   log "saved subscription refresh and isolated node probe preserve the active global service"
   # Even poisoned environment proxies must not affect the direct-first fetch.
   env PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1 PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1 \
@@ -581,7 +582,13 @@ subscription_and_probe_canary() {
   assert_json "$state" \
     '(.speed_results | length == 1) and all(.speed_results[]; .success == false and .target == "节点实际 HTTPS 代理请求" and (.error | startswith("节点 HTTPS 代理请求失败")))' \
     "isolated core reached the real HTTPS request phase"
-  jq -S 'del(.generation, .speed_results)' "$state" > "$snapshot/state-after.json"
+  # A legacy node remains unmanaged until explicit adoption, but its matching
+  # source membership is recorded during the first refresh.
+  assert_json "$state" \
+    'all(.nodes[]; (.subscription_managed // false) == false and (.subscription_ids | length) == 1)' \
+    "legacy refresh records source without taking ownership"
+  jq -S 'del(.generation, .speed_results) | .nodes |= map(del(.subscription_ids))' \
+    "$state" > "$snapshot/state-after.json"
   cmp -- "$snapshot/state.json" "$snapshot/state-after.json" \
     || fail "subscription refresh or probe changed saved node, subscription, or runtime settings"
   for path in /opt/proxyscene/config.json /opt/proxyscene/core-loaded.json \
@@ -609,6 +616,110 @@ subscription_and_probe_canary() {
   fi
   assert_no_path /opt/proxyscene/runtime-transition.json
   printf 'NODE_PROBE_ACTIVE_SERVICE_ISOLATION_VERIFIED global_unchanged=1 unrelated_unchanged=1 cleanup=1\n'
+  subscription_replacement_canary "$test_root" "$state" "$snapshot"
+}
+
+subscription_replacement_canary() {
+  local test_root="$1" state="$2" snapshot="$3"
+  local original_url original_id source_id first_url second_url replacement_id
+  local pid invocation fixture_pid fixture_invocation path snapshot_name
+  local config_sha receipt_sha global_port
+  original_url="$(jq -r '.nodes[0].raw_url' "$state")"
+  original_id="$(jq -r '.nodes[0].id' "$state")"
+  source_id="$(jq -r '.nodes[0].subscription_ids[0]' "$state")"
+  [[ "$original_url" == *@198.51.100.10:443* ]] || fail "unexpected subscription fixture endpoint"
+  first_url="${original_url/198.51.100.10/198.51.100.11}"
+  second_url="${original_url/198.51.100.10/198.51.100.12}"
+  fixture_pid="$(systemctl show --property=MainPID --value proxyscene-subscription-fixture.service)"
+  fixture_invocation="$(systemctl show --property=InvocationID --value proxyscene-subscription-fixture.service)"
+  jq -S '{runtime_config, scene_enabled, subscriptions}' "$state" > "$snapshot/replacement-settings.json"
+  global_port="$(jq -r '.runtime_config.global_http_port' "$state")"
+
+  log "withdraw selected subscription nodes and replace the running core with stored settings"
+  /usr/local/bin/proxyscene subscription adopt 1 "$original_id"
+  /usr/local/bin/proxyscene node use "$original_id" all
+  pid="$(systemctl show --property=MainPID --value proxyscene.service)"
+  invocation="$(systemctl show --property=InvocationID --value proxyscene.service)"
+  printf '%s\n' "$first_url" "$second_url" > "$test_root/subscription-fixture/nodes.txt"
+  env PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1 PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1 \
+    PROXYSCENE_HOST=127.0.0.2 PROXYSCENE_GLOBAL_HTTP_PORT=17999 \
+    PROXYSCENE_GLOBAL_SOCKS_PORT=17998 PROXYSCENE_SERVICE_USER=unexpected-subscription-user \
+    /usr/local/bin/proxyscene subscription update --all
+  jq -e --arg first "$first_url" --arg second "$second_url" --arg source "$source_id" \
+    --arg old "$original_id" \
+    '(.nodes | length == 2) and ([.nodes[].raw_url] == [$first, $second]) and
+     all(.nodes[]; .id != $old and .subscription_managed == true and .subscription_ids == [$source]) and
+     ((.speed_results | has($old)) | not)' "$state" >/dev/null \
+    || fail "subscription replacement retained withdrawn nodes or lost source ownership"
+  replacement_id="$(jq -r '.nodes[0].id' "$state")"
+  jq -e --arg id "$replacement_id" \
+    '.default_node_id == $id and .scene_nodes == {global: $id, dev: $id, telegram: $id}' \
+    "$state" >/dev/null || fail "subscription replacement did not migrate every selected binding"
+  [[ "$(systemctl show --property=MainPID --value proxyscene.service)" != "$pid" ]] \
+    || fail "subscription replacement did not replace the core process"
+  [[ "$(systemctl show --property=InvocationID --value proxyscene.service)" != "$invocation" ]] \
+    || fail "subscription replacement did not restart the active core"
+  assert_core_process_loaded "subscription replacement core"
+  assert_core_loaded_receipt
+  assert_json /opt/proxyscene/config.json \
+    '([.outbounds[] | select(.tag == "proxy-global") | .settings.vnext[0].address] == ["198.51.100.11"])' \
+    "running core uses the replacement subscription endpoint"
+  wait_for "subscription replacement retained custom listener" port_is_listening "$global_port"
+  wait_for "subscription replacement ignored caller port override" port_is_not_listening 17999
+  assert_eq "$fixture_pid" "$(systemctl show --property=MainPID --value proxyscene-subscription-fixture.service)" \
+    "subscription replacement preserved unrelated PID"
+  assert_eq "$fixture_invocation" "$(systemctl show --property=InvocationID --value proxyscene-subscription-fixture.service)" \
+    "subscription replacement preserved unrelated invocation"
+  for path in /etc/systemd/system/proxyscene.service /etc/systemd/system/proxyscene-restore.service \
+    /etc/profile.d/proxyscene-global-proxy.sh /etc/apt/apt.conf.d/99proxyscene-global-proxy \
+    /opt/proxyscene/global-proxy-journal.json /opt/proxyscene/global-proxy-journal.json.bak; do
+    snapshot_name="${path//\//_}"
+    cmp -- "$snapshot/$snapshot_name" "$path" || fail "subscription replacement changed unrelated runtime file: $path"
+    assert_eq "$(stat -c '%u:%g:%a' "$snapshot/$snapshot_name")" \
+      "$(stat -c '%u:%g:%a' "$path")" "subscription replacement retained metadata: $path"
+  done
+  assert_no_path /opt/proxyscene/runtime-transition.json
+
+  log "an identical subscription refresh preserves the active core and replacement nodes"
+  pid="$(systemctl show --property=MainPID --value proxyscene.service)"
+  invocation="$(systemctl show --property=InvocationID --value proxyscene.service)"
+  config_sha="$(sha256_file /opt/proxyscene/config.json)"
+  receipt_sha="$(sha256_file /opt/proxyscene/core-loaded.json)"
+  jq -S 'del(.generation)' "$state" > "$snapshot/replacement-state.json"
+  env PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1 PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1 \
+    PROXYSCENE_GLOBAL_HTTP_PORT=17999 /usr/local/bin/proxyscene subscription update --all
+  jq -S 'del(.generation)' "$state" > "$snapshot/replacement-state-after.json"
+  cmp -- "$snapshot/replacement-state.json" "$snapshot/replacement-state-after.json" \
+    || fail "identical subscription refresh changed replacement nodes or settings"
+  assert_eq "$pid" "$(systemctl show --property=MainPID --value proxyscene.service)" "identical refresh retained core PID"
+  assert_eq "$invocation" "$(systemctl show --property=InvocationID --value proxyscene.service)" "identical refresh retained core invocation"
+  assert_eq "$config_sha" "$(sha256_file /opt/proxyscene/config.json)" "identical refresh retained core config"
+  assert_eq "$receipt_sha" "$(sha256_file /opt/proxyscene/core-loaded.json)" "identical refresh retained loaded receipt"
+  assert_no_path /opt/proxyscene/runtime-transition.json
+
+  # Restore the original single endpoint through the public update path so all
+  # later lifecycle canaries retain their existing network and scene fixture.
+  printf '%s\n' "$original_url" > "$test_root/subscription-fixture/nodes.txt"
+  env PROXYSCENE_ALLOW_HTTP_SUBSCRIPTION=1 PROXYSCENE_ALLOW_PRIVATE_SUBSCRIPTION=1 \
+    /usr/local/bin/proxyscene subscription update --all
+  jq -e --arg raw "$original_url" \
+    '.nodes[0].id as $id | (.nodes | length == 1) and .nodes[0].raw_url == $raw and
+     .default_node_id == $id and .scene_nodes == {global: $id, dev: $id, telegram: $id}' "$state" >/dev/null \
+    || fail "subscription canary did not restore the original selected endpoint"
+  cmp -- "$snapshot/_opt_proxyscene_config.json" /opt/proxyscene/config.json \
+    || fail "subscription canary did not restore the original core config"
+  jq -S '{runtime_config, scene_enabled, subscriptions}' "$state" > "$snapshot/replacement-settings-after.json"
+  cmp -- "$snapshot/replacement-settings.json" "$snapshot/replacement-settings-after.json" \
+    || fail "subscription replacement changed saved runtime parameters or scene activation"
+  assert_core_process_loaded "restored subscription core"
+  assert_core_loaded_receipt
+  assert_eq "$fixture_pid" "$(systemctl show --property=MainPID --value proxyscene-subscription-fixture.service)" \
+    "subscription canary retained unrelated PID"
+  assert_eq "$fixture_invocation" "$(systemctl show --property=InvocationID --value proxyscene-subscription-fixture.service)" \
+    "subscription canary retained unrelated invocation"
+  service_is_active proxyscene-subscription-fixture.service || fail "subscription canary stopped the unrelated fixture"
+  assert_no_path /opt/proxyscene/runtime-transition.json
+  printf 'SUBSCRIPTION_SELECTED_REPLACEMENT_VERIFIED real_systemd=1 replaced=1 bindings_migrated=1 settings_preserved=1 unrelated_unchanged=1 identical_no_restart=1\n'
 }
 
 inside_container() {
