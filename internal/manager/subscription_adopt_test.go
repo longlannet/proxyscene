@@ -2,6 +2,7 @@ package manager
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +26,13 @@ func adoptionFixture(t *testing.T) (*App, *Store) {
 	if err := a.saveStore(st); err != nil {
 		t.Fatal(err)
 	}
-	return a, st
+	// Compare subsequent loads with the persisted representation. JSON drops
+	// time.Time's local Location identity even when its UTC offset is zero.
+	persisted, err := a.loadStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a, persisted
 }
 
 func requireAdoptionTestRoot(t *testing.T) {
@@ -161,11 +168,25 @@ func TestSubscriptionAdoptionMenuCancellationAndInvalidSelections(t *testing.T) 
 	} {
 		t.Run(input, func(t *testing.T) {
 			a, before := adoptionFixture(t)
+			files := make(map[string][]byte)
+			for _, path := range []string{a.cfg.StorePath(), a.cfg.StoreBackupPath()} {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				files[path] = data
+			}
 			subscriptionMenuInputForTest(t, input)
 			if err := a.adoptSubscriptionNodesMenu(); err == nil {
 				t.Fatal("incomplete, declined or invalid adoption succeeded")
 			}
 			assertSubscriptionStoreUnchanged(t, a, before)
+			for path, expected := range files {
+				data, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(data, expected) {
+					t.Fatalf("cancelled or invalid adoption changed persisted file %s: %v", path, err)
+				}
+			}
 		})
 	}
 }
