@@ -265,6 +265,27 @@ func TestNodeProbeChildPrivilegeAndPrivateState(t *testing.T) {
 	var pid int
 	opts.onStartedForTest = func(child int, dir string) {
 		pid = child
+		// Start observes the exec error pipe closing before /proc necessarily
+		// exposes the new argv. Retry only empty reads, never an unsafe argv.
+		deadline := time.Now().Add(time.Second)
+		for {
+			argv, err := os.ReadFile(filepath.Join("/proc", itoa(pid), "cmdline"))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if len(argv) > 0 {
+				if !strings.Contains(string(argv), "stdin:") || strings.Contains(string(argv), "config.json") {
+					t.Errorf("probe argv exposes configuration path: %q", argv)
+				}
+				break
+			}
+			if !time.Now().Before(deadline) {
+				t.Error("probe argv remained empty after exec")
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 		for path, mode := range map[string]os.FileMode{dir: 0o700, filepath.Join(dir, "config.json"): 0o600} {
 			info, err := os.Stat(path)
 			if err != nil || info.Mode().Perm() != mode {
@@ -296,13 +317,6 @@ func TestNodeProbeChildPrivilegeAndPrivateState(t *testing.T) {
 			if !found {
 				t.Errorf("missing child status %s", key)
 			}
-		}
-		argv, err := os.ReadFile(filepath.Join("/proc", itoa(pid), "cmdline"))
-		if err != nil {
-			t.Error(err)
-		}
-		if !strings.Contains(string(argv), "stdin:") || strings.Contains(string(argv), "config.json") {
-			t.Errorf("probe argv exposes configuration path: %q", argv)
 		}
 		env, err := os.ReadFile(filepath.Join("/proc", itoa(pid), "environ"))
 		if err != nil {

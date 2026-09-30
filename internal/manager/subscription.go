@@ -92,7 +92,10 @@ func (a *App) subscriptionCommand(args []string) error {
 	if len(args) == 2 && args[0] == "update" {
 		return a.updateSubscriptions(args[1])
 	}
-	return fmt.Errorf("用法：subscription list | subscription update <序号或ID> | subscription update --all")
+	if len(args) >= 3 && args[0] == "adopt" {
+		return a.adoptSubscriptionNodes(args[1], args[2:])
+	}
+	return fmt.Errorf("用法：subscription list | subscription update <序号或ID> | subscription update --all | subscription adopt <序号或ID> <节点ID...>")
 }
 
 func (a *App) subscriptionMenu() error {
@@ -107,8 +110,8 @@ func (a *App) subscriptionMenu() error {
 		} else {
 			writeSubscriptionList(os.Stdout, st)
 		}
-		fmt.Println("1. 添加/导入订阅\n2. 更新单个订阅\n3. 更新全部订阅\n0. 返回")
-		choice, err := menuInput("请输入选项 [0-3，q 返回]: ")
+		fmt.Println("1. 添加/导入订阅\n2. 更新单个订阅\n3. 更新全部订阅\n4. 关联旧节点到订阅\n0. 返回")
+		choice, err := menuInput("请输入选项 [0-4，q 返回]: ")
 		if errors.Is(err, errMenuCancelled) || choice == "0" {
 			return nil
 		}
@@ -142,8 +145,10 @@ func (a *App) subscriptionMenu() error {
 			if err == nil && confirmed {
 				err = a.updateSubscriptions("--all")
 			}
+		case "4":
+			err = a.adoptSubscriptionNodesMenu()
 		default:
-			fmt.Println("无效选项，请输入 0-3")
+			fmt.Println("无效选项，请输入 0-4")
 			continue
 		}
 		if err := reportMenuAction(err); err != nil {
@@ -237,7 +242,7 @@ func validateSubscriptionRefresh(prepared preparedSubscription) error {
 }
 
 type subscriptionChanges struct {
-	Added, Existing, Removed, Retained, Invalid int
+	Added, Existing, Removed, Invalid, Unmanaged, Reselected int
 }
 
 // Reconcile all sources together so a node moving between subscriptions keeps
@@ -273,28 +278,55 @@ func reconcileSubscriptions(st *Store, prepared []preparedSubscription) (subscri
 			if node.Parsed == nil || node.RawURL == "" {
 				return changes, fmt.Errorf("订阅节点解析结果无效")
 			}
-			if _, found := desired[node.RawURL]; !found {
-				desired[node.RawURL] = node
-				order = append(order, node.RawURL)
+			key := subscriptionNodeIdentity(node.RawURL)
+			if _, found := desired[key]; !found {
+				desired[key] = node
+				order = append(order, key)
 			}
-			if !slices.Contains(sources[node.RawURL], id) {
-				sources[node.RawURL] = append(sources[node.RawURL], id)
+			if !slices.Contains(sources[key], id) {
+				sources[key] = append(sources[key], id)
 			}
 		}
 	}
-	protected := map[string]bool{st.DefaultNodeID: true}
+	selected := map[string]bool{st.DefaultNodeID: true}
 	for _, id := range st.SceneNodes {
-		protected[id] = true
+		selected[id] = true
 	}
 	for _, scene := range []Scene{SceneGlobal, SceneDev, SceneTelegram} {
-		protected[st.selectedNodeID(scene)] = true
+		selected[st.selectedNodeID(scene)] = true
+	}
+	keys := make([]string, len(st.Nodes))
+	keepers := make(map[string]int, len(st.Nodes))
+	for i, node := range st.Nodes {
+		key := subscriptionNodeIdentity(node.RawURL)
+		keys[i] = key
+		if previous, found := keepers[key]; !found || subscriptionNodePriority(node, selected) > subscriptionNodePriority(st.Nodes[previous], selected) {
+			keepers[key] = i
+		}
+	}
+	// A manual node or an unrefreshed source can require an equivalent copy
+	// to survive. If it already owns the incoming URL, reuse it so refreshing
+	// another copy cannot create two stored nodes with the exact same URL.
+	for i, node := range st.Nodes {
+		fresh, found := desired[keys[i]]
+		if !found || node.RawURL != fresh.RawURL {
+			continue
+		}
+		mustKeep := !node.SubscriptionManaged
+		for _, source := range node.SubscriptionIDs {
+			mustKeep = mustKeep || !refreshing[source]
+		}
+		if mustKeep {
+			keepers[keys[i]] = i
+		}
 	}
 	nodes := make([]Node, 0, len(st.Nodes))
-	seen := make(map[string]bool, len(st.Nodes))
 	ids := make(map[string]bool, len(st.Nodes))
+	current := make(map[string]string, len(desired))
 	var removed []string
-	for _, node := range st.Nodes {
-		seen[node.RawURL] = true
+	now := time.Now()
+	for i, node := range st.Nodes {
+		key := keys[i]
 		ids[node.ID] = true
 		memberships := make([]string, 0, len(node.SubscriptionIDs))
 		for _, id := range node.SubscriptionIDs {
@@ -302,50 +334,96 @@ func reconcileSubscriptions(st *Store, prepared []preparedSubscription) (subscri
 				memberships = append(memberships, id)
 			}
 		}
-		memberships = append(memberships, sources[node.RawURL]...)
+		if keepers[key] == i {
+			memberships = append(memberships, sources[key]...)
+		}
 		slices.Sort(memberships)
 		node.SubscriptionIDs = memberships
 		if node.SubscriptionManaged && len(memberships) == 0 {
-			if !protected[node.ID] {
-				removed = append(removed, node.ID)
-				changes.Removed++
-				continue
-			}
-			changes.Retained++
+			removed = append(removed, node.ID)
+			changes.Removed++
+			continue
 		}
-		if _, found := desired[node.RawURL]; found {
+		if !node.SubscriptionManaged {
+			changes.Unmanaged++
+		}
+		if current[key] == "" || keepers[key] == i {
+			current[key] = node.ID
+		}
+		if fresh, found := desired[key]; found && keepers[key] == i {
+			if node.SubscriptionManaged && node.RawURL != fresh.RawURL {
+				old, err := prepareNode(node.RawURL)
+				if err == nil && node.Name == subscriptionNodeName(old) {
+					node.Name = subscriptionNodeName(fresh)
+				}
+				node.RawURL = fresh.RawURL
+				node.UpdatedAt = now
+			}
 			changes.Existing++
 		}
 		nodes = append(nodes, node)
 	}
-	now := time.Now()
-	for _, raw := range order {
-		if seen[raw] {
+	for _, key := range order {
+		if _, found := keepers[key]; found {
 			continue
 		}
-		prepared := desired[raw]
+		prepared := desired[key]
 		id := newNodeID()
 		for ids[id] {
 			id = newNodeID()
 		}
 		ids[id] = true
-		name := prepared.Parsed.Name
-		if name == "" {
-			name = prepared.Parsed.Protocol + "-node"
-		}
-		memberships := sources[raw]
+		memberships := sources[key]
 		slices.Sort(memberships)
-		nodes = append(nodes, Node{ID: id, Name: name, Protocol: prepared.Parsed.Protocol, RawURL: raw,
+		nodes = append(nodes, Node{ID: id, Name: subscriptionNodeName(prepared), Protocol: prepared.Parsed.Protocol, RawURL: prepared.RawURL,
 			CreatedAt: now, UpdatedAt: now, SubscriptionIDs: memberships, SubscriptionManaged: true})
+		current[key] = id
 		changes.Added++
 	}
 	if len(nodes) > maxTotalNodes {
 		return subscriptionChanges{}, fmt.Errorf("更新后节点总数超过上限 %d，本次更新未提交", maxTotalNodes)
 	}
-	// An old store may use firstNodeID as an implicit selection. Never replace
-	// that choice merely because DefaultNodeID was empty before the update.
-	if len(st.Nodes) == 0 && len(nodes) > 0 {
+	// Replace selections along with the source snapshot. Prefer an equivalent
+	// survivor, then the first current node from the withdrawn node's source.
+	// Nodes retained by older versions may have already lost their source IDs.
+	firstBySource := make(map[string]string, len(prepared))
+	for _, sub := range prepared {
+		firstBySource[subscriptionID(sub.URL)] = current[subscriptionNodeIdentity(sub.Nodes[0].RawURL)]
+	}
+	replacements := make(map[string]string, len(removed))
+	for _, id := range removed {
+		old := st.findNode(id)
+		replacement := current[subscriptionNodeIdentity(old.RawURL)]
+		if replacement == "" {
+			for _, source := range subscriptions {
+				sourceID := subscriptionID(source)
+				if slices.Contains(old.SubscriptionIDs, sourceID) && firstBySource[sourceID] != "" {
+					replacement = firstBySource[sourceID]
+					break
+				}
+			}
+		}
+		if replacement == "" && len(order) > 0 {
+			replacement = current[order[0]]
+		}
+		replacements[id] = replacement
+		if selected[id] {
+			changes.Reselected++
+		}
+	}
+	defaultID := st.DefaultNodeID
+	if st.findNode(defaultID) == nil {
+		defaultID = st.firstNodeID()
+	}
+	if replacement, removed := replacements[defaultID]; removed {
+		st.DefaultNodeID = replacement
+	} else if len(st.Nodes) == 0 && len(nodes) > 0 {
 		st.DefaultNodeID = nodes[0].ID
+	}
+	for scene, id := range st.SceneNodes {
+		if replacement, removed := replacements[id]; removed {
+			st.SceneNodes[scene] = replacement
+		}
 	}
 	st.Nodes = nodes
 	st.Subscriptions = subscriptions
@@ -355,13 +433,43 @@ func reconcileSubscriptions(st *Store, prepared []preparedSubscription) (subscri
 	return changes, nil
 }
 
+func subscriptionNodeName(node preparedNode) string {
+	if node.Parsed.Name != "" {
+		return node.Parsed.Name
+	}
+	return node.Parsed.Protocol + "-node"
+}
+
 func (a *App) commitPreparedSubscriptions(st *Store, prepared []preparedSubscription) error {
-	var changes subscriptionChanges
-	err := a.commitStoreMutation(st, func(candidate *Store) error {
-		var err error
-		changes, err = reconcileSubscriptions(candidate, prepared)
+	staged := cloneStore(st)
+	changes, err := reconcileSubscriptions(staged, prepared)
+	if err != nil {
 		return err
-	}, storeRuntimeSyncNone)
+	}
+	mode := storeRuntimeSyncNone
+	for _, scene := range []Scene{SceneGlobal, SceneDev, SceneTelegram} {
+		if !st.SceneEnabled[scene] {
+			continue
+		}
+		before, after := st.findNode(st.selectedNodeID(scene)), staged.findNode(staged.selectedNodeID(scene))
+		if before == nil || after == nil || subscriptionNodeIdentity(before.RawURL) != subscriptionNodeIdentity(after.RawURL) {
+			mode = storeRuntimeSyncXray
+			break
+		}
+	}
+	// A subscription refresh only changes nodes, not runtime settings supplied
+	// by the current shell. Reconfigure the core using the persisted settings.
+	committer := a
+	if mode != storeRuntimeSyncNone {
+		committer, err = a.appForStoreRuntime(st)
+		if err != nil {
+			return err
+		}
+	}
+	err = committer.commitStoreMutation(st, func(candidate *Store) error {
+		restoreStore(candidate, staged)
+		return nil
+	}, mode)
 	if err != nil {
 		return err
 	}
@@ -371,8 +479,11 @@ func (a *App) commitPreparedSubscriptions(st *Store, prepared []preparedSubscrip
 			fmt.Printf("订阅 %s：%s\n", subscriptionID(sub.URL)[:16], sub.diagnosticSummary())
 		}
 	}
-	if changes.Retained > 0 {
-		fmt.Printf("保留 %d 个已不在订阅中但仍被选中的节点；请手动选择替代节点，下次更新再清理\n", changes.Retained)
+	if changes.Unmanaged > 0 {
+		fmt.Printf("当前有 %d 个手动/旧版节点不受订阅自动清理；确认属于订阅的旧节点可在订阅管理中选择“关联旧节点到订阅”\n", changes.Unmanaged)
+	}
+	if changes.Reselected > 0 {
+		fmt.Printf("已替换 %d 个失效的选中节点：优先使用等价节点，否则使用原订阅当前列表的首个节点\n", changes.Reselected)
 	}
 	return nil
 }

@@ -79,6 +79,7 @@ func (a *App) help() {
 	fmt.Println("  proxyscene subscription list        查看订阅列表（隐藏链接凭据）")
 	fmt.Println("  proxyscene subscription update <序号或ID>  更新单个订阅")
 	fmt.Println("  proxyscene subscription update --all      更新全部订阅")
+	fmt.Println("  proxyscene subscription adopt <序号或ID> <节点ID...>  关联旧节点到订阅")
 	fmt.Println("  proxyscene node rename '节点ID' '新备注'")
 	fmt.Println("  proxyscene node remove '节点ID'      删除节点（别名：delete）")
 	fmt.Println("  proxyscene node test               通过各节点请求 HTTPS，检测连通性和延迟")
