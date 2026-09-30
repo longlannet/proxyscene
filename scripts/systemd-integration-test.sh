@@ -722,6 +722,114 @@ subscription_replacement_canary() {
   printf 'SUBSCRIPTION_SELECTED_REPLACEMENT_VERIFIED real_systemd=1 replaced=1 bindings_migrated=1 settings_preserved=1 unrelated_unchanged=1 identical_no_restart=1\n'
 }
 
+
+# Reuse the running Hermes/OpenClaw fixtures after their individual lifecycle
+# checks. All paths and service mutations remain inside the disposable container.
+remove_all_nodes_canary() {
+  local test_root="$1" state="$2" original_url="$3" oc_user="$4" oc_uid="$5"
+  local openclaw_config="$6" original_profile="$7" original_apt="$8"
+  local snapshot second_url generation global_port restored_id
+  snapshot="$test_root/remove-all-nodes"
+  install -d -m 0700 "$snapshot"
+  assert_json "$state" \
+    '(.nodes | length == 1) and .scene_enabled.global == true and .scene_enabled.dev == false and .scene_enabled.telegram == false' \
+    "bulk-delete canary starts with the established single-node fixture"
+  jq -S '{runtime_config, subscriptions, scene_enabled}' "$state" > "$snapshot/settings-before.json"
+  jq -S '.subscriptions' "$state" > "$snapshot/subscriptions-before.json"
+  cp -p -- /opt/proxyscene/config.json "$snapshot/config-before.json"
+  global_port="$(jq -r '.runtime_config.global_http_port' "$state")"
+  [[ "$original_url" == *@198.51.100.10:443* ]] || fail "unexpected bulk-delete fixture endpoint"
+  second_url="${original_url/198.51.100.10/198.51.100.13}"
+
+  log "delete all nodes in one transaction while all three scenes are active"
+  printf '%s\n' "$second_url" | /usr/local/bin/proxyscene node add --stdin
+  env PROXYSCENE_DEV_TARGET_USER=root /usr/local/bin/proxyscene dev on
+  env "PROXYSCENE_TG_SERVICES=hermes-gateway user:${oc_user}:openclaw-gateway" \
+    /usr/local/bin/proxyscene tg on
+  assert_json "$state" \
+    '(.nodes | length == 2) and .scene_enabled.global == true and .scene_enabled.dev == true and .scene_enabled.telegram == true' \
+    "bulk deletion has two nodes and every scene enabled"
+  assert_core_process_loaded "bulk-delete active core"
+  wait_for "bulk-delete development listener" port_is_listening 7891
+  wait_for "bulk-delete Telegram listener" port_is_listening 7892
+  generation="$(jq -r .generation "$state")"
+
+  /usr/local/bin/proxyscene node remove --all
+  assert_json "$state" \
+    '(.nodes | length == 0) and .default_node_id == "" and (.scene_nodes | length == 0) and
+     (.speed_results | length == 0) and .scene_enabled.global == false and
+     .scene_enabled.dev == false and .scene_enabled.telegram == false' \
+    "bulk deletion cleared every node, selection, speed result and enabled scene"
+  assert_eq "$((generation + 1))" "$(jq -r .generation "$state")" "bulk deletion committed exactly once"
+  cmp -- "$state" "$state.bak" || fail "bulk deletion Store backup differs"
+  jq -S '.subscriptions' "$state" > "$snapshot/subscriptions-after.json"
+  cmp -- "$snapshot/subscriptions-before.json" "$snapshot/subscriptions-after.json" \
+    || fail "bulk deletion removed saved subscriptions"
+  wait_for "bulk-delete stopped core" service_is_inactive proxyscene.service
+  assert_eq inactive "$(systemctl show --property=ActiveState --value proxyscene.service)" \
+    "bulk deletion cleanly stopped the core"
+  for port in "$global_port" 7891 7892 7893; do
+    wait_for "bulk-delete closed listener $port" port_is_not_listening "$port"
+  done
+  assert_no_path /opt/proxyscene/config.json
+  assert_no_path /opt/proxyscene/core-loaded.json
+  assert_no_path /opt/proxyscene/runtime-transition.json
+  assert_no_path /opt/proxyscene/global-proxy-journal.json
+  assert_no_path /opt/proxyscene/global-proxy-journal.json.bak
+  assert_no_path /opt/proxyscene/dev-proxy-backup.json
+  assert_eq "$original_profile" \
+    "$(tr -d '\r\n' < /etc/profile.d/proxyscene-global-proxy.sh)" "bulk deletion restored original global profile"
+  assert_eq "$original_apt" \
+    "$(tr -d '\r\n' < /etc/apt/apt.conf.d/99proxyscene-global-proxy)" "bulk deletion restored original apt proxy"
+  assert_eq 640 "$(stat -c '%a' /etc/profile.d/proxyscene-global-proxy.sh)" \
+    "bulk deletion restored original global profile mode"
+  assert_eq 600 "$(stat -c '%a' /etc/apt/apt.conf.d/99proxyscene-global-proxy)" \
+    "bulk deletion restored original apt proxy mode"
+  assert_git_values http.proxy \
+    http://original-http-a.invalid:8001 http://original-http-b.invalid:8002 http://concurrent-http.invalid:8031
+  assert_git_values https.proxy \
+    http://original-https-a.invalid:8011 http://original-https-b.invalid:8012 http://concurrent-https.invalid:8032
+  assert_npm_proxy_eq http://original-npm.invalid:8021 "$(npm config get proxy | tail -n1)" \
+    "bulk deletion restored npm proxy"
+  assert_npm_proxy_eq http://original-npm-https.invalid:8022 "$(npm config get https-proxy | tail -n1)" \
+    "bulk deletion restored npm HTTPS proxy"
+  assert_no_path /etc/systemd/system/hermes-gateway.service.d/90-proxyscene-telegram-proxy.conf
+  assert_json /opt/proxyscene/telegram-proxy-journal.json '.targets | length == 0' \
+    "bulk deletion released Hermes ownership"
+  assert_json /opt/proxyscene/telegram-proxy-journal.json.bak '.targets | length == 0' \
+    "bulk deletion released Hermes backup ownership"
+  assert_json "$openclaw_config" \
+    '(.channels.telegram | has("proxy")) and .channels.telegram.proxy == null and .preserved.value == 7 and .channels.telegram.preserved == true' \
+    "bulk deletion restored OpenClaw settings"
+  jq -e --arg user "$oc_user" '.users | has($user) | not' \
+    /opt/proxyscene/openclaw-proxy-journal.json >/dev/null \
+    || fail "bulk deletion retained OpenClaw ownership"
+  service_is_active hermes-gateway.service || fail "bulk deletion stopped Hermes"
+  user_systemctl "$oc_user" "$oc_uid" is-active --quiet -- openclaw-gateway.service \
+    || fail "bulk deletion stopped OpenClaw"
+  assert_eq '' "$(cat /run/proxyscene-integration-targets/hermes.fallback-ips-disabled)" \
+    "bulk deletion restarted Hermes without managed proxy settings"
+
+  # Restore the existing fixture through public commands for the later layout
+  # and uninstall canaries; reimport does not silently enable any proxy scene.
+  printf '%s\n' "$original_url" | /usr/local/bin/proxyscene node add --stdin
+  restored_id="$(jq -r '.nodes[0].id' "$state")"
+  /usr/local/bin/proxyscene node use "$restored_id" all
+  assert_json "$state" \
+    '(.nodes | length == 1) and .scene_enabled.global == false and .scene_enabled.dev == false and .scene_enabled.telegram == false' \
+    "reimport retained disabled scenes"
+  /usr/local/bin/proxyscene global on
+  jq -S '{runtime_config, subscriptions, scene_enabled}' "$state" > "$snapshot/settings-after.json"
+  cmp -- "$snapshot/settings-before.json" "$snapshot/settings-after.json" \
+    || fail "bulk-delete canary did not restore runtime settings, subscriptions and enabled scenes"
+  cmp -- "$snapshot/config-before.json" /opt/proxyscene/config.json \
+    || fail "bulk-delete canary did not restore the original core config"
+  assert_core_process_loaded "restored bulk-delete core"
+  assert_core_loaded_receipt
+  assert_no_path /opt/proxyscene/runtime-transition.json
+  printf 'NODE_REMOVE_ALL_VERIFIED real_systemd=1 two_nodes=1 single_commit=1 subscriptions_retained=1 all_scenes_closed=1 ownership_restored=1\n'
+}
+
 inside_container() {
   local current_archive="$1"
   local old_archive="$2"
@@ -1572,6 +1680,9 @@ LEGACY_ENV
     "Telegram inbounds removed"
   wait_for "removed Telegram HTTP listener" port_is_not_listening 7892
   wait_for "removed Telegram SOCKS listener" port_is_not_listening 7893
+
+  remove_all_nodes_canary "$test_root" "$old_state" "$node_url" "$oc_user" "$oc_uid" \
+    "$openclaw_config" "$global_profile_original" "$global_apt_original"
 
   hermes_installation_layout_canary "$test_root" "$old_state"
 

@@ -82,6 +82,7 @@ func (a *App) help() {
 	fmt.Println("  proxyscene subscription adopt <序号或ID> <节点ID...>  关联旧节点到订阅")
 	fmt.Println("  proxyscene node rename '节点ID' '新备注'")
 	fmt.Println("  proxyscene node remove '节点ID'      删除节点（别名：delete）")
+	fmt.Println("  proxyscene node remove --all         删除全部节点并关闭所有代理场景（保留订阅，直接执行）")
 	fmt.Println("  proxyscene node test               通过各节点请求 HTTPS，检测连通性和延迟")
 	fmt.Println("  proxyscene node auto [范围]         按代理请求延迟自动选用可用节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")
 	fmt.Println("  proxyscene node use '节点ID' [范围] 使用指定节点；范围可为 默认(default)/全局(global)/开发(dev)/电报(telegram)/全部(all)")

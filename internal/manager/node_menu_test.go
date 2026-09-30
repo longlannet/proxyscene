@@ -152,6 +152,11 @@ func TestMenuNodeMutationsCancelWithoutSideEffects(t *testing.T) {
 		{"delete defaults no", "1\n\n", (*App).menuRemoveNode},
 		{"delete EOF", "1\ny", (*App).menuRemoveNode},
 		{"delete q", "1\nq\n", (*App).menuRemoveNode},
+		{"delete all defaults no", "\n", (*App).menuRemoveAllNodes},
+		{"delete all no", "n\n", (*App).menuRemoveAllNodes},
+		{"delete all EOF", "", (*App).menuRemoveAllNodes},
+		{"delete all unterminated yes", "y", (*App).menuRemoveAllNodes},
+		{"delete all q", "q\n", (*App).menuRemoveAllNodes},
 		{"rename EOF", "1\n", (*App).menuRenameNode},
 		{"rename q", "1\nq\n", (*App).menuRenameNode},
 	} {
@@ -193,6 +198,7 @@ func TestMenuNodeConfirmationRejectsConcurrentStateChange(t *testing.T) {
 	}{
 		{"use", "2\n1\n", "y\n", (*App).menuUseNode},
 		{"delete", "1\n", "y\n", (*App).menuRemoveNode},
+		{"delete all", "", "y\n", (*App).menuRemoveAllNodes},
 		{"rename", "1\n", "changed\n", (*App).menuRenameNode},
 		{"add", "trojan://secret@new.example:443\nnew\n", "y\n", (*App).menuAddNode},
 	} {
@@ -207,6 +213,9 @@ func TestMenuNodeConfirmationRejectsConcurrentStateChange(t *testing.T) {
 					concurrent = cloneStore(before)
 					concurrent.Nodes[0], concurrent.Nodes[1] = concurrent.Nodes[1], concurrent.Nodes[0]
 					concurrent.DefaultNodeID = "backup"
+					if tc.name == "delete all" {
+						concurrent.Nodes = append(concurrent.Nodes, Node{ID: "new", Name: "new", Protocol: "trojan", RawURL: "trojan://secret@new.example:443"})
+					}
 					if err := a.saveStore(concurrent); err != nil {
 						t.Fatal(err)
 					}
