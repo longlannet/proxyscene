@@ -1610,6 +1610,12 @@ var (
 )
 
 func runUserSystemctlQuietPersisted(userName string, identity *persistedUserIdentity, lookup localUserIdentityLookup, args ...string) error {
+	if len(args) == 3 && args[0] == "try-restart" && args[1] == "--" {
+		return runSystemdRestart("重启用户级服务 user:"+userName+":"+args[2], args[2], func(ctx context.Context, commandArgs ...string) (*exec.Cmd, error) {
+			cmd, _, err := commandUserSystemctlPersisted(ctx, userName, identity, lookup, commandArgs...)
+			return cmd, err
+		})
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), externalCommandTimeout)
 	defer cancel()
 	cmd, label, err := commandUserSystemctlPersisted(ctx, userName, identity, lookup, args...)

@@ -12,6 +12,9 @@ func telegramTargetRunning(target systemdTargetName, identity *persistedUserIden
 	if err != nil {
 		return false, fmt.Errorf("无法确认目标 %s 的运行状态，未执行重启", canonicalTelegramTargetName(target))
 	}
+	if err := validateTelegramServiceSettled(target, state); err != nil {
+		return false, err
+	}
 	if state.LoadState != "loaded" {
 		return false, fmt.Errorf("目标 %s 未正常加载，未执行重启", canonicalTelegramTargetName(target))
 	}
@@ -21,7 +24,19 @@ func telegramTargetRunning(target systemdTargetName, identity *persistedUserIden
 	case "active":
 		return true, nil
 	default:
-		return false, fmt.Errorf("目标 %s 正在切换状态，请稍后重试", canonicalTelegramTargetName(target))
+		return false, fmt.Errorf("目标 %s 正在切换状态，请稍后重试：%w", canonicalTelegramTargetName(target), errSystemdRestartUnsettled)
+	}
+}
+
+func validateTelegramServiceSettled(target systemdTargetName, state telegramServiceState) error {
+	if state.Job != "" {
+		return fmt.Errorf("目标 %s 尚有 systemd 任务，请等待服务稳定后重试：%w", canonicalTelegramTargetName(target), errSystemdRestartUnsettled)
+	}
+	switch state.ActiveState {
+	case "active", "inactive", "failed":
+		return nil
+	default:
+		return fmt.Errorf("目标 %s 正在切换状态或状态未知，请稍后重试：%w", canonicalTelegramTargetName(target), errSystemdRestartUnsettled)
 	}
 }
 

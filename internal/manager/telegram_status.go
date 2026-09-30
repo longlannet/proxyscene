@@ -17,6 +17,7 @@ import (
 type telegramServiceState struct {
 	LoadState   string
 	ActiveState string
+	Job         string
 }
 
 var telegramReadServiceState = readTelegramServiceState
@@ -27,7 +28,7 @@ func readTelegramServiceState(target systemdTargetName, identity *persistedUserI
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	args := []string{"show", "--property=LoadState", "--property=ActiveState", "--", target.Service}
+	args := []string{"show", "--property=LoadState", "--property=ActiveState", "--property=Job", "--", target.Service}
 	var cmd *exec.Cmd
 	if target.UserMode {
 		var err error
@@ -44,11 +45,25 @@ func readTelegramServiceState(target systemdTargetName, identity *persistedUserI
 	if err := cmd.Run(); err != nil {
 		return telegramServiceState{}, fmt.Errorf("无法查询 Telegram 服务状态")
 	}
-	load, active, err := parseSystemdUnitState(output.String())
-	if err != nil {
-		return telegramServiceState{}, err
+	return parseTelegramServiceState(output.String())
+}
+
+func parseTelegramServiceState(output string) (telegramServiceState, error) {
+	values := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || (key != "LoadState" && key != "ActiveState" && key != "Job") {
+			return telegramServiceState{}, errors.New("电报服务状态响应无效")
+		}
+		if _, exists := values[key]; exists {
+			return telegramServiceState{}, errors.New("电报服务状态字段重复")
+		}
+		values[key] = strings.TrimSpace(value)
 	}
-	return telegramServiceState{LoadState: load, ActiveState: active}, nil
+	if _, exists := values["Job"]; !exists || values["LoadState"] == "" || values["ActiveState"] == "" {
+		return telegramServiceState{}, errors.New("电报服务状态字段缺失")
+	}
+	return telegramServiceState{LoadState: values["LoadState"], ActiveState: values["ActiveState"], Job: values["Job"]}, nil
 }
 
 // Do not let an unexpected command response accumulate unbounded output.
@@ -70,6 +85,9 @@ func (s telegramServiceState) description() string {
 	}
 	if s.LoadState != "loaded" {
 		return "未正常加载"
+	}
+	if s.Job != "" {
+		return "切换中"
 	}
 	switch s.ActiveState {
 	case "active":

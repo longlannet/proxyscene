@@ -534,6 +534,9 @@ func validateTelegramAbsentRelease(target systemdTargetName, identity *persisted
 	if err != nil {
 		return fmt.Errorf("无法确认缺失或屏蔽的 Telegram 目标 %s 已停止，保留 ownership", canonicalTelegramTargetName(target))
 	}
+	if err := validateTelegramServiceSettled(target, state); err != nil {
+		return err
+	}
 	if state.ActiveState != "inactive" && state.ActiveState != "failed" {
 		return fmt.Errorf("电报代理 目标 %s 的磁盘 unit 不可用但服务尚未确认停止，保留 ownership", canonicalTelegramTargetName(target))
 	}

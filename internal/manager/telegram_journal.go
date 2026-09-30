@@ -1219,6 +1219,9 @@ func (a *App) cleanupHermesTelegramTarget(target systemdTargetName) error {
 		return err
 	}
 	if err := a.reloadValidateAndRestartManagedHermesTarget(target, identity, true); err != nil {
+		if errors.Is(err, errSystemdRestartUnsettled) {
+			return err
+		}
 		rollbackArtifactErr := a.restoreHermesTelegramArtifactForRetry(target, prepared.removedContent)
 		var rollbackReloadErr error
 		if rollbackArtifactErr == nil && len(prepared.removedContent) != 0 {
@@ -1299,6 +1302,9 @@ func (a *App) cleanupLegacyTelegramTarget(st *Store, target systemdTargetName) e
 		}
 	}
 	if err := a.reloadAndRestartTelegramArtifactTarget(target); err != nil {
+		if errors.Is(err, errSystemdRestartUnsettled) {
+			return err
+		}
 		if !removed {
 			return err
 		}
