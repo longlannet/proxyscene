@@ -103,12 +103,36 @@ func TestTelegramServiceStateDescription(t *testing.T) {
 		{"not-found", "inactive", "未安装"}, {"masked", "inactive", "未正常加载"},
 		{"loaded", "unknown-value", "未知"},
 	} {
-		if got := (telegramServiceState{test.load, test.active}).description(); got != test.want {
+		if got := (telegramServiceState{LoadState: test.load, ActiveState: test.active}).description(); got != test.want {
 			t.Fatalf("%+v: got %q", test, got)
 		}
 	}
 	var limited telegramStatusBuffer
 	if _, err := io.Copy(&limited, strings.NewReader(strings.Repeat("x", 4097))); err == nil || limited.Len() != 0 {
 		t.Fatal("oversized command output accepted")
+	}
+}
+
+func TestTelegramServiceStateRequiresExplicitIdleJob(t *testing.T) {
+	valid := "LoadState=loaded\nActiveState=active\nJob=\n"
+	for _, output := range []string{
+		strings.ReplaceAll(valid, "Job=\n", ""),
+		valid + "Job=42\n",
+		valid + "ActiveState=inactive\n",
+		"LoadState=loaded\nJob=\n",
+		valid + "unexpected\n",
+	} {
+		if _, err := parseTelegramServiceState(output); err == nil {
+			t.Fatalf("accepted ambiguous service state %q", output)
+		}
+	}
+	for _, job := range []string{"", "42", "42 /org/freedesktop/systemd1/job/42"} {
+		state, err := parseTelegramServiceState(strings.Replace(valid, "Job=", "Job="+job, 1))
+		if err != nil || state.Job != job {
+			t.Fatalf("job %q: state=%+v err=%v", job, state, err)
+		}
+		if job != "" && state.description() != "切换中" {
+			t.Fatal("pending job reported as running")
+		}
 	}
 }

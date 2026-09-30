@@ -2,15 +2,22 @@ package manager
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 )
 
 const managedSystemdUnitHeader = "# Managed by proxyscene\n"
 
 var systemctlRun = func(label string, args ...string) error {
+	if len(args) == 3 && args[0] == "try-restart" && args[1] == "--" {
+		return runSystemdRestart(label, args[2], func(ctx context.Context, commandArgs ...string) (*exec.Cmd, error) {
+			return exec.CommandContext(ctx, "systemctl", commandArgs...), nil
+		})
+	}
 	return runQuietLabel(label, "systemctl", args...)
 }
 

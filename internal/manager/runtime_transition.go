@@ -462,6 +462,11 @@ func (a *App) commitPlannedStoreMutation(st *Store, mutate func(*Store) error, m
 			return errors.Join(err, a.compensateRuntimeTransition(r))
 		}
 		if err := a.executeRuntimeStep(p, r.Steps[i].Name); err != nil {
+			// A timed-out systemctl client does not cancel the systemd job.
+			// Keep the fixed plan until recovery can prove the service is stable.
+			if errors.Is(err, errSystemdRestartUnsettled) {
+				return fmt.Errorf("服务重启结果尚未确定，已保留运行事务；等待服务稳定后执行 proxyscene recover：%w", err)
+			}
 			return errors.Join(err, a.compensateRuntimeTransition(r))
 		}
 	}

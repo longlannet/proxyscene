@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -228,24 +229,85 @@ func compensateRuntimeTelegram(app *App, snapshot *runtimeTelegramResources, che
 	if snapshot == nil {
 		return errors.New("缺少Telegram恢复计划")
 	}
+	// Recovery must not restore configuration underneath an unfinished restart.
+	// Check only targets captured by the fixed plan, using recorded identities.
+	if err := validateRuntimeTelegramSettled(snapshot); err != nil {
+		return err
+	}
 	var errs []error
 	// Legacy handoff is the last forward operation, so restore it first.
 	for i := len(snapshot.Legacy) - 1; i >= 0; i-- {
 		if err := compensateRuntimeLegacy(app, &snapshot.Legacy[i], checkpoint...); err != nil {
+			if errors.Is(err, errSystemdRestartUnsettled) {
+				return errors.Join(append(errs, err)...)
+			}
 			errs = append(errs, err)
 		}
 	}
 	for i := len(snapshot.OpenClaw) - 1; i >= 0; i-- {
 		if err := compensateRuntimeOpenClaw(app, snapshot, &snapshot.OpenClaw[i]); err != nil {
+			if errors.Is(err, errSystemdRestartUnsettled) {
+				return errors.Join(append(errs, err)...)
+			}
 			errs = append(errs, err)
 		}
 	}
 	for i := len(snapshot.Hermes) - 1; i >= 0; i-- {
 		if err := compensateRuntimeHermes(app, snapshot, &snapshot.Hermes[i]); err != nil {
+			if errors.Is(err, errSystemdRestartUnsettled) {
+				return errors.Join(append(errs, err)...)
+			}
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func validateRuntimeTelegramSettled(snapshot *runtimeTelegramResources) error {
+	check := func(key string, identity *persistedUserIdentity) error {
+		target, err := parseSystemdTargetName(key)
+		if err != nil {
+			return err
+		}
+		// Even a removed/masked unit can still have a job in the manager.
+		// SkipRestart limits mutation authority, not this read-only check.
+		state, err := telegramReadServiceState(target, identity)
+		if err != nil {
+			return fmt.Errorf("恢复前无法查询目标 %s；保留配置和恢复记录，稍后执行 proxyscene recover", key)
+		}
+		if err := validateTelegramServiceSettled(target, state); err != nil {
+			return fmt.Errorf("恢复前无法确认服务稳定；保留配置和恢复记录，稍后执行 proxyscene recover：%w", err)
+		}
+		return nil
+	}
+	for _, item := range snapshot.Hermes {
+		target, err := parseSystemdTargetName(item.Target)
+		if err != nil {
+			return err
+		}
+		if err := verifyTelegramUserIdentity(target, item.Identity); err != nil {
+			return err
+		}
+		if err := check(item.Target, item.Identity); err != nil {
+			return err
+		}
+	}
+	for _, item := range snapshot.OpenClaw {
+		if err := verifyOpenClawUserIdentity(item.User, item.Identity); err != nil {
+			return err
+		}
+		for _, key := range item.Targets {
+			if err := check(key, item.Identity); err != nil {
+				return err
+			}
+		}
+	}
+	for _, item := range snapshot.Legacy {
+		if err := check(item.Target, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func runtimeHermesContentAllowed(item *runtimeHermesResource, raw []byte, missing bool) bool {
